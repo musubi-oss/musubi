@@ -1,1160 +1,212 @@
 # Musubi
 
-Open-source game backend in Rust: accounts, data, social, chat, leaderboards, matchmaking,
-authoritative realtime, dedicated-server fleets and **server meshing** — one Apache-2.0 binary,
-clustered out of the box.
+[![ci](https://github.com/musubi-oss/musubi/actions/workflows/ci.yml/badge.svg)](https://github.com/musubi-oss/musubi/actions/workflows/ci.yml)
+[![release](https://img.shields.io/github/v/release/musubi-oss/musubi?include_prereleases)](https://github.com/musubi-oss/musubi/releases)
+[![license](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-Status: alpha — the backend roadmap v0 is implemented and tested (CI runs the full suite against
-Postgres); client SDKs and the admin console are not written yet, so integrating today means
-talking to the HTTP/WS/QUIC API directly (`GET /openapi.json`).
+**Open-source game backend in Rust with server meshing.** One binary gives you accounts and
+authentication, player data, social and chat, leaderboards and tournaments, matchmaking,
+authoritative realtime, dedicated-server fleets, economy and LiveOps, an operator console and —
+the part nobody else ships open — a **seamless persistent world** spread over many simulators
+and many machines, with handover and failover that do not drop the player.
 
-## Quick start (dev)
+Apache-2.0. Clustered out of the box. Postgres is the only dependency.
+
+```
+clients (HTTP / WebSocket / QUIC)          Unreal dedicated servers (Musubi GDK)
+            │                                            │
+            ▼                                            ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│  musubi-server  ×N   roles: edge · api · realtime · sim · orchestrator│
+│  ───────────────────────────────────────────────────────────────────│
+│  auth · accounts · storage · social · chat · leaderboards · parties   │
+│  matchmaker · matches · worlds (cells, leases, handover, interest)    │
+│  fleets (docker / k8s / firecracker / GameLift / Edgegap / webhook)   │
+│  economy · LiveOps · WASM modules · webhooks · console at /console    │
+└──────────────┬──────────────────────────────┬────────────────────────┘
+               │ node bus: QUIC + Raft         │ or Postgres LISTEN/NOTIFY
+               ▼                              ▼
+                         PostgreSQL 16 (one database)
+```
+
+## Why
+
+Every piece of a multiplayer backend exists somewhere — but as a hosted service with a bill,
+as a framework that stops at "run your own server", or as an engine-locked meshing product.
+Musubi puts the whole thing in one open binary:
+
+- **Seamless worlds that scale out.** A world is a grid (or octree) of cells; cells are leased
+  to simulators, split when hot, merged when cold and moved between nodes automatically.
+  Entities cross cell and node borders with a handover protocol (ghosts, hysteresis, buffered
+  input, journal), clients only ever see one continuous world. Measured: 2 000 clients on
+  4 worlds × 4 000 entities across 2 nodes at 25–28 frames/s per client
+  ([numbers](docs/operations.md#measured-not-promised)).
+- **Failover that keeps sessions.** Nodes are killed every 12 s in the nightly chaos stand;
+  worlds re-home from snapshots + journals, resumable WebSocket sessions reconnect, zero lost
+  writes is the pass condition ([`musubi soak`](docs/operations.md#chaos-stand-musubi-soak)).
+- **Unreal Engine first-class.** A NetDriver-level plugin: the player's pawn, PlayerController,
+  PlayerState and replicated subobjects stay the *same instances* while authority moves to
+  another dedicated server. Join by `musubi://<world>` — no manual entity ids
+  ([GDK](docs/gdk-unreal.md)).
+- **Everything a live game needs on day one** — the list below is implemented and tested, not a
+  roadmap. 1 077 HTTP paths, 220 migrations, 650+ tests run against Postgres on every push.
+- **Cheap to run.** One Rust process per node, ~200 MB image, no sidecars, no JVM, no Redis.
+  5 400 HTTP req/s and 35 000 WebSocket messages/s per 8-vCPU node in the bundled bench.
+
+## What is inside
+
+| Area | Features |
+|---|---|
+| **Identity** | device / e-mail+password (argon2id) / magic link / custom; Steam, Apple, Google, Game Center, Facebook, Xbox, PlayStation, Nintendo link & unlink; JWT with key rotation, refresh-token families, device-code flow, session caps, brute-force locks, OAuth2 clients, SSO for operators, age gate & parental controls, GDPR data rights (export / delete / tombstones) |
+| **Players** | profiles, metadata, bans and sanctions with appeals, notes, audit trail, segments, geo & attribution, crash reports, kick / silence / shadow, dormant-account sweeps |
+| **Data** | typed storage collections with contracts, JSON Patch, aggregates, full-text search, indexes, live object subscriptions, versioned content bundles per environment, schema migrations, one IDL → contracts + RPC validation + OpenAPI + Rust/C++ types |
+| **Social** | friends, blocks, groups with roles, parties with invites and join requests, presence with rich status, notifications (TTL, templates, schedule, Web Push, e-mail), chat (rooms / groups / direct, history, typing, attachments, automod, filters) |
+| **Competition** | leaderboards (seasons, buckets, records, around-me), player statistics, tournaments with brackets (single / double elimination, round robin, standings, forfeit), ratings with seasons and decay, achievements, quests with pools and rerolls, progress graphs |
+| **Realtime** | WebSocket + QUIC/WebTransport + UDP channels, JSON or postcard framing, LZ4, resumable sessions, relayed and authoritative matches, turn-based matches, streams, rollback match support, interest management |
+| **Matchmaking** | skill / latency / party-aware queues, ready check, backfill, pause / drain, MMF testing and simulation, queue observability, georouting |
+| **Servers** | fleets with builds (delta upload), autoscaler rules, canaries; providers: Docker, Kubernetes, Firecracker (snapshots, warm pool), AWS GameLift, Edgegap, webhook; allocation, health, logs, crash capture |
+| **World meshing** | named worlds at 30 Hz, 2-D grid or 3-D octree cells, simulator leases, split / merge, placement strategies (adjacency, points of interest, player density, custom hook), cross-node offload, handover journal, time travel (snapshot / verify / rewind), persistent entities, entity ownership by account, `world_join` → find-or-spawn |
+| **Economy** | currencies and wallets with an append-only ledger, items (stackable / unique / bound / equipable), inventory limits, store with per-platform listings, reward tables and modifiers, battle pass / progression tracks, seasons, crafting, auctions, trades, code campaigns with fraud flags, IAP validation, subscriptions |
+| **LiveOps** | feature flags, experiments, remote config, audiences, live events, offers, news, changesets with approval, environments with promotion and dry-run, scheduled jobs |
+| **Logic** | WASM modules (wasmtime) with publish / canary / promote / rollback, RPCs, hooks (auth, storage, matchmaker placement, …), durable workflows (sagas), webhooks with retries and deliveries |
+| **Analytics** | event ingestion with schemas and sampling, sinks, KPI (DAU/WAU/MAU, retention cohorts, funnels, revenue), daily reports |
+| **Operations** | console at `/console` (React + TanStack, embedded in the binary), Prometheus `/metrics`, OpenAPI at `/openapi.json`, retention policies, encrypted secrets with re-keying, `musubi doctor`, Helm chart and Terraform (Hetzner, OVH), Nakama / PlayFab / UGS importers |
+
+Per-subsystem detail: [docs/features.md](docs/features.md). API by area: [docs/http-api.md](docs/http-api.md).
+
+## Quick start
+
+### 1. Run a node
+
+With Docker (image from GitHub Releases):
+
+```sh
+docker network create musubi
+docker run -d --name musubi-pg --network musubi \
+  -e POSTGRES_USER=musubi -e POSTGRES_PASSWORD=musubi -e POSTGRES_DB=musubi postgres:16-alpine
+docker run -d --name musubi --network musubi -p 7350:7350 \
+  -e MUSUBI__DATABASE__URL=postgres://musubi:musubi@musubi-pg:5432/musubi \
+  -e MUSUBI__HTTP__SERVER_KEY=change-me \
+  ghcr.io/musubi-oss/musubi:latest
+```
+
+Or from source (Rust 1.85+):
 
 ```sh
 docker run -d --name musubi-pg -e POSTGRES_USER=musubi -e POSTGRES_PASSWORD=musubi \
   -e POSTGRES_DB=musubi -p 5432:5432 postgres:16-alpine
-cargo run -p musubi-cli -- dev            # all roles in one process, migrates on start
-curl -s localhost:7350/v1/auth/device -H 'content-type: application/json' \
-  -d '{"id":"my-device-id-0001"}'          # → access_token / refresh_token
+cargo run -p musubi-cli -- dev     # all roles in one process, migrates on start, key `defaultkey`
 ```
 
-Configuration: TOML/YAML file via `--config`, every key overridable with
-`MUSUBI__SECTION__KEY` (e.g. `MUSUBI__DATABASE__URL`). `musubi config` prints the effective config.
+Migrations run on start. `GET /healthz`, `GET /readyz`, `GET /v1/node` tell you it is up.
 
-## Operating it
+### 2. Open the console
 
-| command | what it does |
-|---|---|
-| `musubi doctor` | config sanity (built-in secrets are refused outside `musubi dev`), database + pending migrations, data dir, ports; exit 1 if the server would not start |
-| `musubi migrate` | apply migrations and exit |
-| `musubi export --out dump.jsonl` / `musubi import --input dump.jsonl [--replace]` | move game data between environments (every `musubi` table except runtime state, foreign-key order, idempotent import) |
-| `musubi migrate-playfab --from ./export [--replace]` | import PlayFab (`GetPlayerCombinedInfo` JSON/JSONL, `{"Players": [...]}` wrappers) or Unity Gaming Services (Authentication + Cloud Save + Economy + Leaderboards stitched per player) exports: accounts with stable ids, linked platform identities, user data → storage (`playfab_user_data` / `playfab_readonly` / `cloud_save`), currencies → wallets, inventory, statistics → leaderboards; re-runs are idempotent and the old id keeps logging in via `POST /v1/server/auth/custom {"id": "playfab:<PlayFabId>"}` |
-| `musubi bench --url … --clients 50 --duration-secs 10 --scenario http\|storage\|ws\|chat\|match\|world\|all [--match-size 8]` | load generator with p50/p95/p99, throughput, errors and 429s (`chat`: rooms of 50, send → own echo; `match`: relayed matches of `match_size` players at 30 Hz, relay latency measured at the receivers) |
-| `musubi module publish NAME game.wasm` / `module canary NAME game.wasm --percent 10 [--accounts a,b]` / `module promote NAME [--drop]` / `module rollback NAME 3` / `module versions [NAME]` | ship WASM modules to a running cluster: straight to active, or as a canary taking a share of RPCs (plus pinned accounts) that you promote or drop; roll back to any earlier version |
-| `musubi fleet push fleet.toml` / `musubi fleet list` | create the fleet in the file or update the existing one of that name (buffer/min/max/policy); a `[build]` section adds a build version — canary (`canary_percent > 0`) or active |
-| `musubi deploy [--file musubi.deploy.toml]` | one manifest with `[[modules]]` (`name`, `path`, `canary_percent`) and `[[fleets]]` (same shape as `fleet push`), applied in order — the CI step after `cargo build --target wasm32-wasip1` |
-| `musubi config --format json` | effective configuration (secrets included — do not paste it anywhere) |
+`http://localhost:7350/console/` — sign in with the server key (or create an operator with an
+e-mail and password under *Settings → Operators*, invite others, enable SSO). Dashboard,
+players, worlds, fleets, matchmaking, economy, LiveOps, analytics and every admin setting live
+there; *Settings → Developer tools → Load demo data* fills a fresh node with players, currencies
+and items.
 
-Server-to-server keys: `http.server_key` is the bootstrap admin key; issue scoped keys with
-`POST /v1/admin/keys {"name","role":"server"|"admin"}` and revoke them with `DELETE /v1/admin/keys/{id}`.
-Clean-up of events/deliveries/audit/notifications/sessions runs on the `retention` lease
-(`[retention]`, days per table; chat history per channel kind — `chat_room_days` 90, `chat_group_days` / `chat_direct_days` 0 = forever, `chat_days` > 0 overrides all three; room messages are written to history only when the sender joined with `persistence: true`). Nodes drain on SIGTERM or `POST /v1/admin/cluster/nodes/{id}/drain`.
-
-### Measured (not promised)
-
-`musubi bench`, **release** build, one node on an 8-vCPU / 31 GB VM with Postgres 16 in Docker on
-the same box, 200 clients for 30 s, per-account `[limits]` off (otherwise the limiter is what you
-measure):
-
-| scenario | ops | ops/s | p50 | p95 | p99 | max | errors |
-|---|---|---|---|---|---|---|---|
-| HTTP `GET /v1/account` | 162 370 | 5 412 | 7.1 ms | 11.4 ms | 14.8 ms | 42.6 ms | 0 |
-| storage write + read-back | 129 444 | 4 315 | 8.8 ms | 15.1 ms | 19.8 ms | 56.8 ms | 0 |
-| WebSocket ping | 1 056 846 | 35 228 | 0.97 ms | 2.4 ms | 3.8 ms | 29.3 ms | 0 |
-| chat message → delivered (rooms of 50) | 559 927 | 18 664 | 0.86 ms | 2.4 ms | 4.2 ms | 26.4 ms | 23* |
-| relayed match input → echo | 253 936 | 8 465 | 1.35 ms | 3.4 ms | 5.1 ms | 33.1 ms | 0 |
-
-\* the 23 chat "errors" are sessions the node closed as slow consumers (see below): one bench
-process pretending to be 200 clients cannot drain ~1 M chat deliveries per second.
-
-World meshing, same box, **release** build, 30 s runs, 4 simulators per world over the stream
-(`--sims 4`, entities drifting across cell borders), players at 200 units radius, 30 Hz. "before"
-is the tree as of `bebbbcf`, "after" has the three fixes described below the table:
-
-| run | clients | worlds × entities | wire | frames/client/s | client delta p50 / p95 / p99 | node fan-out p50 / p99 | RL tick mean / p99 | handovers done / asked | node CPU |
-|---|---|---|---|---|---|---|---|---|---|
-| 1 | 200 | 2 × 500 | json | 29.8 | 34 / 43 / 61 ms | 2.5 / 25 ms | 0.23 / 2.5 ms | 359 / 359 | — |
-| 2 before | 1 000 | 4 × 2 000 | json | 26.5 | 50 / 75 / 123 ms | 10 / 100 ms | 1.0 / 25 ms | 5 103 / 5 188 | 154 % |
-| 2 after | 1 000 | 4 × 2 000 | json | **29.0** | **33 / 53 / 71 ms** | **5 / 50 ms** | 0.48 / 10 ms | 4 818 / 4 818 | 128 % |
-| 2b | 1 000 | 4 × 2 000 | binary | 28.6 | 34 / 60 / 81 ms | 10 / 50 ms | 0.6 / 10 ms | 4 959 / 4 959 | 154 % |
-| 3 before | 2 000 | 4 × 4 000, 8 sims | json | 12.3 | 65 / 240 / 352 ms | 25 / 250 ms | 2.2 / 25 ms | 6 982 / 13 744 | 164 % |
-| 3 after | 2 000 | 4 × 4 000, 8 sims | json | **23.6** | **39 / 94 / 134 ms** | **25 / 100 ms** | 1.5 / 25 ms | **8 568 / 8 574** | 225 % |
-| 3, 2 nodes, players on home, Postgres bus | 2 000 | 4 × 4 000, 8 sims | json | 24.0 | 35 / 87 / 196 ms | 25 / 100 ms | 2.3 / 25 ms | 2 099 / 6 055 | home 47 %, peer 22 % |
-| 3, 2 nodes, players split, Postgres bus | 2 000 | 4 × 4 000, 8 sims | json | 13.8 | 35 / 198 / 706 ms | 10 / 50 ms | 2.0 / 10 ms | 2 096 / 5 554 | home 65 %, peer 33 % |
-| 3, 2 nodes, players on home, QUIC bus | 2 000 | 4 × 4 000, 8 sims | json | 28.3 | 31 / 72 / 192 ms (max 0.44 s) | 10 / 50 ms | 1.6 / 10 ms | 3 269 / 7 249 | home 110 %, peer 26 % |
-| 3, 2 nodes, players split, QUIC bus | 2 000 | 4 × 4 000, 8 sims | json | 25.5 | 33 / 93 / 187 ms (max 0.75 s) | 10 / 50 ms | 1.5 / 10 ms | 3 524 / 6 476 | home 66 %, peer 12 % |
-
-The two-node rows are the same stand with a second `sim`-role node on the same VM and
-`--controller '{"offload_above_cost": 800}'`: the home moves ~40 cells (of 4 × 25) to the peer,
-the bench simulators follow the lease redirects and the peer ticks and fans out its cells
-(70–160 k frames in 30 s). The first two rows are kept as a warning: node 1 of that stand had no
-`node.bus_listen`, so every one of its inter-node messages went over the Postgres `NOTIFY`
-fallback (one round trip to the database each, 7 900 bytes max) — that, not the design, is the
-13.8 fps and the 22 s backlog with players split. Three things changed for the QUIC rows:
-messages to sessions on other nodes (`Wire::Session`, i.e. world deltas to remote players) get
-their own bus lane and are batched per drain like replica deltas (they used to go one message
-per session per tick on the control lane, in front of the handovers; batching is off on the
-Postgres fallback, where a batch would exceed the cap and be dropped whole); a node the
-directory names as a cell's host now takes the cell on the first request for it (`ensure_hosting`,
-with the cell resolved from `musubi.worlds` when the shard is not up yet, and a follower whose
-directory replica lags asks the leader) instead of redirecting back to the home — a simulator
-redirected during an offload used to bounce between the two nodes until "too many redirects";
-and the bench stand survives cells moving while it is still spawning (per-cell leases, a 409 on
-spawn re-leases on the new host). Result with players split over both nodes: 23 fps per client,
-same p99 as one node, the peer now does more of the work than the home (32 % vs 48 % of a core)
-and the home's send path is no longer the ceiling (fps per client moves between 17 and 25
-across runs of the same build; the rows are single runs, the split row shows the range seen).
-Still honest: this is two nodes on one VM, and cross-node handovers remain the open problem —
-~3 000–3 400 complete per run against ~10 000–13 000 asked (one node: all of them; the counter
-now includes completions acked from another node, it used to count only the simulator's ack
-path). The funnel is instrumented (`musubi_world_handover_recv_total{path}` on the receiver,
-`musubi_world_handover_acks_total{path}` on the sender, `musubi_fanout_published_total{lane,kind}`
-on the bus) and it moved the picture from guesses to numbers: the control lane of the bus used to
-carry ~148 000 `world_subscribe` re-sends a run (clients move their interest as they walk, each
-one a message to the shards of a split world) ahead of the ~12 000 handovers, so a handover
-reached the peer up to a minute late and the sender re-shipped it (55 000 duplicate deliveries a
-run) — those re-sends now go on the batched input lane, the control lane carries handovers only,
-duplicates are 16 a run; a handover ships the full entity (a delta against a ghost the receiver
-no longer held was refused one time in five); a world deleted on its home is dropped on every
-node (the peer kept the shards of 198 deleted bench and test worlds); the remote-handover
-timeout is 30 ticks (`remote_handover_timeout_ticks`), acks travel on the parallel lane, the
-control lane keeps 8 sends in flight with order restored on the receiver — and a gap is no longer just waited out: a receiver missing frames for 50 ms asks the sender (`OrderNack`, once per 200 ms per gap), the sender replays them from the last 256 control frames it kept, replays other receivers already have are dropped as duplicates, and only a gap still open after 500 ms is skipped (a frame of it arriving later is still dispatched, once) — `musubi_bus_order_{nacks,replayed,dups,gaps}_total`. What is left is measured too, down
-to single entities (`hotrace` debug lines on both nodes, one entity in sixteen): a border
-handover shipped to the peer is acked while still in transit 264 times of 266 — the cross-node
-path itself works and takes ~60 ms; the ~6 400 "late" acks a run are the peer's acks to the
-forced migrations of offloaded cells (the home drops those entities as it ships them, so an ack
-finds nothing — benign); and the largest loop was a refusal: the peer turned an entity away when
-the hosted target cell had no simulator lease yet (the bench simulator was still following the
-offload redirect), the sender re-offered it every tick (~60 ms) for as long as that took. A
-hosted cell without a lease now takes the entity and holds it, as an unleased cell on one node
-does (`unowned_cell` in the receiver's funnel: 11 500 of 16 600 arrivals in two runs) —
-completions went from ~3 000 to 3 500–4 100 of ~5 800 asked. A receiver whose cached cell directory says the cell is not
-its own now asks the leader before turning the entity away (`here_after_fresh_lookup`: 353 of
-521 such arrivals in a run were in fact its cells; the 168 `not_here_confirmed` are refused at
-once instead of silently, so the sender re-targets on the next tick rather than after the
-timeout) — 3 750 of 5 801 asked completed in that run. The bench's "asked" column used to count every
-`handover_request` event, and an entity the home re-offers on the next tick while its first
-request is open appeared again; it now counts distinct requests and reports the repeats as
-`handover_asks_repeated` (forced migrations of offloaded cells never were in it — they reach
-the simulator as `cell_released`). Counting how a request ends
-(`musubi_world_handover_ended_total{path}`) showed the real inflation: ~15 000 local requests
-per run expired after `handover_timeout_ticks` because the simulator's ack took longer than
-10 ticks on this shared VM, and the entity was asked again next tick while the late ack was
-thrown away. A late ack is now accepted when the entity still stands in a cell the acking
-simulator owns — distinct requests per run 10 771 → 4 202 with 3 245 completed (77 %, was
-32 %), local expiries 15 257 → 7 465, and each expiry is closed by the ack instead of a
-re-ask. The simulator stream itself no longer makes an ack wait: frames used to be written
-in the same loop that read the simulator's commands, so an ack sat behind the full-state frame
-being sent — frames now leave through a bounded channel on their own task, a tick that finds it
-full is skipped (`musubi_world_sim_frames_skipped_total`; events are drained only when a frame
-is built, so none are lost) and the ack's age is measured
-(`musubi_world_handover_ack_latency_ticks`). Honest result: on this stand the server's writer
-was almost never the blocker (34 skipped frames a run) — the simulators here are 32 bots in one
-bench process parsing full-state JSON at 70 % CPU, so the split alone moved expiries only
-15 406 → 13 530; the timeout default did the rest (next bullet list). The frame itself was the
-simulators' real cost: every tick carried every entity of every leased cell. `stream?delta=1`
-sends per cell only what changed since the simulator's previous frame (`owned`/`ghosts` with the
-changed entities, `gone` with the ids that left, `full: true` on a cell's first frame) and the
-simulator keeps the view; same stand: 14.6 M entity records a run became 0.49 M (30× less), the
-bench process 71 → 58 % CPU, node 28 → 22 %, expiries 8 204 → 7 276, 0 errors — and the bots
-still read ~19 of 30 frames a second, so their loop, not the frame, is the next thing on the
-stand side. The control lane's gap replay (`OrderNack`, above) was then put on the same stand: a
-players-split run showed no gaps and no nacks on either node and two duplicate frames dropped on
-the peer — the QUIC bus loses nothing on one VM, so the replay is exercised by its unit tests and
-is there for the Postgres fallback, reconnects and lossy links (26.7 fps per client, p99 171 ms,
-3 630 of 5 723 asked handovers completed, 0 errors on that run). Backpressure for the
-remote players' deltas sits at the producer, not in the queue: a frame to a session on another
-node cannot be dropped once built (the world has already marked the client as knowing it —
-spawns and positions would never be resent), so instead the home skips building a new delta for a
-session whose previous frame has waited on the session lane longer than `SESSION_CONGESTED_AFTER`
-and the client's interest keeps the change for the next one (`musubi_world_deltas_deferred_total`,
-`musubi_fanout_queue_depth{lane}`). Measured honestly: gating at 100 ms bounded the lane (worst
-wait 11.5 s → 4.8 s) but deferred 465 000 deltas a run and cost every remote player a fifth of
-their frame rate (26.7 → 21.3 fps) — the lane's send throughput is the ceiling, not the queue —
-so the gate is one second: the same run then holds 26.6 fps per client (p99 189 ms, 0 errors),
-defers 424 deltas — only the ones that would have arrived useless — and the lane's worst wait is
-9.0 s instead of 11.5 s. Which says plainly that the remaining backlog is the session lane's own
-throughput (one send in flight, a thousand frames serialized per tick on the home), the next
-thing to take apart. First probe, measured and kept out of the code: four session lanes sharded
-by session id (order only matters per session) changed nothing — 25.7 fps, worst wait 12.3 s,
-average 7.3 s, i.e. the lanes queue behind each other on the one QUIC connection. The numbers
-that do point somewhere: a 64-frame session batch takes 23 ms on average (136 ms worst) to
-serialize and push, the home sends ~59 MB/s to the peer over the run, and the peer applies what
-arrives with an 8.6 ms average lag — the cost is on the sender's batch path (JSON of a thousand
-deltas a tick plus the send into the peer's flow-control window), not at the receiver. Split further (`musubi_fanout_batch_ms{lane,phase}`): serializing a
-session batch costs 0.26 ms, sending it 3.1 ms — twelve times more, and the bulk lane's sends
-added up to 48 s of a 40 s run (1.1 ms × 42 000 batches), so both lanes are simply saturated by
-the send call, which returns only when the peer has read the frame. So the bus now keeps one long-lived QUIC stream per
-peer and priority lane and writes length-prefixed frames on it — a send returns when the bytes are
-in the stream (flow control is the only wait) instead of after the peer has read them (`stopped()`
-per frame was the round trip), order per lane is the stream's, legacy one-frame-per-stream peers
-are still read. Measured on the same stand: 28.0 fps per client (p95 84 ms, p99 166 ms, 0 errors),
-the bulk lane's backlog is gone (38 s worst wait → no slow sends at all), the session lane's is
-not (worst wait 6.6 s, a 64-frame batch still takes 2.5 ms to write) — and the peer's inbound lag
-rose from 8.6 to 23.5 ms: the wait moved to the receiver, which reads and parses each lane stream
-sequentially. Parsing was then taken off the stream reader (the reader only moves bytes and
-releases the window, a worker per stream parses and dispatches in order, `musubi_bus_ingest_ms`):
-the peer's inbound lag fell to 15.9 ms, fps stayed at 28.0 — and the measurement says the parse
-was never the cost (15 µs a frame). A 64-frame write still takes 2.7 ms, which with 15 µs of work
-behind it is flow control: the next suspect is the QUIC connection's receive and send windows for
-~60 MB/s on one connection. Raised (16 MB per stream, 64 MB per connection, both ends, `bus_transport`): 28.4
-fps per client, p99 150 ms (the best of this series), 0 errors, the session lane's worst wait
-4.1 s (was 6.1 s) — but a write still costs 2.4 ms, and the peer's inbound bulk queue now lags
-224 ms on average (was 16 ms): the window let the home push replica and ghost deltas faster than
-the peer's single apply worker takes them under the world locks. The backlog has moved for the
-last time to where the work actually is — applying bulk deltas on the receiver — and that worker
-was then split per world (one apply worker per world, order within a world kept): the peer's
-inbound bulk lag halved, 224 → 109 ms average, with fps and p99 inside the run-to-run spread
-(26.9 fps, p99 191 ms, 0 errors; 28.4 / 150 the run before — the stand's variance between runs is
-about that wide, so only the lag figure is a result). What remains on the receiver is the per-world
-lock the delta is applied under, and that is a world-tick question, not a transport one. The bus frame
-itself was the fps ceiling: every message was a `serde_json::Value` — serialized twice on send,
-decoded twice on receive — and the home's session and bulk lanes ran 15–25 s behind under this
-load. The payload is now carried as the sender's bytes (`RawValue`, one serialization per hop):
-the bulk lane no longer falls behind, the session lane's worst wait went from 26 s to 10 s,
-inbound dispatch lag averages 3 ms, and the two rows above moved from 17–25 fps with
-multi-second stalls to 25.5 / 28.3 fps with a worst frame under a second — on two nodes sharing
-one VM with the bench process, so the absolute numbers say less than the trend.
-
-Read it as: the simulation step (`musubi_world_tick_duration_seconds`) is never the problem —
-1.5 ms mean with 4 000 entities and 8 simulators handing entities to each other 280 times a
-second. What fell over first was the **fan-out**, and `MUSUBI_TICK_TRACE=1` showed where: of a
-40–110 ms fan-out per tick, almost all of it was `World::snapshot()` — the per-tick copy of the
-world that the delta build reads — deep-cloning 4 000 entities' component maps (JSON values) on
-the world's single thread, with the other cores idle (run 3 before: 1.6 of 8 cores). Three fixes:
-
-- entity components live behind an `Arc` with copy-on-write (`Arc::make_mut` on the entities
-  that change in a tick), so the snapshot is 4 000 reference bumps instead of a deep copy;
-- the per-client delta scan runs in parallel chunks on the rayon pool once a world has more
-  than `PAR_DELTAS_MIN` (128) subscribers (small worlds stay sequential: the scheduling cost
-  exceeded the gain there);
-- `handover_timeout_ticks` default 3 → 10: a simulator on the stream answers on its next frame,
-  and 100 ms cancelled half of the handovers under load (run 3 before: 6 982 of 13 744 asked —
-  the rest were rolled back and re-requested); at 10 ticks every handover completes.
-- `handover_timeout_ticks` default 10 → 30 (same as the remote timeout): measured on the
-  two-node stand (`musubi_world_handover_ack_latency_ticks`), the acks that made it in time
-  peaked at 9–10 ticks and ~13 500 a run came later; at 30 the in-time acks sit at p50 5 /
-  p99 19 ticks and expiries halve (13 530 → 8 204) — the rest are simulators that take over a
-  second to answer on a 70 %-CPU bench process, and a late ack still completes them.
-
-Also fixed on the way: a session whose outbound queue was full used to spill its message onto
-the cluster bus (whose Postgres `NOTIFY` lane caps payloads at 7 900 bytes — the log filled with
-`bus message realtime exceeds 7900 bytes` under load); it is now dropped locally and counted in
-`musubi_session_dropped_total{reason="queue_full"}`. The binary wire cuts bytes 3.6× (59 → 16.5
-MB/s at run 2) and is the right default for games; it does not change the fan-out ceiling. What
-remains at 2 000 players is the one-home-node replication layer per world — the next item.
-The 0.1–0.5 % `sim_moves_err` in the stream runs are `apply`s a simulator sent one tick after it
-lost the entity to a neighbour (`not authoritative`) — expected and harmless; the new owner
-carries on from the acked state.
-
-Two things made the realtime rows what they are. The request state used to be a flat struct of
-~50 reference-counted fields cloned by every middleware layer; behind one `Arc`,
-`GET /v1/account` alone with all 200 clients went from 5 863 to 24 931 ops/s (p50 32 → 7.6 ms)
-and the node from four cores to ~1.2, with Postgres (~1.7 cores) now the ceiling. And accepted
-sockets run with `TCP_NODELAY`: a room fan-out is many small frames per connection, so Nagle plus
-the peer's 40 ms delayed ACK had pinned chat at p50 44 ms and 6k messages/s whatever the CPU did;
-without it the same run does 43 598 messages/s at p50 3.0 ms. Set it in your own clients too.
-
-A session whose outgoing queue (256 messages) overflows is closed with
-`unavailable: slow consumer: outgoing queue full` and counted in
-`musubi_session_send_full_total`, like Nakama does — a gapped stream is worse than a reconnect,
-and the client resumes with its subscriptions.
-
-`database.max_connections` (default 32, sized so three local nodes fit under Postgres' default
-100) is the next knob: at 96 the same box does 28 439 ops/s on `GET /v1/account` and 17 108 ops/s
-on storage write+read-back (200 clients, one scenario at a time) against 24 931 / 14 674 at 32.
-
-Where the rest of the time goes (same box, 48 connections, storage write+read-back at ~15 000
-req/s): the node burns 1.1–1.5 cores, Postgres 2.2, and 2–3 cores stay idle; sampled thread states
-show 1–2 of the node's 10 threads runnable and `pg_stat_activity` shows most backends in
-`ClientRead` — the three processes are passing small messages to each other and the latency is
-the box's scheduling and loopback stack, not any one of them. Per node core that is ~21 000
-`GET /v1/account` and ~12 000 storage requests a second, against the 10 000 / 5 000 per vCPU the
-design aimed for. Two things that do move it: pointing `database.url` at the container's IP
-instead of the published port (Docker's userland proxy copies every byte) is +13 % and
-‑1.4 ms p50; and the storage layer now spends one round trip where it used to spend several — a
-batch read is a single `unnest` join in request order, and a write is one guarded
-`insert … on conflict do update … returning version` (permission, CAS and create-only checks are
-in the `where`), with the current row fetched only when the guard rejected. On loopback that is
-noise; with Postgres a network hop away each round trip is the whole budget.
-
-`musubi soak` on the same VM, release build, 3 nodes, 24 clients, 6 worlds split across two nodes
-each with 20 entities shuttling over the border, 75 s, SIGKILL of a node every 12 s (3 incidents):
-survivors marked the victim dead after 4.7 s, its worlds and matches were re-homed 4.7 s (p50) to
-10.8 s (max) after the kill, every entity of every split world was accounted for on a survivor
-again 4.7 s (p50) / 10.8 s (max) after the kill with 0 lost and 0 duplicated, the restarted
-process rejoined in 1.0–2.0 s (one slow rejoin at 8.5 s); 25 175 verified storage writes with
-0 lost, 8 WS sessions resumed (6 fresh reconnects), 5 537 match inputs echoed with 0 resets. An
-earlier run of this stand found duplicates after a re-home (two border worlds with 36 and 33
-entities instead of 20): a cross-node handover cancelled during the failover kept its copy while
-the new host had already accepted it, and control messages were queuing tens of seconds behind
-chat and replication traffic in a single bus queue. Adoption announcements answered with drops,
-directory-based ownership checks and separate bus lanes are what made the numbers above settle —
-the stand exists precisely so such numbers are not promised away. Run both against your own
-deployment; numbers from real hardware and a real network are the ones that matter.
-
-### Micro-benchmarks (criterion)
-
-Hot paths have criterion benches that run on every push and pull request (`bench` job in
-`.github/workflows/ci.yml`): `musubi-mesh` (handover detection, per-tick advance, cell view, client
-delta at 1k / 10k entities), `musubi-proto` (envelope encode/decode in JSON and postcard) and
-`musubi-auth` (argon2 hash/verify, password policy). The job benches the base commit (PR base, or the previous push) on the same runner first, then HEAD against it — comparing across GitHub's shared runners is meaningless, their CPU models differ by 2× on the same code — and `scripts/bench-compare.py 5` fails when a bench's mean is more than 5 % slower after dividing out the drift of the code-independent `calibrate` bench, even at the optimistic end of the 95 % interval, and by at least 100 ns (sub-microsecond benches still shift by a few tens of ns within one machine; `bench-compare.py 5 0` disables the floor). Suspects are re-run once before failing. Locally: `cargo bench -p musubi-mesh -p musubi-proto -p musubi-auth --benches -- --save-baseline main`
-on the old code, `cargo bench … -- --baseline-lenient main` on the new code, then `python3 scripts/bench-compare.py`.
-
-### Chaos stand (`musubi soak`)
-
-Failover claims are measured the same way latency is. `musubi soak` spawns a real local cluster of
-`musubi-server` processes on one Postgres, homes persistent worlds across them, puts resumable WS
-sessions and write-then-read-back storage clients on it, then SIGKILLs or drains a random node every
-few seconds and restarts it:
+### 3. Talk to the API
 
 ```sh
-musubi soak --database-url postgres://musubi:musubi@localhost:5433/musubi_soak \
-  --nodes 3 --clients 12 --worlds 6 --duration-secs 75 --kill-every-secs 12 --mode mixed
+# a player
+curl -s localhost:7350/v1/auth/device -H 'content-type: application/json' \
+  -d '{"id":"my-device-id-0001"}'                 # → access_token / refresh_token
+# your game server
+curl -s localhost:7350/v1/server/worlds -H 'x-musubi-server-key: change-me' \
+  -H 'content-type: application/json' -d '{"name":"demo"}'
 ```
 
-It reports, per incident, how long the survivors took to drop the node, how long until every world it
-owned was homed elsewhere and how long the restarted process took to rejoin, plus client errors,
-reconnects and lost writes (a write acknowledged by one node but not readable from another). The
-command exits non-zero on any lost write or incident that did not settle within 60 s. Set
-`MUSUBI_SOAK_NODE_LOG_DIR` (and `MUSUBI_SOAK_NODE_LOG_LEVEL`) to keep the nodes' logs.
+Full schema: `GET /openapi.json`. Server-to-server keys with roles are issued with
+`POST /v1/admin/keys` and revoked instantly cluster-wide.
 
-Measured on the same debug build / VM as the numbers above, two 75 s runs, 3 nodes, 12 clients, 6
-worlds, 7 incidents in total:
+### 4. Plug in Unreal
 
-| incident | survivors drop the node | worlds homed elsewhere | restarted node back |
-|---|---|---|---|
-| SIGKILL (follower or leader) | 4.8 – 8.7 s | 5.7 – 9.3 s | 1.1 – 2.0 s |
-| drain via admin API | 0.1 s | 3 – 5 s | 0.2 – 1.2 s |
+Copy `sdk/unreal/Musubi` into `Plugins/`, point `DefaultGame.ini` at the node, derive your
+GameMode from `AMusubiGameMode`, put `UMusubiAuthorityComponent` on the player character, and
+clients connect with `open musubi://demo`. Dedicated servers run `-server -MusubiCells=…` (or
+let the node assign cells). Step by step: [sdk/unreal/README.md](sdk/unreal/README.md) and
+[docs/gdk-unreal.md](docs/gdk-unreal.md). Engine 5.3 → 5.8 (Iris bridge on 5.5+).
 
-Storage: 33 287 verified writes, 0 errors, 0 lost writes. WS: 17 445 pings answered, 17 sessions
-cut by a kill or drain. Since resumable sessions keep a record in Postgres, a cut session is rebuilt
-on whichever node the client reaches next (same session id and token, joins and follows replayed):
-in a later 60 s mixed run all 6 cut sessions resumed, none reconnected fresh — the client has to
-retry for a few seconds after a kill, because the cluster hands a session over only once SWIM has
-declared its node dead (`MUSUBI_SOAK_DEBUG=1` prints each rejected attempt). The SIGKILL numbers are SWIM's suspect timeout plus one
-failover round, which now starts the moment the death verdict lands (it used to wait for the next
-15 s tick, making it 11 – 12 s); a drained node announces its departure, so its worlds move an order
-of magnitude faster. Open item, now with a trace: in two of roughly twenty kills on this VM the re-home did not settle within the 60 s budget. Reproduced in 1 of 8 kill-only runs with the survivors' Raft/world/member state dumped: the Raft group had been churning elections the whole run (terms 6 → 141 with no new log entry, 142 elections against 3–8 in the clean runs) because vote RPCs to a *live* leader timed out after 1.5 s — that run shared the 8 cores with a `cargo clippy` build, i.e. CPU starvation, not a network fault (one stale-certificate handshake failure after a restart, otherwise none). When the leader was then killed, the two survivors never formed a quorum within 60 s and every world the leader homed stayed unreachable (`leader: null` on both). The failover round needs directory writes, so a leaderless group blocks re-homing entirely. Next: Raft timing that survives a starved box (heartbeat/election as cluster config, vote RPC timeout bounded by the election timeout) and a controlled starvation experiment on the stand. Done, with a twist: Raft heartbeat/election are now cluster config (`node.raft_heartbeat_ms`, `node.raft_election_min_ms`, `node.raft_election_max_ms`, defaults 500/1500/2500) and three kill-only runs under eight busy-loop processes on the 8-core VM gave: defaults starved — 4 elections, 0 lost; defaults unstarved — 9 elections, 0 lost; 1000/3000/5000 starved — 5 elections but one re-home never settled. That failure is not Raft: SWIM on the surviving follower flapped the *new leader* Alive → Suspect → Dead under starvation (probe 500 ms, suspect 3 s), its failover rounds then listed the live leader as dead, and the bus refuses to dial a SWIM-dead peer, so every directory write it needed was turned away while the leader itself timed out confirming leadership against the killed node still in its replication set. Busy loops do not reproduce the election churn of the clippy run (that build starves memory and IO, not just cores). Next: SWIM timings that tolerate a starved box and a bus that still dials the Raft leader regardless of SWIM state. Done for the verdict itself: a SWIM suspect whose Postgres heartbeat is still fresh (`DEAD_AFTER` 15 s) is kept suspect for one more window instead of declared dead (`musubi_swim_death_vetoed_total`; a bus partition with a live heartbeat is still declared dead after the second window, ~6 s) — two independent signals have to agree before a failover starts against a node. Under the same eight busy loops both configs then settle every kill (1000/3000/5000: 3 kills, 0 lost, 15 vetoes; defaults: 3 kills, 0 lost, 14 vetoes). The price is honest: a real death is now confirmed by the stale heartbeat, so detection under starvation went from ~5–6 s to 10–12 s; on an idle box SWIM still declares it in ~5 s because the heartbeat row goes stale at the same time.
+## Configuration
 
-Split worlds are in the stand too: every world gets cell `(1,0)` hosted on the node after its home,
-one simulator per side leases its cell and 20 persistent entities keep crossing the border
-(`x` 90 ↔ 110); after each incident the stand counts entities through every node's cell views and a
-run fails on a single lost one. Two 110 s runs (3 nodes, 12 clients, 6 worlds × 20 entities, SIGKILL
-of a leader with 2 worlds + a drain, `--kill-every-secs 40`): 0 lost entities in both, worlds re-homed
-in 7.6–7.8 s, matches in 12.5 s, all cell views consistent again 13.6 s after the kill. Getting there
-fixed: journal chunks replayed out of tick order (a late Despawn erased a returned entity), a node
-restarting with the same id resuming its cells from memory while the home re-homed them (two owners),
-cell hosts resolved from a local cache that never learns about an unassignment (redirect loops), and
-an adopter treating a draining node as a live host by stale cache (its fresh snapshot skipped).
-A node now counts as dead only when SWIM says so *and* its database heartbeat is stale, so a fast
-same-identity restart is never mistaken for a death.
+TOML or YAML via `--config` / `MUSUBI_CONFIG`; every key can be overridden with
+`MUSUBI__SECTION__KEY` (`MUSUBI__DATABASE__URL`, `MUSUBI__HTTP__LISTEN`, …). No config file is
+needed to start. `musubi config` prints the effective configuration, `musubi doctor` checks
+it (built-in secrets are refused outside `musubi dev`).
 
-The stand runs nightly in GitHub Actions (`.github/workflows/soak.yml`, also on demand with a
-chosen duration and mode); the JSON report and the nodes' logs are kept as the run's artifact, and
-the job fails on any lost write or unsettled incident.
-
-The stand already paid for itself: its first runs showed that a node restarted with the same identity
-after a crash was never seen alive again by the survivors (a SWIM "dead" verdict was terminal per node
-id); that is fixed and covered by `killed_node_rejoins_with_same_identity`.
-
-## HTTP API (so far)
-
-| route | auth | purpose |
+| key | default | meaning |
 |---|---|---|
-| `GET /healthz`, `GET /readyz`, `GET /v1/node` | — | liveness, DB readiness, node info |
-| `POST /v1/auth/device`, `POST /v1/auth/email` | — | authenticate / create account, returns JWT access + refresh. Brute force (5.1): failed email logins per address → exponential lockout (`[session] lockout_threshold/base_secs/max_secs`); after `captcha_after` (3) failures the request must carry `captcha` — verified by a `hook_auth_captcha` module (`{token, ip}` → `{ok}`) or by `captcha_verify_url` + `captcha_secret` (Turnstile / hCaptcha / reCAPTCHA siteverify), otherwise `403 captcha_required` / `captcha_invalid`. Every login stamps the client IP on its session; a login from an address the account was never seen at emits `account.suspicious_login` on the event bus and `hook_suspicious_login` to modules |
-| `POST /v1/auth/device_code {client, device_id, vars}` → `{device_code, user_code, interval, expires_in}`, `POST …/device_code/token {device_code}` (202 pending / 429 slow_down / 403 denied / 410 expired / 409 used / 200 session), `GET …/device_code/{user_code}`, `POST …/device_code/approve|deny {user_code}` (Bearer); server `GET /v1/server/device_codes?status&account_id`, `DELETE …/{id}` | Device-code / handoff login (RFC 8628 shape) for TVs, consoles and headless clients: show a short code, approve it from a signed-in phone, the device receives a full session; codes are hashed, single-use, 10 min |
-| `POST /v1/auth/refresh` | — | rotate refresh token (reuse revokes the family) |
-| `POST /v1/auth/logout`, `GET /v1/account/me` | bearer | |
-| `GET\|PATCH\|DELETE /v1/account` | bearer | own account: profile fields, metadata, identities (masked), soft delete |
-| `POST /v1/account/link/{device,email}`, `DELETE /v1/account/unlink/{device,email}` | bearer | link/unlink identities (the last one cannot be unlinked) |
-| `GET /v1/users?ids=…&usernames=…` | bearer | public profiles, ≤100 per call |
-| `GET\|POST\|DELETE /v1/friends`, `POST /v1/friends/block` | bearer | friends graph: invite/accept/remove/block, Nakama states 0–3, cursor paging, ≤1000 friends |
-| `GET /v1/friends/code`, `POST /v1/friends/code/rotate {max_uses, expires_in_secs}`, `GET /v1/friends/code/{code}` (owner card), `POST /v1/friends/code/{code}/add`; `GET/PUT /v1/friends/settings {requests: anyone|friends_of_friends|code_only|nobody}` | Friend codes (`XXXX-XXXX`, rotatable, use/time-limited; add-by-code bypasses the owner's policy) and friend-request privacy (`POST /v1/friends` → 403 when refused; accepting an incoming invite is always allowed) |
-| `GET\|POST /v1/groups`, `GET\|PATCH\|DELETE /v1/groups/{id}`, `POST /v1/groups/{id}/{join,leave,add,kick,promote,demote}`, `GET /v1/groups/{id}/members`, `GET /v1/users/{id}/groups` | bearer | groups/clans: open or request-to-join, ranks 0 superadmin/1 admin/2 member/3 request, max_count, prefix search |
-| `GET\|DELETE /v1/notifications` | bearer | persistent notifications (friend request/accept are emitted automatically), live push over the socket |
-| `GET /v1/channel/{id}/messages` | bearer | chat history (direct/group persisted; rooms are ephemeral); live chat over the socket: `channel_join/leave`, `channel_message_send/update/remove`, presence events |
-| `POST /v1/channel/{id}/report` | bearer | report a participant (`account_id`, optional `message_id`, `reason`); the channel's last 20 messages are attached as context. Moderation layer (server key): `GET/PUT /v1/admin/chat/filters`, `DELETE …/filters/{id}` — word filters per language (`lang` or all), plain words matched after leet-speak/separator normalisation (`5h.1t` → `shit`) or `regex`, `action` `mask` (word → `****`) or `block` (send rejected); `GET/PUT /v1/admin/chat/{id}/settings` `{slow_mode_secs}` — one message per window per sender (the window lives in `chat_slow_mode` and is advanced by one conditional upsert, so it is shared by every node); moderation kind `shadow` next to `mute`/`ban` — the sender gets ack and echo, nobody else gets the message; `GET /v1/admin/chat/reports?status=open`, `GET/POST …/reports/{id}` `{status: resolved|dismissed|open, by}`; attachments (plan 5.5): `PUT /v1/channel/{id}/attachments` with the raw body (`Content-Type` kept, at most `[chat] attachment_max_bytes` = 10 MiB, inline in Postgres or streamed to `[ugc.s3]` object storage) returns `{id, url, mime, size, sha256}` that a message carries in `content.attachments`; `GET /v1/channel/{id}/attachments/{attachment_id}` needs access to the channel |
-| `POST /v1/reports` {target_id, category, details?, evidence?}, `GET /v1/reports`; `GET /v1/admin/reports?status&target_id&category&cursor`, `GET /v1/admin/reports/{id}`, `POST /v1/admin/reports/{id}` {status, decision?, by?, ban?}, `GET /v1/admin/accounts/{id}/reports` | bearer / server key | player reports (5.12): categories `cheating, harassment, griefing, offensive_name, spam, exploit, other`, free text ≤ 2000 chars and an `evidence` object (match_id, world + tick, channel_id + message_id, url — whatever the client has); one open report per reporter → target, 20 per reporter per day, no self-reports; `player.reported` on the bus with the target's open-report count. Moderators list the queue (status/target/category filters, cursor), read one, see a per-account summary (distinct reporters, counts by category/status, recent) and decide: `reviewing`, `dismissed` or `actioned` — with `ban: {until_secs?, shadow?, reason?, message?}` the target is banned exactly like `/v1/admin/accounts/{id}/ban` and every other open report on them is closed as actioned (`report.decided` on the bus). Reporters see the outcome, not moderator notes |
-| `GET /v1/channel/{id}/messages/{message_id}/replies` | bearer | threads: `channel_message_send` takes `reply_to` (a top-level message of the same channel; one level deep), replies list oldest-first with a cursor; messages carry `reply_to` and `mentions` — `@name` in any string of the content is resolved to accounts server-side (case-insensitive, unknown names ignored) and each mentioned account gets a persistent notification `mention` (code 10) with channel/message/content. Unread: `GET /v1/channel/unread?channels=a,b` → per channel `count` (messages after the read cursor not sent by you) and `mentions`; `POST /v1/channel/{id}/read {message_id?}` moves the cursor forward (never back; omit the id to read up to now) |
-| LiveOps feed (`[zanshin]`) | — | every account-bound event on the event bus (`account.authenticated`, `friend.added`, `purchase.*`, `match.ended`, `group.*`, `lobby.*`, …) is also tracked in Zanshin with the account id as `external_id`, batched by the existing flusher — the same stream webhooks get; WASM modules read LiveOps through `host_call` ops `liveops.flags {names}` and `liveops.live_events` (per-account answers cached 30 s on the node) |
-| `POST /v1/admin/webhooks/{id}/deliveries/{event_id}/redeliver` | server key | put a delivery back in the queue — one marked `dead` after 12 attempts, or a delivered one the receiver lost: attempts and backoff start over and the next dispatch cycle sends it again (unknown pair → 404) |
-| `POST /v1/account/mfa/totp`, `POST …/totp/verify`, `DELETE …/totp`, `POST /v1/auth/mfa` | bearer / public | TOTP second factor (5.1): enrol → base32 secret, `otpauth://` URI for the QR code and 8 one-time recovery codes (stored hashed); nothing is enforced until a code confirms the enrolment. With an authenticator enabled, `POST /v1/auth/email` answers `{mfa_required, mfa_token}` instead of a session — the 5-minute token is not accepted as a bearer anywhere — and `POST /v1/auth/mfa {mfa_token, code}` finishes the login (a recovery code works once); RFC 6238 SHA-1 / 30 s / 6 digits with ±1 step of skew. Device and social logins are untouched (the device or the identity provider is the second factor there); refresh is untouched |
-| `GET/POST /v1/server/fleets/{id}/builds`, `POST …/builds/{v}/promote`, `DELETE …/builds/{v}`, `GET …/fleets/{id}/usage?from&to` | server key | fleet build pipeline (5.9): a build is a versioned `spec` (image / command / env / `vcpu`); `canary_percent` > 0 registers it as a canary that takes that share of newly started servers (optionally only in `canary_regions`), 0 makes it active at once and retires the previous build; `promote` makes any build active (a canary, or an old one — that is the rollback) and retires the rest; the active build cannot be retired; running servers are never touched — new ones pick the build at start and record `build_version`. Usage: vCPU-hours of the fleet's servers overlapping the window, per build (start → termination or now, × `vcpu`, default 1), with `ready_at` / `terminated_at` now kept on every server |
-| `POST /v1/server/liveops/changed` {any body} | server key | LiveOps change push (5.12): point Zanshin's flag/live-event change webhook here — cached answers (shared by `GET /v1/liveops/*` and the module host ops `liveops.flags` / `liveops.live_events`, 30 s TTL) are dropped on every node over the bus and modules get `hook_liveops_changed` with the webhook body, so a flag flip reaches running code at once instead of at the next TTL |\n| `GET /v1/gameserver/watch?since&timeout_secs`, `POST /v1/gameserver/players` {players, capacity}; `POST /v1/server/fleets/{id}/allocate` {payload, backfill} | server key + X-Musubi-Server-Id | game-server SDK depth (5.9): WatchGameServer as a long-poll on the server's change counter (`version`, bumped by every state/label/allocation/occupancy change — returns at once with `changed: true`, or after the timeout with the unchanged record), occupancy reporting, and backfill allocations that put the match onto a live `allocated`/`in_game` server with free slots (same connect token, `backfill: true` in the reply) before starting a fresh one |
-| `POST /v1/server/store` {…, available_from, available_until, bundle, min_level, level_track, discount_percent, discount_until, rotation, rotation_slots}, `GET/PUT /v1/server/store/coupons`, `DELETE …/{code}`; `POST /v1/store/buy` {…, coupon} | server key / bearer | store depth (5.11): availability windows (hidden and unbuyable outside), bundles (extra items granted with the listing), level gates against a progression track (shown as `locked: "level"`), timed discounts (`effective_prices` for the viewer), coupons (percent, restricted to a listing, use count, once per account, expiry — applied after the discount, use recorded on the purchase) and seeded daily rotations (`rotation_slots` of a `rotation` group on sale each UTC day, chosen by FNV-1a of group/day/id so every node agrees) |
-| `GET`/`PUT /v1/server/entitlements` {provider, external_id, reward_table, label?}, `DELETE …/{provider}/{external_id}`; `POST /v1/entitlements/sync` {provider}; `GET /v1/entitlements`; `POST /v1/server/entitlements/grant` / `revoke` {account_id, provider, external_id} | server key / bearer | platform entitlements (5.11): a platform purchase (Steam DLC appid, PSN entitlement label, Xbox product id, …) maps to a reward table and is paid to each account at most once (`entitlement_grants` is the idempotency key, `entitlement.granted` / `entitlement.revoked` on the bus). `sync {provider: "steam"}` checks every Steam catalog entry for the caller's SteamID with the publisher Web API (`ISteamUser/CheckAppOwnership`, `[iap.steam] url/key`): newly owned → granted, no longer owned (refund) → revoked. Console stores expose entitlements only to the title, so the game server reports them through the trusted grant/revoke routes. Revoke marks the grant; delivered items are not clawed back automatically |
-| `GET`/`PUT /v1/server/grant_limits` {kind, key, window_secs, max_per_account}, `DELETE …/{kind}/{key}`; `GET /v1/admin/accounts/{id}/grants` | server key | limited grants (5.11): a per-account cap on server-side grants of a `currency` (sum of positive deltas), an `item` (quantity) or a `reward_table` (grants) inside a sliding window — `POST /v1/server/wallet/adjust`, `/v1/server/inventory/grant`, `/v1/server/rewards/grant` and the module host ops `wallet.adjust` / `inventory.grant` all answer `429 resource_exhausted` once the cap would be exceeded; a backstop against a buggy module or a leaked key duplicating rewards. Usage is only recorded for limited keys; the admin route lists an account's recent limited grants |
-| `GET /v1/server/accounts/{id}/wallet`, `…/ledger?currency&limit`, `…/inventory`, `…/entitlements` | server key | operator views of one player's economy for the console / support: the same payloads the player gets from `/v1/wallet`, `/v1/wallet/ledger`, `/v1/inventory`, `/v1/entitlements`, addressed by account id — balances, append-only ledger with `reason`/`ref`/`metadata`, item instances, entitlement grants with `active`/`expired` |
-| `POST /v1/server/matches/{id}/results` {teams:[{rank?, players:[{account_id, stats?}]}], queue?, rewards?: {"1": table, "default": table}, quest_event?: {name, delta?}, progression?: {track_id, xp_by_rank: {"1": n, "default": n}}, metadata?}; `GET` same path | server key | end-game report (5.7): one call from the game server fans the result out — rating update on `queue` (same math as `/v1/server/rating/queues/{id}/results`), a reward table per rank for every player (under grant limits, reference `match:<id>`), a quest event per player, progression XP per rank; `match.results` on the bus and `hook_match_results` to modules. Idempotent per match id: the first report wins, repeats (or `GET`) return the stored outcome with `replayed: true`. Per-step failures are recorded per player (`rewards_error`, …) instead of failing the whole report |
-| `POST /v1/admin/accounts/{id}/ban` {reason, message, until_secs, shadow}, `GET …/ban`, `POST …/unban` | server key | account bans (5.2): bans with reason, a player-visible message and an expiry — the player sees `account banned: <message> (until …)` at login and on every request, the leader lifts expired bans once a minute; `shadow: true` keeps the account working but its chat reaches nobody and its matchmaking tickets never match (cluster-wide, replicated like hard bans); soft-deleted accounts are purged for good after `[retention] deleted_account_days` (30, 0 = never) with an `account.purged` event |
-| `GET /v1/admin/bans?kind=full\|shadow\|feature&limit&offset`, `GET /v1/admin/accounts/{id}/devices`, `GET …/{id}/ips`, `POST …/{id}/ban/devices {devices, ips, reason, message, until_secs}`, `GET/POST /v1/admin/bans/rules {kind: device\|ip\|cidr, value, …}`, `DELETE …/rules/{id}`, `GET/PUT/DELETE /v1/admin/bans/reasons/{code}`, `GET /v1/admin/bans/check?ip=&device=` | server key | bans depth: the paged banned feed; a login registry of every device id and address per account; device / IP / CIDR ban rules enforced before authentication (`/v1/auth/*` and `/ws` reject a banned address, a banned device id is refused at device login and cut off after any other login), replicated cluster-wide; the reason catalog (`title`, player `message`, `default_duration_secs`, `severity`, `features`) so `POST …/ban {reason_code}` fills everything in; **feature bans** — `ban {features: ["chat","matchmaking","groups","ugc","trading","leaderboards","voice","friends"]}` keep the account usable and deny only those features (403 `chat banned: …`) |
-| ws `party_create {open, max_size, label?, hidden?}`, `party_update {party_id, label?, open?, hidden?, max_size?}` (leader; members get a fresh `party`), `party_list {label?, label_prefix?, open?, limit}` → `party_list {parties: [{party_id, label, open, max_size, size, leader_id}]}`; `GET /v1/parties?label=&label_prefix=&open=&limit=` | bearer | party labels and a cluster-wide party directory (`musubi.party_directory`, written by the home node, stale/dead-node rows ignored): visible parties with a free seat searchable by exact label or prefix; `hidden` parties never list |
-| `GET /v1/account/mfa`, `POST/DELETE /v1/account/mfa/email`, `POST /v1/auth/mfa/email/send {mfa_token}`, `POST /v1/auth/mfa {mfa_token, code}`; `GET /v1/account/security_events`, `GET /v1/admin/accounts/{id}/security_events?kinds=&before=&limit=`; `[operators] require_mfa = true`, `[operators.sso] mfa_claims` | bearer / server key | MFA depth: e-mail one-time codes as a second factor next to TOTP (needs a verified e-mail; a pending login asks for a code with `…/email/send`, the game's mailer gets `account.mfa_code {email, code, expires_in_secs}`, 6 digits, 10 min, 5 attempts; `/v1/auth/mfa` accepts an authenticator, recovery or e-mail code); a per-account security timeline out of the event log (logins, suspicious logins, bans, MFA changes, links — secrets stripped); operator SSO can be refused unless the IdP proves a second factor (`amr` / `acr`) |
-| fleets: `policy = {target_utilization, step_up, step_down, cooldown_up_secs, cooldown_down_secs, forecast, horizon_min, schedule, suspended, rules, webhook, wasm = {module, function, config, timeout_ms}}`, `GET /v1/server/fleets/{id}/autoscaler`, `POST …/autoscaler/suspend|resume`, `spec.resources = {cpu_millis, cpu_limit_millis, memory_mb, memory_limit_mb, disk_mb, gpu}`, `spec.ports = [{name, protocol: udp|tcp|both, container_port?}]`, `spec.port_protocol`, `spec.port_policy: dynamic|none`, `spec.kubernetes = {node_selector, tolerations, affinity, annotations, priority_class, service_account, safe_to_evict: never|on_upgrade|always, host_network, termination_grace_secs}` (`POST /v1/server/fleets`, `POST …/{id}/scale`) | server key | autoscaling policies: besides buffer/schedule/forecast the ready pool follows a utilization target (`allocated × (1−u)/u`), scale steps per pass and separate up/down cooldowns. P0-6 depth: `rules: [{name, metric, op: gt|gte|lt|lte, threshold, for_secs, action: scale_up|scale_down, step, cooldown_secs}]` is a metric rule engine over fleet gauges — `ready`, `ready_pct`, `allocated`, `allocated_pct`, `players`, `players_pct`, `cpu_pct_avg|max`, `mem_pct_avg`, `tick_p99_ms_max` (latest per-server metrics sample, P1 fleet metrics) and `custom.<key>` — a rule whose condition has held for `for_secs` adds/removes `step` servers from the target and then rests `cooldown_secs` ("cpu_pct_avg > 75 for 60 s → +2", "players_pct <= 10 for 10 min → −1"); `webhook: {url, timeout_ms, headers}` hands the decision to an external scaler Agones-style — every pass POSTs `{fleet, status: gauges, target}` and `{scale: true, replicas}` (or `{response: {scale, replicas}}`) sets the desired total, a failed call keeps the local decision; `suspended: true` / `POST …/autoscaler/suspend|resume` freezes the server count (health reaping, rollouts and lifecycle limits keep running) with events `autoscale.suspended|resumed`. `GET …/autoscaler` explains the last pass — base (buffer/forecast/utilization), rollout surge, counter shortfall, rule delta with the rules holding/fired, webhook answer, plan vs applied after steps/cooldowns (`limited`), `able_to_scale`, gauges — and every rule's holding/fired state; `autoscale.scaled` events and Prometheus `musubi_fleet_autoscaler_{target,desired_start,desired_stop,able_to_scale,limited,suspended,rules_firing}` per fleet. Per-server resource spec goes to the provider — Kubernetes `resources.requests/limits` (cpu, memory, ephemeral-storage, `nvidia.com/gpu`), Docker `--cpus/--memory/--gpus`, Firecracker vcpus/memory. Ports (P0-7): besides the primary `MUSUBI_PORT`, `spec.ports` gives each server extra named host ports from the fleet range — `MUSUBI_PORT_<NAME>` in the process environment, `ports.{name}` on the server row, inventory and every allocation — each published with its own protocol (`both` opens udp + tcp) onto `container_port` (Docker `-p host:container/proto`, Kubernetes `containerPort`/`hostPort`/`protocol` per entry, Agones `spec.ports[]`); `port_protocol` does the same for the primary port (a pure-UDP game no longer opens a TCP hole), and `port_policy: none` publishes no host ports at all (host networking / service mesh — the process still gets the numbers as a hint). Query/RCON/voice sidecar ports stop colliding on packed hosts because the range allocator counts them too. `spec.secret_env {API_TOKEN: …}` (fleets and builds) keeps credentials out of the plain `env`: values are sealed with the `[security] master_keys` ring when stored, every API response shows `***`, and only the node starting the server decrypts them into the process/container environment (keys `[A-Za-z_][A-Za-z0-9_]*`, ≤64, must not repeat an `env` key). Routed allocation (`POST /v1/server/allocate {pool, …}`) chooses the region, not just "hint matched / didn't": `regions: [..]` is an explicit ordered preference, `pings: {region: ms}` (what the client measured against your ping beacons) picks the lowest, `max_ping_ms` drops regions above the ceiling (429 when none is left), `client: {lat, lon}` falls back to the nearest region by `[fleet.regions.<name>] lat, lon`, then the plain `region` hint (the matchmaker's best region), then anything; the allocation's `route` says which region won and why (`preferred|ping|distance|hint|fallback`, `ping_ms`, `distance_km`, `rank`, `tried`). Kubernetes placement (P0-10): `spec.kubernetes` pins a fleet to a node pool (`node_selector`, `tolerations`, raw `affinity`), sets `priority_class`/`service_account`/`host_network`/`termination_grace_secs` and extra pod `annotations`, and `safe_to_evict` decides disruption — `never` (default) stamps `cluster-autoscaler.kubernetes.io/safe-to-evict: "false"` so a scale-down or node upgrade never kills a live match, `on_upgrade`/`always` relax it (Agones mode: `spec.eviction.safe: Never|OnUpgrade|Always`) |
-| `GET /v1/server/fleets/{id}/servers/{sid}/logs?level=&source=&q=&before=&after=&limit=` (`source_kind=provider` → raw tail from docker / kubernetes / ssh), `POST /v1/gameserver/logs {lines: [{at?, level?, message}]}`; `[retention] server_logs_days` | server key | game server log capture: the `local` provider pipes stdout/stderr of every server it runs into `musubi.server_logs` (level guessed per line, 8 KB cap, batched writes); the `ssh` provider redirects to `/tmp/musubi-<id>.log` on the host and `docker` / `kubernetes` tail their own; any server can push structured lines through the SDK route; filter by level/source/substring/time, retention sweep |
-| `POST /v1/server/fleets/{id}/servers/{sid}/logs/archive {reason?}` · `GET …/servers/{sid}/logs/archives` · `GET|DELETE /v1/server/fleets/{id}/logs/archives/{aid}?format=gzip|lines` | Log shipping to object storage (`[ugc.s3]`): `spec.logs {archive, purge_after_archive, delay_secs, prefix}` archives every terminated server's stored lines as gzip NDJSON (`server-logs/{fleet}/{server}/{ts}-{id}.ndjson.gz`) after `delay_secs`, purging the Postgres rows; manual snapshots of running servers; download raw or decoded; `GET …/logs` reports `archived` when the rows are gone; event `server.logs_archived`. |
-| `POST /v1/server/session_placements {pool, region, regions, pings, max_ping_ms, client, payload, selector…, timeout_secs, metadata, try_now}` · `GET /v1/server/session_placements?status&pool&limit` · `GET|DELETE /v1/server/session_placements/{id}` | Queued placements (GameLift `StartGameSessionPlacement`): a routed allocation that waits for capacity instead of 429 — tried once synchronously, then retried every second by the leader until `fulfilled` (allocation + connect token on the placement), `cancelled`, `timed_out` (≤ 600 s) or `failed`; `queue_position` per pool, `metadata` echoed back; events `placement.queued|fulfilled|cancelled|timed_out|failed`. |
-| `GET/POST /v1/server/subscription_plans`, `GET/PUT/DELETE …/{id}` `{name, period_secs, grace_secs, trial_secs, price: {currency, amount}?, reward_table?, features, enabled}`; `GET/POST /v1/server/subscriptions?account_id=` `{account_id, plan_id, periods, continue_from_wallet}`, `POST …/{id}/cancel|pause|resume|revoke`, `POST …/sweep`; `GET /v1/subscription_plans`, `GET /v1/subscriptions`, `POST /v1/subscriptions/subscribe {plan_id}`, `POST /v1/subscriptions/{id}/cancel|resume`, `GET /v1/subscriptions/entitled?feature=` | server key / bearer | store-independent subscription plans next to Apple/Google ones (`/v1/iap/subscriptions`): VIP / season-pass paid from the wallet each period (idempotent ledger entry per period) or prepaid by the server (promotions, support); first-time trial, per-period reward table, feature tags for `entitled` checks; the leader sweep renews, moves a short wallet into `grace` for `grace_secs` then `expired`, honours cancel-at-period-end; pause freezes remaining time; events `subscription.started/granted/renewed/grace/expired/cancelled/paused/resumed/revoked` |
-| audiences: rules `{…, any: [rules], all: [rules], not: rules, include: [account_id], exclude: [account_id], min/max_account_age_days, bucket_min/bucket_max (0..99, `bucket_salt`)}`, `PUT /v1/server/audiences/{name} {rules, tracked, actions: {on_enter: [...], on_exit: [...]}}`, `GET …/{name}/members`, `POST …/{name}/refresh`, `POST /v1/server/audiences/refresh`, `GET /v1/audiences/me` | server key / bearer | audience depth: rule algebra (any / all / not, nested), computed properties (account age, deterministic percentage bucket for cohorts and rollouts), identity include / exclude overrides; `tracked` audiences keep a member table and run actions on every change — `reward_table`, `notification {subject, content, code}`, `event {name}`, `metadata {set}` — plus `audience.entered` / `audience.exited` events; refreshed by the leader every 5 min or on demand  Overrides & imports (P0-19): `PUT/GET/DELETE /v1/server/audiences/{name}/overrides[/{account_id}]` `{include: [ids], exclude: [ids], note, expires_in_secs}` — identity lists managed separately from the rules (include forces in, exclude forces out of anything incl. imports; expiring rows for playtests/QA; counts in the list); `kind: managed` audiences (`source` tag, no rules) take membership from `PUT …/{name}/members {account_ids, mode: replace|add|remove}` or `POST …/members/csv?mode=` (one id per line, header/extra columns ignored, `unknown`/`invalid` counted) — import a segment from your analytics tool and target it with flags, experiments, live events, store listings; tracked managed audiences fire enter/exit actions on import; `GET …/members` lists the imported set |
-| native LiveOps: `GET/PUT/DELETE /v1/server/flags/{name}` `{default_value, rules: [{audience?, rollout_pct?, value, starts_at?, ends_at?}], enabled}`; `GET/PUT/DELETE /v1/server/experiments/{id}` `{name, variants: [{name, weight, flags: {flag: value}}], audience?, rollout_pct, starts_at?, ends_at?, exclusion_group?}`, `POST …/{id}/start|pause|end`, `GET …/{id}/results`, `GET …/{id}/assignments`; `GET/PUT/DELETE /v1/server/live_events/{id}` `{name, phases: [{name, offset_secs, duration_secs}], starts_at, ends_at?, recurrence_secs?, local_time, audience?, metadata}`; `GET /v1/server/liveops/eval?account_id=`; players: `GET /v1/liveops/flags?names=`, `GET /v1/liveops/live-events`, `GET /v1/liveops/experiments`, `POST /v1/liveops/experiments/{id}/outcome {metric, value}` | server key / bearer | flags, A/B experiments and live events in core — no Zanshin needed (when `[zanshin]` is configured its answers are merged in for names musubi does not define). Flags: first matching rule wins (time window, audience, deterministic rollout %), experiment variant overrides beat rules; experiments: sticky assignment on first sight (`experiment.exposed`), weighted variants, audience + rollout gate, exclusion groups (one running experiment per group per account), outcomes (`experiment.outcome`) and a scorecard per metric with mean / stddev / lift / z-test p-value against the control (first variant); live events: ordered phases, recurrence (daily / weekly), `local_time` replays the schedule in the account's zone (`metadata.tz_offset_min`), upcoming events within 7 days are announced; every change clears the cluster-wide liveops cache like the Zanshin webhook  Live events (P0-53): `labels[]`, `participation: implicit|explicit` (+`participation_secs`, `max_participants`), `template`; players `GET /v1/liveops/live-events?include_past&include_future&labels=a,b` (default: running + starts within 7 days; peek shows ended-within-30-days and later starts), `POST /v1/liveops/live-events/{id}/join|leave` — an explicit event lists as `can_join` until joined, then the account's own window `participation_ends_at = min(joined_at + participation_secs, cycle end)` drives `active`/`ended` (409 when `max_participants` reached, 400 for implicit events, 403 outside the audience); server `GET …/live_events?label&participation&template`, `GET …/live_events/{id}/participants?cycle_started_at&limit`, templates `GET/PUT/DELETE /v1/server/live_event_templates/{id}` (phases, labels, participation, metadata…, validated as an event body) and `POST /v1/server/live_events/from_template {template, id, starts_at, …overrides}` (`metadata` merged key-wise) |
-| offers & placements: `GET/PUT/DELETE /v1/server/placements/{id}` `{name, max_offers}`, `GET/PUT/DELETE /v1/server/offers/{id}` `{placement_id, name, store_item_id, prices: {currency: amount}?, priority, enabled, audience?, starts_at?, ends_at?, max_purchases?, max_activations?, cooldown_secs, duration_secs?, precursor?}`, `PUT/DELETE /v1/server/offers/{id}/force/{account_id}`, `GET /v1/server/offers/{id}/stats`, `GET /v1/server/session_placements/{id}/offers?account_id=`; players: `GET /v1/placements/{id}/offers`, `POST /v1/placements/{id}/offers/{offer_id}/buy {currency, idempotency_key?, coupon?}`, `…/dismiss` | server key / bearer | targeted store offers in named UI slots: an eligible offer (enabled, time window, audience, precursor purchased, under per-player purchase / activation limits, past cooldown) is activated the first time the placement is read and stays for `duration_secs`; the placement shows its top `max_offers` by priority; buying runs the normal store purchase at the offer price (coupons still apply); dismiss ends it and starts the cooldown; force-enable shows an offer to one account regardless of rules; stats = activations / seen / purchased / dismissed / expired / conversion / revenue; events `offer.activated/seen/purchased/dismissed` |
-| rewarded ads: `GET/PUT/DELETE /v1/server/ad_placements/{id}` `{name, reward_table, daily_cap, cooldown_secs, platforms, trust_client, enabled, metadata}`, `GET …/{id}/stats?days`, `GET /v1/server/ads/rewards?account_id&placement&status`; `GET /v1/ads/placements?platform`, `POST /v1/ads/placements/{id}/start {platform}` → `{view_id}`, `POST …/complete {view_id}` (trust_client only), `GET /v1/ads/rewards`; `GET|POST /v1/ads/callback/{provider}` | server key / bearer / network S2S | rewarded video (P1-53): the client opens a view and hands `view_id` to the ad network as user id / custom data; the network's server-to-server callback grants the placement's reward table once per event id — `[ads] providers = [{name, kind = "ironsource" \| "custom", secret, allowed_ips}]`: ironSource's `signature = md5(timestamp + eventId + userId + privateKey)` answered with `eventId:OK`, or the generic `sig = hex(hmac_sha256(secret, sorted k=v pairs))` + `ts` within `callback_ttl_secs` for any mediation; per-player `daily_cap` (UTC day) and `cooldown_secs` refuse the view up front and record over-cap callbacks as `rejected` (networks still get their OK), `trust_client` placements may be completed by the client; events `ad.rewarded` / `ad.rejected`, per-placement fill rate and daily grant/reject/user stats |
-| analytics: `POST /v1/telemetry/events {events: [{name, at?, properties, session_id?, platform?, country?}], device_id?}` (bearer) / `POST /v1/telemetry/anonymous` (`X-Telemetry-Key`, pre-login, `device_id` required); `GET/PUT/DELETE /v1/server/analytics/schemas/{name}` `{required, sampling_pct, enabled}`; `GET /v1/server/analytics/events?name&account_id&after&before&cursor&limit&format=json|jsonl`; `GET /v1/server/analytics/kpi/active_users|retention|funnel?steps=a,b,c|revenue|events?days=`; `POST /v1/server/analytics/flush` | bearer / server key | product analytics in core: batched client telemetry (≤ `max_batch`, property size cap, schema registry with required properties and deterministic per-session sampling, unregistered names accepted or dropped by `[analytics] accept_unregistered`) into `musubi.analytics_events` (`[retention] analytics_events_days`); KPIs as SQL — DAU/WAU/MAU + stickiness, first-seen retention cohorts D1/D3/D7/D14/D30, ordered funnels, store revenue with ARPDAU/ARPPU, event volumes; raw paged export; `[analytics] sinks = [{kind = "jsonl" \| "clickhouse" \| "webhook", name, path/url, table, headers, names}]` stream events (and, with `mirror_domain_events`, the server event bus) to files for S3 sync, ClickHouse (`INSERT … FORMAT JSONEachRow`) or any HTTP collector (Kafka REST proxy, Amplitude/Segment adapters) every `flush_secs` |
-| crash reports + player timeline: `POST /v1/telemetry/crash {kind: crash|error|hang, message, stack, fingerprint?, platform, app_version, build, os, device, locale, session_id?, at?, breadcrumbs, tags, custom, minidump_b64?}` (bearer) / `POST /v1/telemetry/crash/anonymous` (`X-Telemetry-Key`, `device_id`); `GET /v1/server/crashes?status=open,regressed|all&kind&platform&version&q&since_secs&sort=-last_seen|-count|-users&limit&offset`, `GET /v1/server/crashes/summary?since_secs`, `GET|PATCH|DELETE /v1/server/crashes/{fp}` (`{status: open|resolved|ignored, resolved_in_version, assignee, notes}`), `GET …/{fp}/reports`, `GET /v1/server/crashes/reports/{id}[/minidump]`; `GET /v1/admin/accounts/{id}/crashes|events?kinds&prefix&q&after&before|timeline?sources=events,telemetry,sessions,ledger,crashes,notes,audit`, `GET|POST /v1/admin/accounts/{id}/notes`, `DELETE …/notes/{note_id}` | bearer / server key | client crash/error/hang reports grouped by a stable fingerprint (sha256 of kind + digit-normalized first message line + top five frames without addresses, or the client's own `fingerprint`): per-group counters, affected users, first/last version, version/platform/OS breakdowns and a 48 h histogram, repeats from one player/device inside `[analytics] crash_dedupe_secs` fold into `duplicates`; triage `open → resolved (in version X) → regressed` reopens automatically when a report from X or later arrives (`crash.new_group`, `crash.regressed`, `crash.resolved`, `crash.spike` above `crash_spike_per_hour` events for webhooks/LiveOps), `ignored` keeps counting silently; minidumps up to `crash_max_minidump_bytes` stored inline and downloadable; `crash_per_minute` per player/device; raw reports expire after `[retention] crash_reports_days`, groups stay. Per-player history for support: every stored domain event about the player with kind/prefix/text filters and the set of kinds seen, a merged newest-first timeline (domain events, client telemetry, logins with IP/UA, wallet ledger, crashes, support notes, admin audit actions that touched the account) paged by `next_before`, and support notes stored as `support.note` events |
-| environments: `GET/PUT/DELETE /v1/admin/environments/{name}` `{url, admin_key, protected, description}`, `GET …/{name}/status`, `POST …/{name}/promote {sections, prune, note, dry_run, confirm}`, `GET /v1/admin/promotions?to=` | admin key | sibling clusters of the same game (stage, prod, PR previews) registered by name and URL; `promote` exports the chosen content / config sections here and imports them there through the normal bundle import (dry-run diff first; the target refuses bundles meant for another environment; `protected` targets need `confirm = true`); `status` probes `/healthz` and the latest content version over there; every attempt (with the remote result) is kept in `musubi.promotions`, real promotions emit `content.promoted` |
-| scoped credentials: `POST /v1/auth/token/scope {scopes, ttl_secs?}` (bearer), `POST /v1/server/accounts/{id}/token {scopes, ttl_secs}` (server key), `POST /v1/admin/keys {name, role, scopes}` | bearer / server key / admin key | least-privilege credentials for untrusted holders: a player down-scopes their own session into a token that only covers `<area>`, `<area>:read` or `<area>:write` (area = first `/v1/` path segment — `storage`, `friends`, `chat`, `leaderboards`, `wallet`, `store`, …; `realtime` for the socket; `*` = all) — no refresh token, never wider than the issuing token; the game mints scoped tokens for a player (companion apps, overlays, bots, partners) without their credentials; server keys carry resource scopes on top of their role (publishable keys such as `leaderboards:read`). Every route and the realtime handshake enforce the scopes (403 with the missing scope) |
-| `PATCH /v1/admin/accounts/{id} {username?, display_name?, avatar_url?, lang?, timezone?, location?, metadata?}` | server key | console edit of a player profile with the same validation as the player's own `PATCH /v1/account` (taken usernames → 409); returns the account, records `account.updated` on the bus and in the audit log |
-| `GET /v1/admin/accounts?identity=provider:subject` | server key | find a player by a linked identity — `device:<id>`, `email:<address>`, `steam:<id>`, `google:…`, `apple:…`, `oidc:<name>:<sub>`, `passkey:<credential id>` (the last `:` splits provider from subject); combines with `q`, `include_deleted`, `cursor` |
-| `POST /v1/account/passkeys/options` → `POST /v1/account/passkeys` {token, name, credential}, `GET/DELETE /v1/account/passkeys[/{id}]`; `POST /v1/auth/passkey/options` → `POST /v1/auth/passkey` {token, credential} | bearer / none | passkeys (5.1): WebAuthn on `ring` (no OpenSSL) — registration stores the COSE key (ES256 or RS256, attestation `none`) as a `passkey` identity, login verifies clientDataJSON type/challenge/origin, rpIdHash, user-presence flag, signature and a non-regressing sign counter (cloned authenticators refused); the challenge travels in a signed 5-minute token no bearer check accepts; `[social.passkeys] rp_id, rp_name, origins` |
-| `POST /v1/auth/oidc/{provider}` {id_token}, `POST /v1/account/link/oidc/{provider}`, `DELETE /v1/account/unlink/oidc/{provider}` {subject} | bearer | generic OIDC sign-in (5.1): any OpenID Connect issuer configured under `[social.oidc.<name>] issuer, client_ids, jwks_url?` — Discord, Twitch, Epic, Xbox, Keycloak, …; JWKS comes from `<issuer>/.well-known/openid-configuration` when `jwks_url` is empty (cached 1 h, refreshed on an unknown `kid`), `iss`/`aud`/`exp` checked; identities are `oidc:<name>` and merge/link like any other provider |
-| `POST /v1/auth/xbox` {user_hash, token}, `POST /v1/auth/psn` {id_token}, `POST /v1/auth/nintendo` {id_token}; `POST /v1/account/link/{xbox,psn,nintendo}` | — / bearer | console sign-in (5.1). Xbox: the XSTS token for the `http://xboxlive.com` relying party plus its user hash are presented to the profile service (`[social.xbox] url = "https://profile.xboxlive.com"`) as `XBL3.0 x=<uhs>;<token>`; identity `xbox:<xuid>`, gamertag returned on link. PSN / Nintendo: the title's `id_token` is an RS256 JWT — configure `[social.psn]` / `[social.nintendo]` (`jwks_url`, `issuers`, `client_ids`) for the environment from DevNet / NDP; identities `psn:<account id>` (PSN `online_id` returned on link) and `nintendo:<nsa id>`. All three are found by `GET /v1/admin/accounts?identity=…` | Steam ownership gate (P1-24): `[social.steam] require_ownership` checks `ISteamUser/CheckAppOwnership` at every login (cached `ownership_cache_secs`) and refuses copies that are not owned; `family_sharing = allow | deny` for Steam Family Sharing borrowers; `ban_propagation = none | owner_to_borrower | both` — a borrower cannot log in while the lending account is banned (and, with `both`, the lender is refused while one of their borrowers is banned); `GET /v1/admin/accounts/{id}/steam` shows the stored ownership answer, the lender and every borrower with ban state.
-| `POST /v1/auth/queue` {ticket}; `GET`/`DELETE /v1/admin/auth/queue` | — / server key | login queue (5.1): with `[session] login_queue_capacity` > 0, any verified login while that many accounts are online cluster-wide (or others are still waiting) answers `202 {queued, ticket, position, eta_secs, expires_in}` instead of a session; the client polls `/v1/auth/queue` and receives the session the moment its place is reached — arrival order, `login_queue_admit_per_sec` paces the drain, a client silent for `login_queue_ttl_secs` loses its place, tickets last an hour. Admin GET shows capacity/online/waiting, DELETE drops all tickets |
-| `rtt {ms}`, `match_host_transfer {match_id, session_id}` → `match.host`, `match_host` | ws | relayed host migration (5.8): every relayed match has a host (creator, or the first joiner of a matchmaker-made match) carried in the `match` snapshot; clients report their measured ping→pong round trip with `rtt` and when the host leaves or drops the member with the lowest reported RTT takes over (never reported = last, ties = join order), everyone gets `match_host`; the host can hand the role over explicitly; cross-node members are handled on the match's home node |
-| `GET /v1/matches/{id}/replay` | bearer | match recording (5.8): create the match with `params.record: true` and every snapshot (module state, base64) and journal chunk (processed inputs and membership steps) is kept in `match_recordings` / `match_recording_frames` instead of being pruned with the failover journal; the endpoint returns the header (`started_at`, `ended_at`, `last_tick`, `live`) and frames in tick order while the match runs and after it ends; `DELETE /v1/server/matches/{id}/replay` drops it; `[retention] replay_days` (30, 0 = forever) sweeps old recordings |
-| `match_join {spectator: true}` | ws | spectator mode (5.8) for authoritative matches: the session gets the match snapshot and every `match_data` / presence event the match sends, is not counted against `max_players` (joins a full match), never reaches the module's `join_attempt`/`join`/`leave`, and its own `match_data_send` is refused with `PermissionDenied`; leaving is silent for the players |
-| `POST /v1/account/merge` | bearer | account merge (5.1, guest → social login): `{access_token}` of the other account proves you own both; in one transaction its identities move over (an email stays behind if you already have one), wallets are summed with `merge` ledger rows, inventory / friends / group memberships / recent players / notifications are unioned, storage objects move unless you already have the same collection/key (yours win); leaderboard records and ratings stay yours; the other account is closed like `delete` and kicked everywhere; `account_merges` keeps the journal with the per-table report that the call returns |
-| `GET /v1/account/sessions`, `DELETE /v1/account/sessions/{id}` | bearer | device management (5.1): every live login (one entry per refresh family: device id, user agent, IP, created / last seen / expires, `current` for the caller's own) and sign-out of a single device — its refresh family is revoked so it cannot refresh again (the access token it already holds expires within its 15-minute lifetime); `POST /v1/auth/logout {all_devices: true}` still signs out everything |
-| `POST /v1/storage/patch`, `GET /v1/storage/{collection}?sort=`, `GET /v1/storage/{collection}/count` | bearer | storage depth (5.3): `patch` applies a JSON Merge Patch (RFC 7386: nested objects merge, `null` removes a member) to existing objects under the row lock with the same OCC `version` rules as write (missing object → 404); listing takes `sort=field` / `sort=-field` (nested `stats.wins`) ordered by the JSON value with a keyset cursor, and `count` returns how many objects match `where`/`prefix` under the same visibility rules; `[storage] max_objects_per_user` (10 000) / `max_bytes_per_user` (100 MiB) quotas per owner (0 = unlimited, system owner exempt) are kept by a trigger-maintained `storage_usage` table so TTL/retention purges count too — a write or patch that would overflow is rejected and rolled back |
-| `POST/DELETE /v1/groups/{id}/ban`, `GET /v1/groups/{id}/bans`, `POST /v1/groups/{id}/announcement`, `GET /v1/groups/{id}/events` | bearer | groups depth: admins ban accounts (`{ids, reason, until_secs?}`; members are kicked, a banned account cannot join or request to join until the ban lapses; nobody of equal/higher rank), lift bans, list active bans; pin an announcement (`{text}`, ≤ 2048, `null` clears — shown on the group as `announcement`/`announcement_at`, every member gets a persistent notification `group_announcement`, code 30); the group journal records `joined`/`join_requested`/`kicked`/`banned`/`unbanned`/`announcement` with actor, subject and payload, newest first with an id cursor, members only |
-| `GET/PUT /v1/groups/{id}/roles`, `POST /v1/groups/{id}/rank` | bearer | role hierarchy with permission bitmasks (5.4): ranks 0 (owner, holds everything) .. 7, each with a name and `permissions` bits — INVITE 1, KICK 2, BAN 4, ANNOUNCE 8, EDIT 16, PROMOTE 32, TREASURY_DEPOSIT 64, TREASURY_WITHDRAW 128; defaults: admin (1) = all, member (2) = deposit only, 3..7 = junior tiers (recruits, trials) with nothing until the owner defines them (`PUT {roles: [{rank, name, permissions}]}`). Every moderation call checks the caller's role bits instead of a fixed admin tier; `POST …/rank {ids, rank}` (needs PROMOTE) moves members to a rank junior to the caller's, never touching seniors; ranks 1..2 keep the legacy `state` in sync, so `promote`/`demote` still work |
-| `GET /v1/groups/{id}/treasury`, `POST …/treasury/deposit`, `POST …/treasury/withdraw`, `GET …/treasury/ledger` | bearer | group treasury (5.4): a wallet per group and currency with its own ledger. `deposit {currency, amount, reason}` moves money from the caller's wallet (needs TREASURY_DEPOSIT, the member default; fails when the wallet is short), `withdraw {currency, amount, reason, to?}` pays the treasury out to a member (needs TREASURY_WITHDRAW; never below zero); both legs are one transaction and the member side shows in the personal ledger as `treasury_deposit`/`treasury_withdraw` with the group id as `ref`. Bus events `group.treasury_deposit` / `group.treasury_withdraw` |
-| `GET /v1/groups/{id}/inventory`, `POST …/inventory/deposit`, `POST …/inventory/withdraw`, `GET …/inventory/ledger` | bearer | group inventory (5.4): a shared item store per group with its own ledger. `deposit {entry_id, quantity, reason}` moves stackable items out of the caller's own inventory entry (needs INVENTORY_DEPOSIT = 256, the member default; non-stackable items keep per-instance data and cannot be pooled), `withdraw {item_id, quantity, reason, to?}` grants them to a member (needs INVENTORY_WITHDRAW = 512; the store never goes negative, `max_stack` applies on the receiving side). Both legs run in one transaction; bus events `group.inventory_deposit/withdraw`. |
-| `POST/GET /v1/server/group_challenges`, `GET/DELETE …/{id}`, `POST …/{id}/score {account_id, delta, group_id?}`, `POST …/{id}/settle`, `POST …/sweep`; `GET /v1/group_challenges`, `GET …/{id}`, `GET …/{id}/me` | server key / bearer | group wars and challenges (5.4): `kind = war` names the groups, `challenge` is open to every group whose members score; the game reports contributions, standings are the per-group sum with top contributors; when the window closes (or on `settle`) the `schedules` runner credits `rewards.treasury {currency, amount}` to the winner's treasury, grants `winner_table` to its active members and `participant_table` to every contributor with ≥ `min_contribution`, and emits `group_challenge.settled` |
-| `POST /v1/server/groups/{id}/xp`, `POST /v1/alliances`, `GET /v1/alliances/{id}`, `POST …/invite`, `POST …/accept`, `POST …/leave`, `GET /v1/groups/{id}/alliance` | server key / bearer | group progress and alliances (5.4): the server grants group XP (`{delta, reason}`), the level follows `[social] group_level_xp` thresholds (default 1 000 → level 2 … 45 000 → level 10), `level_up` lands in the group journal and `group.level_up` on the bus; groups carry `xp`/`level`. Alliances are groups of groups: a group owner founds one (`{group_id, name}`, the group leads), the leader's owner invites (`{group_id}`), the invited group's owner accepts or leaves (declining = leaving); a group is in at most one alliance; the leader leaving dissolves it. Journal: `alliance_founded/invited/joined/left/dissolved` |
-| `PATCH /v1/friends/{id}`, `GET /v1/friends/recent`, `GET /v1/friends/suggestions` | bearer | friends depth: a private `note` (≤ 256 chars, `null` clears) and `favorite` flag per accepted friend (returned in the friends list); `recent` = up to 50 accounts you shared a match with, newest first (recorded when a session joins a relayed/authoritative match, both directions; blocked accounts hidden); `suggestions` = friends of friends ranked by mutual friends, then recent teammates — never anyone you already relate to or who blocked you. Accepted + outgoing friendships are capped at 1000 per account |
-| `POST /v1/friends/import` {provider, subjects[], add?} | bearer | platform friends import: the client sends the platform ids of its Steam / Xbox / PSN / Nintendo / OIDC friends (≤ 500), the server maps them to accounts via linked identities and returns `matches` (subject, account, username); `add: true` also sends friend requests to every match (`friend.added` on the bus with `import: <provider>`). Unknown ids, the caller and disabled accounts are skipped |
-| `POST/GET /v1/lobbies`, `POST /v1/lobbies/join`, `GET /v1/lobbies/mine`, `GET/PATCH/DELETE /v1/lobbies/{id}`, `POST …/{id}/leave`, `…/kick`, `…/ready`, `…/team`, `…/heartbeat`, `…/start` | bearer | lobbies (plan 5.4): waiting rooms of 2..=1000 accounts with optional team slots (`team_count` × `team_size` must cover `max_members`; joiners land on the least-loaded team unless they pick one), `public` (listed) or `private` (6-letter join `code`, shown to members only), optional password (argon2, `password: ""` in PATCH clears it), `region`, `metadata` ≤ 16 KB; listing = public + waiting, filters `name` prefix / `region` / `metadata` containment (`?metadata={"mode":"ctf"}`) / `has_slots` (default true), id cursor. One lobby per account; host leaving hands over to the longest-standing member, last one out closes it; host can kick, PATCH settings (never below current members/teams) and `start` once: `{fleet_id, payload}` allocates a dedicated server (roster goes in the allocation payload), `{module, params}` creates an authoritative match on the cluster, `{connect}` publishes the host's own connect info; `require_ready` refuses while someone is not ready. Every change reaches members as a notification `lobby` (code 20, `content.event` = joined/left/kicked/ready/team/updated/started/closed; started/kicked/closed are persisted, the rest are live-only). Lobbies without a heartbeat (any member) or change for 300 s are swept on the `lobbies` lease, members get `closed`. Lobby chat: a room channel named after the lobby id |
-| `POST/GET /v1/turns`, `POST /v1/turns/join {id|code}`, `GET /v1/turns/mine?state`, `GET /v1/turns/{id}?since_turn`, `POST …/{id}/start`, `…/leave`, `…/move {data, board, version, next_seat, finish}`, `…/resign`, `…/rematch`; server `GET /v1/server/turns?game&state&account_id`, `GET/DELETE /v1/server/turns/{id}`, `POST …/{id}/finish`, `POST /v1/server/turns/sweep` | Asynchronous turn-based matches: seats, invitations/open join/join code, round-robin or explicit next seat, shared `board` with optimistic `version`, per-turn deadlines with `timeout_action skip|resign` (+`max_skips`), full move history, last-player-standing / declared finish, rematch; notifications subject `turn`, events `turn_match.*` |
-| `GET /v1/leaderboards[/{id}]`, `GET\|POST\|DELETE /v1/leaderboards/{id}/records`, `GET /v1/leaderboards/{id}/around/{owner}` | bearer | leaderboards: best/set/incr/decr operators, asc/desc, cron reset windows, 1-based ranks, owner lookup, around-owner paging |
-| `POST /v1/server/leaderboards`, `DELETE /v1/server/leaderboards/{id}`, `POST\|DELETE /v1/server/leaderboards/{id}/records/{owner}` | `X-Musubi-Server-Key` | server-to-server: create/delete boards, authoritative writes with operator override `reset_schedule` is a 5-field cron in UTC, or crontab-style `CRON_TZ=Asia/Tokyo 0 0 * * *` for local midnight (DST-aware; tournaments too). |
-| `GET /v1/tournaments[/{id}]`, `POST /v1/tournaments/{id}/join`, `GET\|POST /v1/tournaments/{id}/records`, `GET /v1/tournaments/{id}/around/{owner}`; server: `POST /v1/server/tournaments`, `DELETE …/{id}`, `POST …/{id}/records/{owner}` | bearer / server key | tournaments: start/end, active duration per reset window, max_size, max_num_score, join_required, category range listing |
-| `POST /v1/server/tournaments {…, prizes: [{from_rank, to_rank, reward_table, title?, body?}]}`, `POST /v1/server/tournaments/{id}/end` | server key | tournament prizes (5.6): non-overlapping rank bands, each paying a reward table; when a window ends (leader sweep, or `end` by hand — which also fires `tournament_end` to modules once) every record in a band gets a mail with that table (`metadata {tournament_id, rank, score, expiry}`) and `tournament.prize` goes to the bus; paid once per (tournament, window) — `end` on a paid window returns `paid: 0`. `GET /v1/tournaments/{id}` shows `prizes`, listings do not |
-| `POST /v1/server/tournaments {…, team: {perm?}}`, `POST /v1/tournaments/{id}/join {group_id}`, `POST /v1/tournaments/{id}/records {score, group_id}` | server key / bearer | team tournaments (5.6): records are owned by groups — a member holding the tournament's role bits (`perm`, default ANNOUNCE = 8) joins and writes for `group_id`; the tournament operator aggregates members' submissions (`best` keeps the best, `incr` sums), `max_num_score` caps the group, ranks / `around` work on groups. Team prizes are `{from_rank, to_rank, currency, amount}` and are paid into the group treasury (ledger entry without a member, `tournament.prize` on the bus) instead of by mail; `group_id` on a player tournament, or none on a team tournament, is a 400 |
-| socket `matchmaker_add` / `matchmaker_remove` / `matchmaker_ready` → `matchmaker_ticket`, `matchmaker_ready_check`, `matchmaker_matched`, `matchmaker_ready_failed` | token | matchmaker: mutual queries (`+field:value`, `-field:value`, `>=`, `[a TO b]`, `*`), min/max count, count_multiple, 15 s wait for max before settling for min; named queues (`queue` property) with MMR and ping windows that widen with wait, fixed teams balanced by MMR, role quotas, cross-play groups, avoid list, no-repeat opponents, match quality grade, `matchmaker_score`/`matchmaker_propose` WASM overrides; ready-check (`matchmaker.ready_check_secs`, per queue) — confirmed tickets return to the queue with their wait, dodgers are kept out for `dodge_penalty_secs` doubling per repeat within 24 h (≤8×) |
-| socket `party_create/join/leave/promote/accept/remove/close/join_request_list/data_send/matchmaker_add/matchmaker_remove` → `party`, `party_join_request`, `party_leader`, `party_presence_event`, `party_data`, `party_matchmaker_ticket`, `party_close` | token | parties: open or request-to-join, leader moderation, leader hand-off on leave, party-wide matchmaking tickets |
-| socket `match_create`, `match_join` (by id or matchmaker token), `match_leave`, `match_data_send` → `match`, `match_data`, `match_presence_event` | token | relayed (client-hosted) matches, ≤64 players, targeted or broadcast data; authoritative matches come with the actor runtime |
-| `GET /v1/matches?label=&min_size=&max_size=&open_slots=&region=` (free player slots need `params.max_players`; region is the hosting node's); server: `POST /v1/server/matches {module, params}`, `GET\|DELETE /v1/server/matches/{id}`; socket `match_join/leave/data_send` on an authoritative id | bearer / server key | authoritative matches as actors (`musubi-actor`): handler over an opaque state blob (init/join_attempt/join/leave/tick/terminate), tick 1–60 Hz, label ≤ 2 KB; built-in `echo` module; snapshots in `musubi.match_snapshots` on every membership change / every 50 ticks, claimed atomically and resumed on startup and whenever a node stops heartbeating (failover); match modules in WebAssembly: exports `match_<module>_{init,join_attempt,join,leave,tick,terminate}` (JSON in/out, state as base64) are registered automatically |
-| `POST /v1/rpc/{id}`, `GET /v1/rpc`; socket `rpc` | bearer or server key | server logic: sandboxed WebAssembly modules from `runtime.modules_dir` (fuel, memory cap, wall-clock deadline, hot reload per module); ABI v0 documented in `musubi-runtime`; hooks `before_rpc_<id>` / `after_rpc_<id>` / `hook_authenticated` |
-| `GET /v1/server/cluster/nodes` | server key | cluster v0: node registry with heartbeats + Postgres LISTEN/NOTIFY bus; chat, notifications, status/presence events and matchmaker tickets are replicated across nodes (the lowest live node id runs matchmaking passes); parties and relayed matches live on their home node and members on any node reach them over the bus (matchmaker-formed relayed matches are homed on the leader) (gossip/Raft/QUIC bus replace this behind the same API) |
-| `GET /v1/server/cluster/mesh_net`, `GET …/mesh_net/config?format=quick\|setconf`, `POST …/mesh_net/refresh\|rotate` | server key | WireGuard-style private mesh between nodes (`[mesh_net]`: `enabled`, `subnet = "10.77.0.0/16"`, `listen_port = 51820`, `endpoint`, `interface = "musubi0"`, `apply = auto\|wg\|none`, `keepalive_secs`, `bind_bus`): each node keeps an x25519 key pair in `node.data_dir`, claims a sticky address in the overlay subnet through the node registry, publishes key + endpoint + address and derives its peers from the registry — hosts from different providers share one encrypted private network for the QUIC bus (`bind_bus`), simulators and game servers without public ports. With `wg`/`ip` on PATH the node keeps the kernel interface in sync itself (`apply = auto`), otherwise `…/config` renders the `wg-quick` file for the operator; `rotate` issues a new key that peers pick up within one refresh (10 s). Status: address, endpoint, peers (alive, endpoint-less NAT peers dial out), `applied`, `tools_missing`, `last_error`, `generation` |
-| `GET /v1/server/geoip`, `POST …/geoip/update\|reload`, `GET …/geoip/lookup/{ip}`, `GET /v1/account/geo`, `GET /v1/server/accounts/{id}/geo`, `GET /v1/server/analytics/geo` | server key / bearer | player IP geolocation (`[geoip]`: `enabled`, `edition = "GeoLite2-City"`, `path`, `account_id` + `license_key`, `update_days = 7`, `stale_days = 35`, `overrides = [{cidr, country, region, city, lat, lon}]`): a MaxMind `.mmdb` read in-process, downloaded and refreshed by the leader, ignored once its build is stale; every login stamps the account's last known country/region/city/coordinates, which audiences (`countries`, `not_countries`), remote-config `countries` selectors (fallback when the client sends no `x-musubi-country`) and telemetry events (country fallback) build on; overrides pin LAN / QA ranges to a location |
-| `GET /v1/server/analytics/sinks`, `POST …/sinks/flush[?force=false]` | server key | telemetry sinks: `[analytics].sinks[] {kind: jsonl\|clickhouse\|webhook\|s3, …}` — `s3` buffers rows until `batch_rows` (10000) / `batch_secs` (60) and uploads gzip NDJSON objects (`prefix/YYYY/MM/DD/HH/…ndjson.gz`) to a registered storage endpoint (`endpoint`), failed uploads keep their rows; dedicated telemetry backend: a node with role `telemetry` and no `api` serves only `/v1/telemetry/*` (+ health/metrics), `[analytics].ingest_url` is advertised in `GET /v1/telemetry/sampling` and `redirect_ingest = true` makes API nodes answer ingest with 307 to it |
-| `GET /v1/server/edge`, `POST …/edge/block {ip, secs}`, `POST …/edge/unblock {ip}` | server key | UDP edge flood guard (`[edge.guard]`: `enabled`, `max_pps_per_source = 2000`, `max_bytes_per_source`, `max_opens_per_source = 10`, `global_max_pps`, `min_packet_bytes = 4`, `strikes_to_block = 20`, `strike_window_secs = 10`, `block_secs = 300`, `allow`, `deny` CIDRs): every datagram is judged by source before parsing — budgets, strikes for malformed/unknown-token packets, escalating reactive blocks; status shows counters per verdict and the blocklist |
-| `[worlds] enabled = true` · `[node] roles` with/without `sim` | config | Server meshing is optional: with `enabled = false` the cluster runs no world recovery or failover, `/v1/server/worlds/*` answer 404 and world commands over realtime are refused — a game without a seamless world pays nothing for meshing. Enabled, only nodes carrying the `sim` role home worlds, host cells, adopt failed cells and accept simulators; API/realtime/edge nodes without it route world traffic to them, and a world created through such a node is placed for adoption by a `sim` node |
-| `GET\|POST /v1/server/fleets`, `GET\|DELETE /v1/server/fleets/{id}`, `POST …/{id}/scale\|allocate`, `GET …/{id}/servers`, `GET\|DELETE /v1/server/gameservers/{id}`; SDK (per-server token: the fleet puts `gs_<server id>_…` in the process's `MUSUBI_SERVER_KEY`, `POST /v1/server/game_servers/{sid}/token` issues/rotates one; the operator key + `X-Musubi-Server-Id` is accepted only with `[fleet].legacy_server_key = true`): `GET /v1/gameserver`, `POST /v1/gameserver/{ready,health,allocate,shutdown,label,connect}` | server key | dedicated-server orchestration v0 (`musubi-fleet`): fleets with buffer/max/port range, reconciler every 5 s (reaps dead/unhealthy, tops up to buffer), `local` process provider and `docker` provider (Docker CLI, `spec.image`, port published UDP+TCP), env `MUSUBI_SERVER_ID/FLEET_ID/PORT/API/SERVER_KEY`, group connect tokens; tickets with string property `fleet=<name>` get a server allocated and delivered in `matchmaker_matched.server`; kubernetes/agones/edgegap providers next |
-| `GET\|PUT /v1/server/matchmaker/queues`, `DELETE …/queues/{name}`, `GET …/stats` | server key | matchmaker queues at runtime (boot-time ones come from `[[matchmaker.queues]]`), waiting tickets per queue, open matches; Prometheus `musubi_matchmaker_wait_seconds{queue,region}`, `…_match_quality`, `…_rejections_total{reason}` |
-| `POST /v1/tournaments/{id}/join {code}` | token | private tournaments: `join_code` at creation makes `join` require the code (`private: true` in listings, the code is never returned; scores without an explicit join are refused). Every finished window of a board/tournament with a reset schedule fires `hook_leaderboard_reset` / `hook_tournament_end` once (`{id, expiry, size, records}` with final ranks) for rewards — idempotent across nodes and restarts |
-| `GET /v1/leaderboards/{id}/tier`, `POST /v1/server/leaderboards/{id}/rollover` | token / server key | bucketed leaderboards (`bucket_size`: players compete in buckets of K assigned on their first score of a window — ranks, pages and `around` stay inside the bucket) and leagues (`league {tiers, promote_pct, demote_pct}` on a board with a reset schedule: at every reset the top/bottom share of each tier-bucket moves one tier up/down; `rollover` closes a window by hand, e.g. to end a season early) |
-| `GET /v1/rating/{queue}`, `GET …/top`, `GET …/{account}`; `GET\|PUT /v1/server/rating/queues`, `GET\|DELETE …/{id}`, `POST …/{id}/results\|season\|decay` | token / server key | skill rating per queue: Elo, Glicko-2 or OpenSkill (Weng-Lin), team games with ranks/draws, placement games, seasons with soft reset (`carry`), inactivity decay (Elo loses points to a floor, Glicko-2/OpenSkill widen uncertainty), one 1500-centred `display` scale across systems; a matchmaker queue of the same name gets `mmr` from it |
-| `POST /v1/storage/{read,write,delete}`, `GET /v1/storage/{collection}` | bearer | legacy KV storage, Nakama permission codes, CAS versions |
-| `GET /ws?token=…&format=json\|binary` | token | realtime socket: ping, status/presence follow, rpc (envelope `{cid, msg}`, JSON or postcard) |
-| QUIC `quic.listen` (UDP) | access JWT in the first frame `{token, format, status}` | same envelopes/encodings as WebSocket over one bidirectional quinn stream (`type:u8 \| len:u32be \| payload`); an unvalidated source is answered with a Retry token before any handshake state exists (`quic.retry`, default on — spoofed addresses cost nothing and amplification stays 1×), handshakes in flight are capped by `quic.max_pending_handshakes` (default 1024, refused above), 8 bidirectional / 0 unidirectional streams per connection, ALPN `musubi-rt/1`, PEM cert or self-signed dev cert; `match_data` with `reliable=false` travels as QUIC datagrams (clients may send datagrams too) |
+| `node.roles` | all | `edge`, `api`, `realtime`, `sim`, `orchestrator` — any subset per process |
+| `node.bus_listen` | empty | QUIC node bus (Raft directory); empty = Postgres LISTEN/NOTIFY bus |
+| `http.listen` | `0.0.0.0:7350` | HTTP, WebSocket and console |
+| `http.server_key` | — | bootstrap operator / server key |
+| `database.url` | — | Postgres 16 |
+| `quic` / `edge` | off | QUIC/WebTransport and the UDP edge on `7351` |
 
-Limited access mode (P1-25): `PUT /v1/admin/access/policy {mode: open|limited|maintenance, message, providers, allow_existing_accounts, bypass_providers, bypass_audiences, windows: [{name, start, end, mode, message}], retry_after_secs, kick_on_change}` gates every login after the account is resolved — `limited` admits allow-listed players (`PUT /v1/admin/access/allowlist/{account|identity|email_domain|audience}/{value}` with optional `expires_at`, bulk `…/import`) and, for soft launches, existing accounts; `maintenance` admits only the bypass providers/audiences; scheduled windows (playtest weekends, maintenance slots) override the base mode and are announced through the public `GET /v1/access` (`mode`, `message`, `window`, `next_change_at`, `upcoming`). Denied logins answer 403 with the reason, are recorded (`GET /v1/admin/access/denials`) and published as `access.denied`; a policy change (or `POST …/enforce`) revokes the refresh sessions and kicks the realtime connections of everyone online who would be denied now (access tokens run out with their TTL); `GET …/check?account_id` explains a decision.
+Every other key is documented next to the feature it drives in [docs/features.md](docs/features.md) and [docs/operations.md](docs/operations.md).
 
-OAuth2 clients / app registrations (P1-23): tools, partners and pipelines get their own credentials instead of sharing a server key — `POST /v1/admin/oauth/clients {name, kind: confidential|public, role, scopes, redirect_uris, allowed_ips, token_ttl_secs, owner}` returns `client_id` + `client_secret` once; `POST /v1/oauth/token` (RFC 6749 `grant_type=client_credentials`, HTTP Basic or body credentials, optional narrower `scope`/`ttl_secs`) answers with a short-lived scoped server key usable as `X-Musubi-Server-Key` or `Authorization: Bearer msk_…`; `POST /v1/oauth/introspect` (RFC 7662) and `POST /v1/oauth/revoke` (RFC 7009) work for the client itself or any server key. Secrets rotate with a grace period (`POST …/{id}/secrets {expire_old_in_secs}`, up to 5 live), tightening a client's scopes or disabling/deleting it revokes the tokens that exceed it, `GET …/{id}/tokens` lists live keys per client, failures/issued counters and `oauth.*` events give the audit trail.
-| `GET/POST /v1/oauth/authorize {client_id, redirect_uri, scope, state, code_challenge (S256), approve}` (Bearer player) → `{code, redirect_to}`; `POST /v1/oauth/token grant_type=authorization_code {code, code_verifier, redirect_uri, client_id[/secret]}` → player access token + rotating refresh token; `grant_type=refresh_token` (reuse of a rotated token revokes the family); `GET/DELETE /v1/account/oauth/grants[/{client_id}]`; `GET/DELETE /v1/admin/oauth/clients/{id}/grants`; introspect/revoke understand player and refresh tokens | OAuth2 authorization-code + PKCE: "Sign in with <game>" for companion apps, community sites and bots acting for a player with down-scoped tokens (`account:read friends`, never `*`) |
+## Deploying a cluster
 
-Secrets management (P1-30): any config string may reference `${env:NAME}` or `${file:/run/secrets/x}` (resolved once at load; a missing reference fails startup naming the config path — keep secrets in the orchestrator, a mounted volume or a Vault-agent sink, not in the TOML), and `[security] master_keys = ["${file:/run/secrets/musubi-master}"]` (32-byte hex/base64, first seals, all open) encrypts stored credentials — webhook signing secrets and IdP client secrets — with ChaCha20-Poly1305 as `enc:v1:<kid>:…`; plaintext rows keep working, so enabling it needs no migration. `GET /v1/admin/secrets/status` shows loaded key ids, resolved config refs and per-store sealed/plaintext/unknown-key counts with warnings; `POST /v1/admin/secrets/reencrypt` seals plaintext rows and moves rows from a previous key to the current one (rotation = prepend the new key, re-encrypt, drop the old key). The config dump redacts every key/secret/password/token/pem field.
+Run several `musubi-server` processes on one database; they discover each other through the
+database (or the QUIC bus), elect a directory leader, lease worlds and cells, and drain on
+`SIGTERM`. Ready-made:
 
-Storage queries (P1-38): `filter` / `where` conditions `[field, op, value]` now accept `in`/`nin` (array of scalars), `like`/`ilike`/`prefix`, `regex`/`iregex` (POSIX), `exists` (true/false), `contains` (jsonb containment: array has elements, object has pairs), `size`/`size>=`/`size<=`/`size>`/`size<` (array length) and `between` `[lo, hi]` next to the comparison operators; `"$or": [cond | [cond, …], …]` adds alternatives (each alternative is an and-group) that combine with the top-level `$where`/equality filter, all within the same 8-condition budget and the same `count`/`aggregate` endpoints. `sort=random` returns a random sample of the matching objects (no cursor); `sort=rank` orders a `$q` full-text query by `ts_rank` (best match first).
+- **Helm**: [`deploy/helm/musubi`](deploy/helm/musubi) — replicas, HPA, PDB, secrets as
+  `MUSUBI__*`, optional UDP edge LoadBalancer.
+- **Terraform**: [`deploy/terraform`](deploy/terraform) — module plus Hetzner and OVH stacks.
+- **Single host**: the Docker image above behind any reverse proxy; the stand we test against
+  is a Coolify service with exactly that compose.
 
-Simulated network conditions (P1-62): every realtime connection (WebSocket, QUIC, WebTransport, WebRTC, UDP) is wrapped by a netsim shim that adds one-way latency ± jitter and drops a percentage of frames in either direction while preserving order — `[dev.netsim] enabled = true, latency_ms, jitter_ms, loss_pct, direction = both|in|out` at startup, or at runtime `PUT /v1/admin/dev/netsim {latency_ms ≤ 10000, jitter_ms ≤ latency_ms, loss_pct 0..=100, direction}` (applies to live sessions immediately), `PUT|DELETE …/netsim/sessions/{id}` for a single client (QA on one tester while the playtest stays clean), `GET …/netsim` (profile, overrides, delayed/dropped counters), `POST …/netsim/reset`, `DELETE …/netsim` to clear everything. Zero cost when nothing is configured (one atomic read per frame).
+Operations (export / import, migrations from Nakama / PlayFab / UGS, retention, keys,
+`musubi deploy` manifests, benchmarks, chaos stand): [docs/operations.md](docs/operations.md).
 
-Simulated players (P1-35): the node can load itself (or, with `[dev.loadtest] allow_remote`, another environment) with thin bot clients — `POST /v1/admin/dev/loadtests {name, bots, ramp_secs, duration_secs, rate_hz, format: json|binary, scenario: ping|chat|match|rpc|custom, channel, match_size, payload_bytes, rpc_id, rpc_payload, steps: [{op: ping|rpc|chat_send|status|sleep}], max_in_flight, reply_timeout_ms}`. Each bot authenticates with a stable device id (`loadbot:000042`-style, no account pile-up), opens a real WebSocket and tags every request with a `cid`, so RTT is what a client sees through socket, hub, chat/match/RPC and fan-out; relayed match echoes are timed through payload ticks. `GET …/{id}` shows the live per-second timeline (connected, sent/received, p50/p99) and, when done, the report (p50/p95/p99/max per request kind, connect time, throughput, errors by kind: connect_error/auth_error/send_error/closed/timeout/server_error/backpressure); `POST …/{id}/stop`, `GET …?state`, `DELETE …/{id}`, `GET …/{id}/compare/{base}?threshold_pct` flags regressions in RTT, connect time, error rate or throughput against a saved baseline. Finished runs are kept in `musubi.loadtest_runs` (`keep_runs`); events `loadtest.started|finished|stopped|failed`. For world-scale load use `musubi bench --scenario world`.
+## Repository layout
 
-Group economies on top of the treasury: contribution pools (`POST /v1/groups/{id}/pools {name,
-currency, goal, tiers: [{at, reward_table}], contributor_reward_table?, ends_at?}` by officers;
-members `POST …/pools/{pid}/contribute {amount}` — wallet → treasury, clamped to the goal, every
-contributor is rewarded once per crossed tier, completion emits `group.pool_completed`; `GET …/pools`,
-`GET …/pools/{pid}` with top contributors, `…/close`), donation requests (`POST /v1/groups/{id}/donations
-{currency, amount, note}`, one open per currency; a guildmate `POST …/{did}/give` pays the full amount
-wallet-to-wallet through the audited treasury ledger; `…/cancel`), and a team store (`PUT
-/v1/groups/{id}/store/{item} {currency, price, quantity, enabled}` by officers, `POST …/{item}/buy
-{account_id?}` — the treasury pays and the member receives the inventory item).
-
-Remote config depth: variants layered on a base config — `PUT /v1/server/configs/{name}/variants/{variant}
-{selector: {environment, platforms, min_version, max_version, countries, rollout_pct}, patch, priority,
-enabled}` (RFC 7386 merge patch; `rollout_pct` is a deterministic per-account bucket); `GET /v1/configs[/{name}]
-?platform&version&country` (or `x-musubi-platform` / `x-musubi-client-version` headers) returns the resolved
-value with `variants` applied and a `checksum`; `GET /v1/configs/manifest` lists `{name, version, checksum}`
-with an `ETag` (304 on `If-None-Match`); `GET /v1/server/configs/{name}/preview?platform…&account_id` resolves
-as a given client would. Every write is a history entry (`…/history`, 200 kept), `…/diff?from&to` lists
-JSON-pointer changes, `POST …/rollback {id}` re-applies a past value, `PUT …/csv?key=col` (text/csv) ingests
-a spreadsheet as typed rows or a keyed object (dotted headers nest, `//` comments skipped). Client version
-gates: `PUT /v1/server/client_versions/{platform} {min_version, latest_version, store_url, redirects:
-[{min_version, url}], message}` and the tokenless `GET /v1/client/version?platform&version` →
-`{supported, update_required, update_available, redirect}` (newer clients are redirected to another host).
-
-Title / global files: `PUT /v1/server/files/{path}?public&platforms&min_version&max_version&environment`
-with the raw body (content-type kept; blobs in `[ugc.s3]` or Postgres, `[files] max_bytes`), `PATCH` metadata
-/ visibility, `DELETE`, `GET /v1/server/files?prefix`. Clients: `GET /v1/files/manifest?prefix&platform&version`
-(public files anonymously, private ones with a token; selector-filtered; `checksum` + `ETag`) and
-`GET /v1/files/{path}` with sha256 `ETag`/304, `Cache-Control`, `x-musubi-file-version`; `[files]
-public_base_url` rewrites manifest URLs to a CDN origin.
-
-Quest pools (challenge rotations): `POST /v1/server/quests/pools {id, kind: daily|weekly|custom, period_seconds,
-reset_hour, local_time, pick, goals: [{id, name, description, objectives, rewards, weight}], rerolls_per_period,
-starts_at, ends_at}` hands every player a deterministic weighted pick of `pick` goals per period (seeded by
-account × pool × period × generation — no coordination between nodes), rolling over at `reset_hour` in UTC or
-in the player's timezone (`accounts.metadata.tz_offset_min`); `GET /v1/quests/pools` creates the period's
-assignments on first sight, `POST …/{id}/slots/{slot}/reroll` swaps a slot for a goal not held (limited per
-period), `…/claim` pays the goal's reward table; `POST /v1/server/quests/event` and match results feed pools
-and challenges too (`pools.completed`, `quest_pool.completed` events); `…/{id}/accelerate` bumps the
-generation (fresh set for everyone now), `…/retire` closes the pool, `GET …/{id}/preview/{account_id}?at=`
-shows one player's set at any time. Player challenges from templates: `POST /v1/server/challenge_templates
-{id, objectives, duration_secs, max_participants, rewards_by_rank: {"1": table, "default": table}}`;
-a player runs one — `POST /v1/challenges {template_id, name, open, invite: [ids], starts_in_secs,
-duration_secs, max_participants}` (≤ 5 active per owner; invitees get a `challenge_invite` notification,
-code 31) — friends join by invite, open flag or the 8-char `join_code`; quest events score every running
-challenge the player is in (progress capped per objective), `GET /v1/challenges/{id}` shows live standings
-(code hidden from outsiders), at `ends_at` the ranks freeze (lazily or via `POST /v1/server/challenges/sweep`)
-and `POST …/{id}/claim` pays the rank's table; `GET /v1/challenges` lists the player's own and invited ones.
-Streak depth: `POST /v1/server/streaks {…, calendar, reset_hour, local_time, max_count, decay, repeat_every,
-repeat_rewards, enabled}` — calendar buckets instead of rolling periods (grace in whole periods), caps,
-decay by missed periods instead of a hard reset, a repeating reward every N-th count; state carries `best`,
-`claims`, `missed`, `in_grace`, `broken`, `next_milestone`, `max_count_reached`; operators read
-`GET /v1/server/streaks/{id}/state/{account_id}` and `POST …/{id}/reset {account_id, count?}`.
-
-Player statistics depth: definitions (`PUT /v1/server/stats/defs`) carry a fold kind `sum|max|min|last|avg|avgrate`
-(`avgrate` = `{value, length}` samples over a `window_secs` sliding window, Steam-style), `visibility`,
-constraints (`min_value`/`max_value` clamps, `max_change` per write, `increment_only`, `default_value`),
-`cycles: [{kind: daily|weekly|monthly|custom, period_seconds, reset_hour}]` (every update also lands in the
-current cycle slice; `GET /v1/stats/history?stat&cycle&limit` lists past cycles, `GET /v1/server/stats/top?stat&cycle`
-ranks the current one), `global: true` (a game-wide aggregate per scope and cycle — `GET /v1/stats/global`,
-`GET /v1/server/stats/global`) and `client_writable: true` (players post their own via `POST /v1/stats {scope, stats}`,
-every other stat is 403). `POST /v1/server/stats/update {…, transaction_id}` is idempotent per id.
-
-League depth: `league` on a leaderboard takes `overrides: {"<tier>": {promote_pct, demote_pct, promote_score, demote_score}}`
-(per-tier rules), `promote_score` / `demote_score` (score-target races: anyone past the target moves regardless of rank),
-`idle_demote` (a tier > 0 player who posted nothing all window drops one tier), `rest_secs` (writes are 503
-`league is resting` for the first stretch of each window), `ending_soon_secs` and `rewards: {"<tier>": reward_table}`
-paid to every participant of the tier at rollover (`rollover.rewarded`, `league.rollover` event).
-`GET /v1/leaderboards/{id}/tier` is the player's league card: tier, bucket, window start/end, `seconds_left`,
-`ending_soon`, `resting`/`resting_until`, `rank`/`group_size`/`score`, `promote_cut`/`demote_cut`, the effective
-`rule` and `projected: promote|demote|stay` (idle players see the demotion coming).
-
-Account policy: `PUT /v1/admin/accounts/policy {fields: {username|display_name|avatar_url|lang|location: {min_len, max_len,
-regex, ascii_only, blocked_words, reserved, edit: unlimited|interval|creation_only, interval_days}}, dormant: {days,
-notice_days, action: disable|delete}}` — player `PATCH /v1/account` is validated against the field rules (400) and the
-edit cadence (403 with `next_allowed_at`; `creation_only` fields can be set once), `GET /v1/account/policy` gives the client
-the rules plus its own per-field `edit_status`; the leader's retention loop (and `POST /v1/admin/accounts/dormant/sweep`)
-notices accounts `notice_days` before the dormancy threshold (`account.dormant_notice`) and then disables or soft-deletes
-them (`account.dormant_actioned`; activity = last session seen). Support lookup `GET /v1/admin/accounts/lookup?id|username|
-identity=provider:subject|email` returns the player card: account, status, last seen, sessions/devices/IPs, dormancy, edit status.
-
-Economy configuration workflow (P1-48): catalog edits are staged in a changeset instead of hitting the live tables — `POST /v1/server/economy/changesets {name, note, changes?}`, `PUT …/{id}/changes {changes: [{table, op: upsert|delete, row}]}` (any content-bundle table: `items`, `store_items`, `currencies`, `reward_tables`, `store_coupons`, `economy_strings`…; a partial row merges into the live one), `DELETE …/{id}/changes/{table}/{key}`, `GET …/{id}` (staged rows), `GET …/{id}/diff` (dry-run content import: added/changed/removed per table), `GET …/{id}/validate` (store entries reference existing, non-retired items and known currencies with non-negative prices; item status values; `images.*` are `https://` or `/v1/files/` paths; `[economy] required_locales` all have strings), `GET …/{id}/preview?table=store_items&locale=de` (the table as players would see it after publishing). Review: `POST …/submit` → `in_review`, `POST …/approve|reject {note}` — with `[economy] require_review = true` the author's key cannot approve its own changeset and only approved changesets publish (four-eyes); `POST …/publish {schedule_at?}` applies everything atomically as one content version (so `POST /v1/admin/content/versions/{id}/rollback` undoes it) or schedules it for the job loop (`scheduled`; failures fall back to `approved` with the error in `review_note`); `cancel`, `DELETE` of drafts; events `economy.changeset_submitted|approved|rejected|scheduled|published|cancelled`. Per-locale catalog strings: `PUT /v1/server/economy/strings/{kind}/{id} {locales: {de: {name, description, extra}}}` (`kind = item|store_item|currency|reward_table`), `GET …/strings?kind&id&locale`, `DELETE …/{kind}/{id}[/{locale}]`, translator round-trip `GET|POST …/strings/csv` (`kind,id,locale,name,description`; `?changeset=<id>` stages the import); players get them merged into `GET /v1/store?locale=de` (`name`/`description`, falling back to `[economy] default_locale`) and via `GET /v1/economy/strings?kind=item&ids=a,b&locale=de`. `images` (jsonb) on items and store entries carry icon/hero URLs.
-
-Item lifecycle: items carry a `status` (`POST /v1/server/items/{id}/status {status: draft|published|retired}` — only
-published items can be granted or bought, retired ones stay usable), `PUT /v1/server/items/{id}/lifecycle {use_cooldown_secs,
-effects: [{key, value, duration_secs}], durability: {max, per_use}}`; `POST /v1/inventory/use {id, quantity}` gates on the
-per-player cooldown (409 with `ready_at`), applies the timed status effects (`GET /v1/effects`, server `GET/DELETE
-/v1/server/effects/{account_id}[/{key}]`), and spends durability on the instance (durable items break — `item.broken` — instead
-of being consumed; `POST /v1/server/inventory/repair {account_id, id, amount?}`). `POST /v1/server/items/{id}/revoke` retires
-the item and pulls every instance from every inventory (`item.revoked` per owner).
-
-Game sessions: one object per running game — `POST /v1/server/sessions {fleet_id|pool+region|module+params|connect, name,
-properties, data, max_players, join_policy: open|invite|closed, idempotency_key, owner_id?}` allocates a dedicated server,
-launches an authoritative match or records custom connect info (same `idempotency_key` → same session, `reused: true`);
-`PATCH` properties/data/caps/policy (invite/closed mint a 6-letter code), `POST …/search {filters, sort}` over typed
-properties and built-ins (`player_count`, `free_slots`, `region`, `kind`, `state`…), `DELETE` terminates and stops the
-match/server, `POST …/{id}/members {account_id}` reserves a seat server-side. Seats are per-player reservations with a token
-the game server confirms (`POST /v1/gameserver/session/accept {token}` → `joined`; unconfirmed seats expire after 120 s;
-`…/left`, `GET|PATCH /v1/gameserver/session`). Players: `POST /v1/sessions/search` (server browser: open sessions with free
-seats), `POST /v1/sessions/join {code}` / `…/{id}/join`, `…/invite {account_id}` (invited friends bypass the policy, get a
-`session_invite` notification), `…/leave`, `GET /v1/sessions/mine|history`, and private/custom matches from operator templates
-(`PUT /v1/server/session_templates/{id} {fleet|module, region, params, max_players, join_policy, max_active_per_owner,
-wait_secs}` → `POST /v1/sessions {template_id, name, properties, join_policy?, max_players?}` returns the session, the
-owner's seat token, connect info and the invite code; owner can `PATCH`, rotate the code (`POST …/{id}/code`) and `DELETE`).
-Terminated sessions stay for `[retention] game_sessions_days` (14).
-
-External match functions (Open Match model): a queue with `mmf: {kind: "http", url, headers, timeout_ms, every_ms,
-min_tickets, fallback_after_secs}` is no longer matched in-process — the leader POSTs `{queue, extensions, tickets}` (the
-queue's whole waiting pool as wire tickets) to `url` every `every_ms` and applies the answer `{proposals: [{tickets: [id…],
-teams?: [[id…]…], region?, score?}]}` (or plain `{groups: [[id…]…]}`): every ticket must still be waiting, be used once and
-the size must be one the queue accepts; teams/region/score default to the built-in balancer/ping/grade, a negative score
-vetoes. Rejected proposals count under `bad_proposal`/`vetoed`. When the function has not succeeded for
-`fallback_after_secs` the built-in algorithm takes the queue over until it answers again (0 = never fall back).
-`GET /v1/server/matchmaker/mmf` — per queue calls/failures/latency/last proposals + rejections/`fallback_active`;
-`POST /v1/server/matchmaker/queues/{name}/mmf/test {apply?}` calls it once on the live pool (dry-run by default).
-`mmf: {kind: "wasm", propose, score}` names per-queue WASM exports instead of the global `matchmaker_propose`/
-`matchmaker_score` hooks; `extensions` is an opaque JSON blob handed to either kind with every call.
-
-Asynchronous PvP (offline matchmaking, P1-55): `PUT /v1/server/matchmaker/async/{rating_queue} {spread, max_spread,
-count, max_count, min_games, defender_cooldown_secs, attack_ttl_secs, attacks_per_day, max_open, shield_on_loss_secs,
-shield_max_secs, attack_breaks_shield, shield_price: {currency, per_hour}, revenge_ttl_secs, revenge_ignores_shield}`
-turns a rating queue into an attack ladder. `GET /v1/matchmaker/async/{q}/opponents?count&spread` — attackable players
-nearest to my display rating (within `spread`, widened to `max_spread` when too few; never shielded, opted-out,
-under-played, under my cooldown or already in one of my open attacks; `revenge_of` set when striking back is allowed);
-`POST …/attacks {defender_id, revenge_of?, data}` opens an attack (one per `max_open`, daily budget, cooldown per defender;
-revenge ignores shield and cooldown and can be used once per received attack within `revenge_ttl_secs`; starting an
-attack drops the attacker's own shield), `POST …/attacks/{id}/resolve {result: win|loss|draw, data?}` by the attacker
-or `POST /v1/server/matchmaker/async/attacks/{id}/resolve` by the game server: rating result for both sides, loser's
-shield (`shield_on_loss_secs`), `async_attack` notification to the defender with the revenge window, events
-`async_mm.attack_started|resolved`. Unresolved attacks expire after `attack_ttl_secs`. `GET …/me` (shield, opt-out,
-open/incoming with `revenge_available`, daily budget), `PUT …/opt_out`, `POST …/shield {hours}` buys shield time from the
-wallet (ledger reason `async_shield`; refused with an open attack), shields never reach past `shield_max_secs`;
-server: `POST|DELETE /v1/server/matchmaker/async/{q}/shields[/{account_id}]`, `GET …/attacks?account_id&role&state`.
-
-Login provider catalog (any OAuth2 / OIDC IdP at runtime, no code): `PUT /v1/admin/auth/providers/{name} {kind: oidc|oauth2,
-display_name, issuer (discovery) | authorize_url + token_url (+ userinfo_url, jwks_url), client_id, client_secret
-(omit to keep), auth_style: body|basic, scopes, pkce, claims: {subject, email, email_verified, display_name, avatar_url,
-username} (dotted JSON paths), allow_signup, redirect_urls (callbacks registered at the IdP), return_urls (where the browser
-may be sent back), enabled}`, `GET|DELETE`, `POST …/test` (runs discovery, fetches JWKS, shows an example authorize URL).
-Players: `GET /v1/auth/providers` (login buttons), `POST /v1/auth/providers/{name}/start {return_url?, callback_url?,
-create?, username?, vars?}` → `{url, state}` — the server keeps the PKCE verifier + nonce for 10 min; the IdP returns to
-`GET …/callback?code&state` (JSON session, or `return_url#access_token=…&refresh_token=…&created=` when a return_url was
-given) or the native app posts the code to `POST …/exchange {code, state}`; `GET …/login?return_url=` is the browser
-shortcut (302 to the IdP). `POST …/token {id_token | access_token, create, username, vars}` logs in with a token the
-client already holds (oidc: JWKS-verified id_token; oauth2: access token checked at userinfo). Identities are
-`oidc:<name>` (same namespace as `[social.oidc]`); new accounts get display_name/avatar from the mapped claims, the IdP
-email/name are kept on the identity for support. Linking: `POST /v1/account/link/providers/{name}/start|token`
-(409 when the identity belongs to another account), unlink via `DELETE /v1/account/unlink/oidc/{name}`. Events
-`auth.provider_login`, `account.linked`, `auth.provider_updated`.
-
-Per-server fleet metrics: the game server (agent/SDK) reports `POST /v1/gameserver/metrics {cpu_pct, mem_bytes,
-mem_limit_bytes, net_in_bps, net_out_bps, tick_ms, tick_p99_ms, tick_hz, players, capacity, custom: {k: number}}`
-(also updates occupancy); operators read `GET /v1/server/fleets/{id}/servers/{sid}/metrics?since_secs&step_secs&limit`
-(raw or bucketed history, latest sample, that server's alerts) and `GET /v1/server/fleets/{id}/metrics?window_secs&stale_secs`
-(latest sample per live server with `age_secs`, window aggregates, `stale_servers`, `firing_alerts`). Alert rules per fleet:
-`PUT /v1/server/fleets/{id}/alerts/rules/{name} {metric, op: gt|gte|lt|lte, threshold, for_secs, severity: info|warning|critical,
-enabled}` over `cpu_pct|mem_bytes|mem_pct|net_in_bps|net_out_bps|tick_ms|tick_p99_ms|tick_hz|players|occupancy_pct|custom.<key>`
-plus `silence_secs` (agent stopped reporting; checked by the lease holder every 15 s or `POST …/alerts/sweep`). A breach opens a
-pending alert, after `for_secs` it fires (`fleet.alert_fired` event → webhooks), recovery resolves it (`fleet.alert_resolved`);
-`GET /v1/server/fleets/{id}/alerts?state=firing|pending|resolved|all&server_id`. Samples/resolved alerts kept
-`[retention] server_metrics_days` (7).
-
-Build rollouts and the fleet lifecycle log: `policy.rollout {strategy: manual|rolling|recreate, max_surge, max_unavailable,
-auto_rollback, failure_threshold, drain_allocated_after_secs}` — promoting a build (or adding one as active) starts a rollout:
-the reconciler surge-starts up to `max_surge` servers of the new build above the target and replaces `ready` servers of
-other builds only as replacements become ready (plus `max_unavailable` at a time); `allocated` servers are never touched
-(unless their allocation is older than `drain_allocated_after_secs`); `recreate` replaces every ready server at once.
-Servers of the new build that fail to start or die within two minutes count as failures — at `failure_threshold` the
-previous build is re-promoted (a rollout back). `GET /v1/server/fleets/{id}/rollout` (state, live servers per build,
-`outdated`, `progress_pct`), `…/rollouts`, `POST …/rollout/pause|resume|rollback {reason}`. Every state change is logged
-with a code: `GET /v1/server/fleets/{id}/events?code=server.terminated&server_id&after&limit` — `server.starting|ready|
-allocated|shutdown|terminated|error` (with `exit_reason`: shutdown, dead_process, unhealthy, stuck_starting, max_duration,
-idle_ttl, scale_down, rollout, manual…), `build.added|promoted`, `rollout.*`; the lease holder forwards them to the event
-bus as `gameserver.*` / `fleet.*` (webhooks).
-
-Health policy and eviction (P1-28): `policy.health {disabled, initial_delay_secs (120), period_secs (10), failure_threshold (3)}` — a server that has not reported `ready` within `initial_delay_secs` is reaped as `stuck_starting`; after that, `period_secs × failure_threshold` without `POST /v1/gameserver/health` makes it `unhealthy` and the reconciler terminates it (`disabled` never reaps for silence — debugger sessions). `GET /v1/server/fleets/{id}/health` classifies every live server (`healthy | suspect | unhealthy | starting | stuck_starting | unchecked`, missed checks, `reap_in_secs`). `policy.eviction = never | on_upgrade | always` says which in-game servers may be stopped: `never` leaves `allocated` servers to lifecycle limits only, `on_upgrade` (default) lets rollouts drain long allocations per `drain_allocated_after_secs`, `always` also lets scale-down stop the emptiest allocated servers when the fleet is over target.
-
-Packing several matches per process (P1-46): `spec.slots_per_server = N` lets one game server host N concurrent allocations — `allocate` lands on the fullest live server with a free slot before touching a `ready` one (`backfill: true`), every slot gets its own connect token (`/v1/gameserver/connect` accepts any of them), the game server frees a slot with `POST /v1/gameserver/release {token}` and returns to `ready` when the last one is released; the autoscaler counts free slots on live servers as available capacity, so a fleet of 8-room processes keeps a buffer of rooms, not processes.
-
-Counters, lists and the server inventory: a server reports named counters `POST /v1/gameserver/counters {rooms: {delta|count,
-capacity}}` and lists `POST /v1/gameserver/lists {players: {add, remove, values, capacity}}` (over capacity → 429; operators
-`PATCH /v1/server/gameservers/{id}/counters|lists`). Allocations take a selector: `POST /v1/server/fleets/{id}/allocate` /
-`/v1/server/allocate {selector: {labels, build_version, states: ["ready", "allocated"], counters: {rooms: {min_available,
-min_count, max_count}}, lists: {players: {contains, excludes, min_available}}}, counter_actions: {rooms: {delta}},
-list_actions: {players: {add}}}` — the first matching server is taken and the actions are applied in the same transaction;
-with `"allocated"` in `states` a live server is shared (its connect token is returned, `backfill: true`) — room/sub-match
-hosting. `policy.counter_target {counter, buffer}` makes the autoscaler keep that much aggregate free counter capacity across
-the fleet; `GET /v1/server/fleets/{id}/counters` aggregates counters/lists and the shortfall. Cross-fleet inventory
-`GET /v1/server/gameservers?fleet|fleet_id|pool|region|provider&state=ready,allocated|all&build_version&exit_reason&node_id
-&labels=k=v,k2=v2&min_age_secs&max_age_secs&min_players&free_slots&counter&counter_min_available&list&list_contains
-&order=-created_at|players|last_health&limit&offset` (servers with fleet/region/pool/provider, `exit_reason`, `age_secs`,
-`total`) and `GET /v1/server/gameservers/counts?group=state|region|fleet|pool|provider|build|exit_reason|node&<same filters>`.
-
-Allocation placement (P0-30, Agones `GameServerAllocation` parity): a selector also takes `match_expressions: [{key, op: in|not_in|exists|does_not_exist, values}]` over server labels (set-based — "map in [dust, inferno] and no `reserved` label"), and the request takes an ordered fallback chain `selectors: [...]` (tried after `selector`, or instead of it when `selector` is empty; the first selector with a match wins and the response says which — `matched_selector`), `priorities: [{kind: counter|list, key, order: asc|desc}]` to rank the matching servers by a counter's count or a list's length (fewest rooms first, most players first…), and `scheduling: packed|distributed` as the tie-break — `packed` (default) takes the fullest / oldest server so idle ones scale down, `distributed` prefers a fresh server over packing into a live one, then the host with the most free servers, the emptiest and newest — spreading load and blast radius. Servers set labels at runtime with `POST /v1/gameserver/label {k: v}` (label-locking: a server labels itself `reserved` and a selector excludes it). Malformed chains (`in` without values, unknown `kind`/`order`) are 400 before the store is touched.
-
-Match / room lifecycle on the event bus: `match.started|created|joined|left|closed|ended|resumed|results` (authoritative and
-relayed matches, with `match_id`, account/session, node) — `GET /v1/server/matches/{id}/events` is the trail of one match;
-webhook `kinds` accept wildcards (`match.*`, `gameserver.*`, `gameserver.custom.*`). Server-to-server callbacks: a game
-server posts its own events `POST /v1/gameserver/events {kind, data}` → `gameserver.custom.<kind>` on the bus (webhooks,
-LiveOps, `GET /v1/server/events`) and in the fleet log.
-
-Player server browser: fleets with `policy.browsable` (or servers labelled `public=true`) appear in `GET /v1/servers?region
-&labels=map=dust,mode=ctf&q=<name>&min_free_slots&not_full&not_empty&build_version&sort=-players|age|rating|name&limit&offset`
-— name (`labels.name`), map/mode, players/capacity/free slots, counters, uptime, reputation, the caller's favourite and
-last-joined marks; `GET /v1/servers/{id}`. `POST /v1/servers/{id}/join {payload}` connects through a shared allocation on
-exactly that server (`connect_token`, 429 when full) and records `GET /v1/servers/history`; favourites keyed by
-`address:port` (`PUT|DELETE /v1/servers/favorites/{key|id}`, `GET /v1/servers/favorites` resolves which are online);
-reputation `POST /v1/servers/{id}/rate {score: 1..5, tags}` (one vote per player, after joining).
-
-Lifecycle guards in the same `policy` keep fleets free of zombies: `max_duration_secs` terminates any
-server that has lived that long, `idle_ttl_secs` reaps servers that sat `ready` without an allocation
-(never below `min_servers`), `allocated_max_secs` ends matches that have been `allocated`/`in_game`
-for too long (runaway sessions); each reap is logged with its reason and the autoscaler refills.
-
-Redemption codes are campaigns, not discounts: `PUT /v1/server/codes/campaigns/{id} {name,
-reward_table?, key_group?, per_account, max_redemptions?, starts_at?, ends_at?, audience?, enabled,
-metadata}`; `POST …/{id}/generate {count, length, prefix, max_uses, batch}` mints single-use codes
-(returned once), `POST …/{id}/codes {code, max_uses?}` registers a shared code (`LAUNCH2026`),
-`POST /v1/server/codes/{code}/revoke`, `GET …/{id}` with stats, `…/codes?unused&batch`,
-`…/redemptions`. Third-party keys ride along: `PUT /v1/server/key_groups/{id} {platform}`,
-`POST …/{id}/keys {keys: [...]}` bulk-uploads Steam/console keys and a campaign with `key_group`
-hands one out per redemption (`no keys left` → 409, nothing granted). Players
-`POST /v1/codes/redeem {code}` (case/dash-insensitive; 10 attempts per minute) and get
-`{reward: [...], keys: [...], metadata}`; `GET /v1/codes/redemptions` is their history. Event
-`code.redeemed`.
-
-Energy (stamina-style resources) lives next door: `POST /v1/server/energy {id, max, regen_seconds,
-initial, refill_count, max_overfill, reward_on_spend?}` — `refill_count` units per tick, grants may
-push the bar up to `max_overfill` (regeneration never does), `reward_on_spend` grants a reward table
-per spend (XP per stamina); `GET /v1/energy`, `POST /v1/energy/{id}/spend {amount, at?}` where `at`
-books an offline spend at the moment it happened (regeneration runs to `at`, then on to now);
-`POST /v1/server/energy/grant`. Per-player timed modifiers — `POST /v1/server/energy/modifiers
-{account_id, energy_id, kind: infinite|set_refill_count|set_refill_sec|set_max_count, value,
-duration_secs?}`, `GET …?account_id`, `DELETE …/{id}` — make spends free or override refill/max for
-the duration; `GET /v1/energy` reports effective values and active modifiers.
-
-Lobbies carry typed attributes: `attributes {key: string|number|bool}` (public, searchable, ≤ 32
-keys) and `private_attributes` (members only) on create/PATCH, plus per-member `data`
-(`PUT /v1/lobbies/{id}/me {data}` — loadout, colour, platform; everyone in the lobby gets `updated`).
-`POST /v1/lobbies/search {filters: [{key, op, value}], sort: [{key, dir, near?}], region?, has_slots,
-limit, offset}` searches public waiting lobbies — ops `eq ne gt gte lt lte contains in exists` on
-attributes or built-ins (`name`, `region`, `host_id`, `member_count`, `free_slots`, `max_members`,
-`team_count`, `team_size`, `created_at`); `near` sorts by distance to a number (closest skill first).
-
-Sanctions sit on top of bans as the moderation workflow: `POST /v1/admin/accounts/{id}/sanctions
-{action, reason_code?, duration_secs?, message?, pending?, escalate?, source?, note}` with actions
-`warn` (notification only), `mute` (chat + voice), `restrict_matchmaking`, `restrict_social`
-(friends/groups/chat), `restrict_trading` (trading/UGC), `shadow`, `ban`, `custom {features}` — the
-account's effective ban is recomputed from all active sanctions (union of restrictions, full ban wins,
-latest end date), `pending: true` waits for a second moderator (`…/sanctions/{id}/approve|reject`),
-`escalate: true` picks action and duration from the reason's `ladder` (`PUT /v1/admin/bans/reasons/{code}
-{ladder: [{action: "warn"}, {action: "mute", duration_secs: 86400}, {action: "ban"}]}`) by how many
-sanctions with that reason the account already has; `…/revoke`, expiry sweep. Players see their own
-(`GET /v1/account/sanctions`, moderator notes hidden) and appeal once per sanction
-(`POST /v1/account/sanctions/{id}/appeal {text}`); moderators work the queue (`GET /v1/admin/appeals`,
-`POST /v1/admin/appeals/{id}/decide {outcome: upheld|overturned, note}` — overturned revokes). Game
-servers ask `GET /v1/server/accounts/{id}/sanctions` (`banned`, `restricted[]`) or mirror everything via
-`GET /v1/server/sanctions/sync?since` (cursor on `updated_at`). Events `sanction.*`, `appeal.*`.
-
-## Layout
-
-| crate | role |
+| path | what |
 |---|---|
-| `musubi-core` | shared types, ids, errors, config |
-| `musubi-proto` | wire protocol and schemas |
-| `musubi-cluster` | membership, raft, placement, leases |
-| `musubi-actor` | actor model, journal, snapshots, failover |
-| `musubi-transport` | QUIC / WebTransport / WebSocket / UDP channels |
-| `musubi-edge` | ingress: TLS, auth, rate limiting, routing |
-| `musubi-auth` | identities, providers, sessions |
-| `musubi-account` | accounts, profiles, wallets |
-| `musubi-storage` | typed collections and legacy KV storage |
-| `musubi-server` | node binary (`musubi-server`) |
-| `musubi-cli` | developer CLI (`musubi dev`, `musubi deploy`, …) |
+| `crates/musubi-server` | the node: HTTP/WS/QUIC API, realtime, worlds, fleets, console embedding, migrations |
+| `crates/musubi-cli` | `musubi` — `dev`, `migrate`, `doctor`, `export`/`import`, `migrate-nakama`/`-playfab`, `module`, `fleet`, `deploy`, `bench`, `soak` |
+| `crates/musubi-mesh` | server-meshing core: cells, leases, handover, interest, controller, snapshots |
+| `crates/musubi-cluster` | membership, Raft directory, placement, leases, node bus |
+| `crates/musubi-actor` | actors with journal, snapshots and failover |
+| `crates/musubi-transport`, `musubi-edge`, `musubi-quic-ffi` | WebSocket / QUIC / WebTransport / UDP, ingress, C-ABI QUIC for the Unreal plugin |
+| `crates/musubi-auth`, `-account`, `-storage`, `-social`, `-chat`, `-leaderboard`, `-matchmaker`, `-economy`, `-fleet`, `-runtime`, `-integrations`, `-idl`, `-proto`, `-core` | the subsystems |
+| `crates/musubi-sim-sdk` | Rust SDK for writing a simulator (`run_sim_stream`) |
+| `crates/musubi-unreal-gen` | generates the C++ wire layer from the Rust protocol (`--check` in CI) |
+| `console2/` | operator console: React 19, TypeScript, Vite, TanStack Router/Query/Table, shadcn/ui; typed client generated from the node's OpenAPI |
+| `sdk/unreal/` | Unreal plugin (client, world view, server module, Iris bridge, NetDriver) and demo project |
+| `deploy/` | Helm chart, Terraform |
+| `docs/` | GDK design, feature and API references, operations, competitive analysis (22 teardowns) |
+
+## Developing
+
+```sh
+cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings
+MUSUBI_TEST_DATABASE_URL=postgres://musubi:musubi@localhost:5432/musubi cargo test --workspace
+cd console2 && pnpm install && pnpm build && pnpm test     # typecheck + OpenAPI path check + vitest
+```
+
+The console build is embedded into the server binary (`console/dist`, `include_dir!`), so a
+console change is `pnpm build`, copy `console2/dist` → `console/dist`, `cargo build`. CI runs the
+Rust suite against Postgres, the console build and tests, the Unreal wire-layer checks and
+criterion benches against the base commit; a nightly chaos stand kills nodes for 20 minutes
+and fails on any lost write.
+
+## Status
+
+`0.1.x` — alpha. The API is complete enough to run a game on, the protocol and the wire are
+pinned by tests, but we do change shapes between minor versions until `1.0`; migrations are
+always forward-compatible. Things we know are not done: client SDKs other than Unreal (Unity
+and Godot are next, the OpenAPI schema and the generated wire layer are the starting point),
+multi-region active/active for one world, and a hosted build of the console outside the node.
+
+Comparison with Nakama, PlayFab, Pragma, AccelByte, Photon, SpatialOS-style meshing vendors and
+17 others: [docs/competitive-analysis.md](docs/competitive-analysis.md),
+[docs/parity.md](docs/parity.md).
 
 ## License
 
-Apache-2.0.
-
-## Server meshing (v0 core, `musubi-mesh`)
-
-Replication-layer data model independent of transport/engine: grid cells with simulator leases (`lease_ttl_ticks`), entity-level authority (only the lease holder writes; versioned components), ghosts within `ghost_margin` of a neighbour's border, handover state machine (border + `hysteresis` → `Started` → `handover_ack` by the new owner → `Completed`, or `Cancelled` after `handover_timeout_ticks`; inputs during transit are buffered for the new owner), interest subscriptions with per-client deltas that never see ownership changes, persistent-entity snapshots/restore, orphaned-cell detection when a lease lapses. Wired into the server: named worlds ticked at 30 Hz (`realtime/world.rs`); simulator API with the server key — `GET|POST /v1/server/worlds`, `GET|DELETE /v1/server/worlds/{w}`, `POST …/{w}/lease|renew|spawn|despawn|apply|handover/ack`, `GET …/{w}/view/{x}/{y}`, `GET …/{w}/events?sim=` (handover requests/results, routed inputs); clients use `world_subscribe {world,x,y,radius}` / `world_unsubscribe` / `world_input {world,entity,input}` and receive `world_delta {spawned,updated,despawned}`. Shard controller v0 (`musubi-mesh::controller`): simulators register with a capacity (`POST|DELETE /v1/server/worlds/{w}/sims {sim, capacity}`), unowned cells are leased on demand (spawn or client interest; adjacency preferred, then lowest load), a pass every 30 ticks re-leases orphaned cells to live simulators and sheds cells off simulators above `split_cost`; simulators learn about it through `cell_assigned`/`cell_revoked` events. Simulator SDK (`musubi-sim-sdk`): `WorldClient` over the HTTP API plus `run_sim(client, sim, SimConfig, impl Simulator, stop)` — registers, heartbeats, drains events, auto-acks handovers (unless refused), ticks owned cells and pushes `Update`s; two SDK simulators handing an entity over is covered by a test. Worlds are homed on one node (directory `musubi.worlds`): clients on any node subscribe/send inputs through the bus and get deltas back, simulators hitting another node get a 307 to the home's `advertise` address (409 with the home node id if none). Multi-home replication of one world and engine SDKs (Unreal headless first) are next.
-
-Streaming simulator protocol: `GET /v1/server/worlds/{w}/stream?sim=<uuid>` (server key; add `&delta=1` for delta frames — per cell only the entities that changed since the previous frame in `owned`/`ghosts`, the ids that left in `gone`, `full: true` on a cell's first frame; the simulator keeps the view — `musubi bench`, `musubi soak` and the SDK's `run_sim_stream` all consume it; `run_sim_stream` folds frames into a local `View` per cell and runs `Simulator::tick` once per frame, so a simulator written against `run_sim`'s polling API switches to the stream by changing one call) upgrades to a WebSocket per node hosting the simulator's cells. After every registry tick the node renews the simulator's lease (connected = alive) and pushes one `{"type":"tick","tick":n,"cells":[{cell, owned, ghosts}],"events":[…]}` frame, replacing per-tick polling of `/view` and `/events`. Commands are JSON objects with `op` ∈ `lease | spawn | despawn | apply | handover_ack` and the fields of the matching HTTP body (no `sim`); replies echo `op` and an optional `id`, and a cell hosted elsewhere answers with `redirect` (that node's URL) exactly like the HTTP endpoints. The soak stand keeps one stream per split world open across kill/drain (`stream: tick frames / reconnects`). Events are one typed enum, `musubi_mesh::SimEvent` (tagged by `type`: `cell_assigned`, `handover_request`, `input`, `co_locate`, `queued`…, `Unknown` for a newer server), built by the server and read back by `musubi-sim-sdk`; its serialization is pinned to the former hand-built JSON by a test, so the wire did not change. Commands up the stream are `musubi_mesh::SimCommand` the same way (tagged by `op`: `lease`, `spawn`, `tick_done`, `despawn`, `attach`/`detach`, `apply`, `interact`, `colocate`, `rewind`, `handover_ack`; `SimCommandFrame` carries the optional `id` echoed in the reply) — the server dispatches on the enum, the SDK builds it. The frame itself and the replies are typed as well: `musubi_mesh::SimFrame` / `CellFrame` (cell, tick, owner, `full`/`gone` in delta mode, owned, ghosts, globals, `time_scale` when dilated) and `CoLocateResult`, `InteractResult` (`delivered`: owner / in_transit / forwarded / dup), `RewindResult`, `HandoverAckResult` — the server builds them, `musubi-sim-sdk` folds `CellFrame`s into its views, all pinned to the former JSON by tests. `musubi_proto::JsonText` (component values kept as raw text) decodes inside such tagged enums too: from serde_json it still takes the raw bytes, from serde's buffered content it re-serializes the value.
-
-Cross-boundary interactions: a simulator that hits a ghost (an entity owned by another cell or node) calls `POST /v1/server/worlds/{w}/interact {sim, entity, kind, payload}` (or the stream op `interact`) instead of writing the target. The replication layer delivers an `interaction` event (`kind`, `payload`, `from_sim`, `seq`, `tick`) to the simulator that owns the target, which alone applies the effect — one winner per conflict, in per-entity sequence order (the owner node is the single point of order; `seq` restarts when the entity changes owner). A target in transit receives it with its buffered inputs after the handover; a target hosted on another node is forwarded over the bus.
-
-Physics across a cell border (plan: physics itself stays out of the core — the engine is the simulator's; what the backend owns is *who resolves a contact*): a simulator that touches a ghost reports `interact {kind: "contact", tick, payload: {other, impulse, point, normal…}}`, where `other` is its own entity. The owner of the target applies the impulse like any interaction — the ghost side never writes — and the same contact reported from the other side of the border for the same tick is dropped (`delivered: "dup"`), so a collision seen by both simulators resolves once. A pair that keeps touching for 10 consecutive ticks is co-located: the target is pinned into the reporter's cell for 300 ticks (`colocated: true` in the reply, the existing `co_locate` path, forwarded over the bus when the target is on another node), so one simulator owns both bodies and the contact becomes local. `musubi_world_contacts_total{path=applied|dup|colocated}`. Writing the test for it found a real
-bug in the cross-node path: the receiving node judged a handed-over body's cell by its position,
-so a co-located body whose position is still across the border was refused (`not_here_confirmed`)
-and the sender retried every tick — the receiver now lands it in the pin it holds, else in the cell
-the sender's transit named, else by position. Honest limits: the backend does not integrate forces or detect collisions — it routes, dedupes and decides ownership; a contact involving three or more bodies across borders gathers in one cell: the reporter's own pin names the cell, and partners pinned next to the body being moved follow it (`followers` in the `interact` reply) instead of being pulled back pair by pair; the threshold and the pin lifetime are per-world config (`contact_colocate_after_ticks`, default 10, `0` disables co-location; `contact_colocate_ttl_ticks`, default 300).
-
-Cross-cell transactions: `POST /v1/server/worlds/{w}/tx {id?, ops: [{entity, components, expect?: {component: version}}], ttl_ticks?}` writes several entities — on any cells, any nodes — atomically: all of it lands or none of it does (trade, loot split, a door and its key across a border). When every entity lives on the receiving node the ops apply at once (`state: committed`). Otherwise the node holds its entities (writes to them answer 409, handover is deferred) and asks the other hosts to prepare; each checks its entities are present, not in transit, not held by another transaction and that every `expect`ed component version is still current, then holds them and votes. The last vote commits everywhere (`tx_committed` event to the owning simulators, persistent writes journaled), any refusal or a host silent past `ttl_ticks` (default 30) aborts everywhere (`tx_aborted` with the reason). `GET /v1/server/worlds/{w}/tx/{id}` → `pending | committed | aborted {reason}`; a known `id` on `POST` returns the stored outcome (`replayed: true`), so a retry never applies twice.
-
-Server-side atomic transactions: `POST /v1/server/tx {ops: [...]}` (server key, up to 100 ops) runs storage writes (`{type: "storage_write", owner_id?, collection, key, value, version?}` — CAS and create-only `"*"` apply), `wallet_adjust` (balance checks, idempotency keys), `inventory_grant` and `inventory_consume` in one PostgreSQL transaction: a 409 on any op rolls back all of them, live storage subscribers hear about the writes only after commit. Grant limits are checked before and charged after the commit.
-
-Cold cells: a hibernated cell (no client watched it for `hibernate_after_ticks`: lease revoked, ephemeral entities gone) that stays untouched for `unload_after_ticks` more (0 = never) is unloaded — its persistent entities are written to `musubi.world_cold_cells` and dropped from memory, so a huge persistent world costs RAM only where someone is. The cell is listed under `cold_cells` in `GET /v1/server/worlds/{w}`; interest, a lease or a spawn reaching it reads the row back (`cell_reloaded` event to the owning simulator) and a world moving to another node learns its cold cells from the same table.
-
-Group handover (plan 4.5): an entity attached to a root (`World::attach` — passenger to vehicle, part to construction; chains allowed, cycles refused) never crosses a border on its own: when the root hands over, the whole group travels in one transaction — one `handover_request` carrying the root's state plus `group` states, one Ack flips authority and cells for all of them, inputs for any member are buffered meanwhile, and a cancel rolls every member back. Simulators declare groups with `POST /v1/server/worlds/{w}/attach {sim, entity, root}` / `…/detach {sim, entity}` (stream ops `attach`/`detach`; both entities must be owned by the caller; journaled, so a rehome keeps the group). A handover that gets no Ack within `handover_timeout_ticks` (3) is cancelled and backs off before the entity is offered again: 2, 4, 8 … up to 32 ticks per consecutive failure (`handover_retry_tick`), reset on the next successful Ack — so a slow or flapping neighbour is retried, not hammered every tick.
-
-Containers (plan 4.5, entity hierarchy): `attach` with `contained: true` puts an entity *inside* its root (item in a chest, cargo in a hold, a bag inside the hold): it takes the root's position and follows it on every `apply`, counts against the root's `container.capacity` component (`400 container full`; re-attaching what is already inside is a no-op), and leaves the spatial interest scan — a client sees the contents only when the root carries `container.open: true` or its `world_subscribe` names the root in `inside` (its own inventory, the chest it is browsing; re-subscribe with `inside` omitted and the contents despawn for it). `detach` puts it back into the world at the root's position. Containment is journaled (`Attach{contained}`) and restored from snapshots, cold cells and journal replay like the rest of the tree; contained groups still hand over with their root. Queries (any node with a shard of the world; `ensure_shard` redirects the rest): `GET /v1/server/worlds/{w}/entities/{id}` → the entity with `path_to_root`, direct `children`, `contents` and `capacity`; `GET …/entities/{id}/children?depth=N` (`0` = whole subtree, each with its `depth`); `GET …/entities?component=kind&equals=ore&cell_x=&cell_y=&persistent=&contained=&root=&under=&limit=` (`equals` is JSON text, a bare word is a string; `root` = direct children of, `under` = anywhere below). A query spans the whole world: the node it lands on answers for its shard, asks every other cell host over the bus (`WorldQuery` → `WorldQueryReply`, 1 s deadline; a shard that stays silent is listed in `shards_missing`, `shards_asked` says how many were reached, `musubi_world_query_shards_total{outcome}` counts both) and reads the hibernated cells from `world_cold_cells` through a scratch mesh with the world's config, so a chest unloaded to the database still answers with its contents and `path_to_root`. Records merge by entity id (live shards win over cold rows; `limit` applies to the merged set). Honest limits: `attach` requires the root on the same shard and attached entities travel with their root (handover, hibernation), so a subtree never spans shards in steady state — the only moment a path stops at a shard border is while the root is in transit between nodes (one handover, re-asked by the client); there is no graph database — the hierarchy lives in the mesh and its snapshots.
-
-Interest v2: a client's `world_subscribe` carries an optional `budget_bytes` per tick (default `client_budget_bytes` = 16 KB in the world config) and an optional `filter` (component → value every delivered entity must match) on top of the radius. Each tick the entities in range are ranked by `relevance × (1 + age)` — relevance falls with distance, age is the ticks since the client last heard about the entity — and sent in that order until the estimated bytes exceed the budget (at least one always goes); the rest keep their old state and come back later with a higher priority, so a crowded radius degrades to lower update rates for far entities instead of bursts. Despawns are always delivered. Positions are quantized to `pos_quantum` (0.01) and jitter below it is not an update.
-
-Degradation under load (plan 4.8): `soft_cap` in the world config refuses spawns into a cell that already holds that many entities (`429`, event `cell_full` to the simulator; handovers always pass — physics cannot wait at a border). A spawn with `queue: true` (HTTP and stream op) waits instead: `202 {queued, ticket, cell, position, eta_ticks}` and event `queued`; each tick the cell admits waiting spawns in arrival order as entities leave (`queue_admitted` with the entity), reports position/ETA changes (`queue_update`, ETA = position / smoothed departures per tick, `null` until the cell has seen departures) and drops tickets older than `queue_ttl_ticks` (600) or whose simulator lost the cell (`queue_expired` with `timeout` / `lease_lost`). Cell cost (plan 4.4 dynamics): `cost_entity`·entities + `cost_player`·clients whose interest is centred in the cell + `cost_traffic`·entities in handover out of it (smoothed per tick), plus `cost_lag` per tick the owning simulator lags; a simulator over `split_cost` sheds its least-coupled cell to one that stays under the bar, and one under `merge_cost` for `merge_after_rounds` control rounds (30 ≈ 30 s) hands every cell to the owners of neighbouring cells that stay under ¾ of `split_cost` — all or nothing — and is left free (co-locate: ghosts and handovers stop crossing simulators; the hysteresis keeps it from flapping). Split before dilation: a simulator whose reported tick lags the world by more than `tidi_after_ticks` first sheds a cell (the one least coupled to its others) to an alive simulator that keeps up, regardless of `split_cost` (reconcile reason `lagging`); only what it still holds is dilated. Time dilation: a simulator reports the last tick it fully processed (`tick` in `POST /renew`, op `tick_done` in the stream); when it lags the world by more than `tidi_after_ticks` (15) its cells run at `tidi_after_ticks / lag` of real time, not below `tidi_min` (0.1) — the simulator gets a `time_scale` event and sees `time_scale` per cell in its tick frames, clients get `time_scale` in `world_delta` (slowest cell in their radius) to interpolate against; the cell returns to 1.0 as the simulator catches up. Interest shedding is the per-client budget of interest v2.
-
-World persistence (plan 4.9): a spawn may carry `decay_ticks` — the entity disappears after that many ticks without a write, interaction or handover (event `decayed` to the cell's simulator; persistent ones are journaled so no shard resurrects them) — abandoned litter cleans itself up. A cell no client has watched for `hibernate_after_ticks` (1800 ≈ 60 s; 0 = never), leased or holding entities under a lapsed lease, with nothing in transit or written to recently, hibernates: its lease is revoked (`cell_hibernated` with `ephemeral_despawned` / `persistent_kept` to the last simulator), ephemeral entities die with it, persistent ones stay in the shard's memory and snapshot, and the cell is not an orphan — nothing re-leases it while nobody looks. A client's interest reaching it (or a simulator leasing it) wakes it within one control round with its persistent entities in place. Old snapshots and journals load unchanged (the new entity fields default). Time machine: every shard snapshot is also appended to `musubi.world_history` (retention `world_history_days`, 7) and the journal is kept back to the oldest retained history row, so `GET /v1/admin/worlds/{w}/at?tick=T` rebuilds the persistent entities as of any retained tick — newest history snapshot of each shard at or before T plus the journal ops up to T (provenance-aware merge, as in recovery) — and reports the retained range; `POST /v1/admin/worlds/{w}/snapshot` takes one now (shards that left the world contribute their last snapshot only).
-
-Lag compensation: the shard keeps `history_ticks` (15 ≈ 500 ms) of positions per entity. `POST /v1/server/worlds/{w}/rewind {entity, tick, x?, y?, tolerance?}` (and the stream op `rewind`) answers where the entity was at the end of `tick` and whether `(x, y)` was within `tolerance` (1.0) of it — `pos`/`hit` are null when history does not reach that far back, never a guess. An `interact` carrying the actor's `tick` (and `x`, `y`, `tolerance`) reaches the target's owner with the same answer under `rewind`, computed on the owner from its own history whether the interaction came from a local simulator or over the bus — Source-style rewind for hitscan on a ghost across a border. Co-locate (docking, grappling — physics that cannot be split across two owners): `POST /v1/server/worlds/{w}/colocate {sim, entity, with, ttl_ticks}` (stream op `colocate`) pins `with` into `entity`'s cell for `ttl_ticks` (300) — the regular handover brings it over with state and buffered inputs (its owner hears `co_locate`, then `handover_request` reaches the caller, who acks), the caller is authoritative over both while the pin holds, and when it lapses the partner hands back to wherever its position says. A partner living on another node is reached over the bus: the caller pins first (so the arrival lands in its cell), the node hosting the partner pins too and its regular cross-node handover ships the entity; the answer carries `forwarded: true`.
-
-Load: `musubi bench --scenario world --clients N --worlds W --entities E --radius R` creates W arenas with E entities each moved by a simulator every tick, spreads N WebSocket players over them; `--sims K` replaces the single HTTP-`apply` simulator with K simulators per world on the server-to-server stream (`/v1/server/worlds/{w}/stream`), each leasing its share of the grid (`(x + y) mod K`) while entities drift across the borders and change owner — the run then also reports `handover_acks` (answered by the simulators), `handovers_completed` (the node's `musubi_world_handovers_total`), `stream_frames_per_sim_per_sec` and `stream_reconnects` and reports frames per player per second, inter-frame gap p50/p99, bytes and entity updates per second, plus the server's own `musubi_world_tick_duration_seconds` (simulation step) and `musubi_world_fanout_duration_seconds` (per-player delta build and send) from `/metrics`. Players walk their interest circle in short random hops (5 Hz), as a moving player would; arenas are deleted when the run ends. Every world ticks on its own thread with its own clock (a slow world never holds back the others); a player whose view did not move re-examines only the entities that changed since its last delta (per-cell change ticks plus a change log), deltas are built sequentially on the world's own thread, component values travel as JSON text serialized once per change, and `--max-hz N` caps deltas per player per second (skipped ticks fold into the next delta). Reference on an 8-core dev box, `--wire binary`: 1 000 players over 4 worlds × 500 entities → 30.1 frames/player/s (the full 30 Hz), gap p50 33 ms / p99 47 ms, 0 errors, ≈0.8 cores. 10 000 players over 20 worlds × 500 entities on the same box: every player connects (the handshake no longer reads the account row — the username rides in the token — and the listen backlog is 4096) and after the fan-out series (ahash maps, one `Known` record per visible entity, 8 KiB WebSocket read buffers, shared component text, pre-sized frame buffers) the node is no longer the bottleneck of this box: with the load generator split in two processes (5 000 players and 10 worlds each — one process reading 10 000 streams was itself the limit: `apply` 18 ms and 21 frames/s against 7 ms and 25 with two) the twenty worlds tick at a full 30 Hz on 4.1 cores, 0 errors, no dropped or deferred frames, 2.67 M entity updates/s at 124 MB/s, the clock-paced HTTP simulator at 30.1 Hz; players get 24.9 frames/s because a tick whose delta is empty for a player sends nothing and the simulator's batches of `apply` land with jitter against the tick clock (`musubi_world_frames_total` equals the frames the players counted). With stream simulators instead (`--sims 2`, 40 simulators moving entities on every frame, 16 200 handovers completed, 0 errors) the node needs 6 cores and the box saturates — the ticks fall to 25 Hz with the two load generators on the same 8 cores, so that configuration wants a second box, not more tuning. Pinning the node to six of the eight cores (`taskset`, generators on the other two) shows what a core budget does: 25 ticks/s and 21 player frames/s with the pools sized to the machine (8 runtime workers + 8 fan-out threads + 20 tick threads on 6 cores), 25 frames/s, 28.5 Hz simulator and `apply` 11.5 → 8.9 ms once the pools follow `available_parallelism` (the affinity mask / cgroup quota; `node.worker_threads` overrides) — ticks stay at 25/s because the node simply needs about six full cores for 10 000 players at this density, which the two generators also want; the 30 Hz proof needs the generators on another machine. Profile of the node at 10 000 players: `delta_with` ≈ 25 %, hot on the probe of each player's `known` map per changed entity — 10 000 cold maps are the per-client state, that miss is the design's price, not a bug (a sorted vector instead of the map was tried and dropped: sorting the scan per player cost more than it saved); a view that moved no longer walks the whole map — only the entities that changed or whose visibility flips between the old and the new circle are examined. Found and fixed on the way: glibc malloc's arena locks (most runtime-worker samples sat in realloc/free waiting for one; the server binary uses mimalloc), the world mutex taken by every subscription and `home_of` on a session task (interest is now queued and applied by the world's tick thread, the home lookup reads a mirror), the tick holding the lock while building deltas (deltas are built from a `WorldView` snapshot off the lock), deltas that cloned every component's JSON value per client and re-serialized it to estimate its size (they carry shared text now), and a benchmark that paced its simulator by the server's reply and so under-reported frames. Per-player cost that remains: the `known` probe per changed entity and the frame encode on the runtime workers; 30 Hz for 10 000 players on one 8-core node is open only because the load generator shares the box. Profiled (`perf`, 1 000 players): the per-player scan (`delta_with`) was a third of the node — 18 % itself plus ~8 % in SipHash, because every id a player sees is hashed several times per tick (`known`, `last_sent`, the seen-set) and the seen-set re-grew per player; entity-keyed maps now use ahash (keyed per map, so crafted ids cannot collide) and the seen-set is pre-sized: per-player delta build 11.4 → 5.6 µs on the world thread, `musubi_world_fanout_duration_seconds` mean 2.9 → 1.5 ms, p99 25 → 10 ms per world tick (one clean run each; under the profiler 3.1 → 2.3 ms, same p99), gap p99 47 → 40 ms at the same 30 Hz. Component text is already shared between players (serialized once per change, `Arc<str>`); the runtime side (encoding and writing each player's frame) was next: component *names* were still copied into a `String` per component per player per frame and the frame buffer grew by doubling — names are now shared (`Arc<str>`, same bytes on the wire) and the buffer is pre-sized from the player's previous frame. Measured with the same profile: runtime-worker samples 5 772 → 2 958 in the same 15 s window (about 700 of them are the fleet fix below), allocator time 5.5 → 3.8 %, world threads unchanged (as expected — this is off the world thread); the libc hot spot at the top (~1 030 samples, unchanged) was then resolved by instruction (`rep stos`) and DWARF call chain — it was not memcpy of our payload (the stand's wire is only 12.7 MB/s) but **memset**: tungstenite zero-fills up to `read_buffer_size` before every read of a socket, the default is 128 KiB, and a node polls 1 000 sockets ~30 times a second — a fifth of the node's CPU zeroing memory for client frames of a few hundred bytes. Player sockets now use an 8 KiB read buffer (`WS_READ_BUFFER`; larger client frames arrive in more reads): memset is gone from the profile, node CPU in the same window 5 013 → 3 531 samples (27 → 9 % of a core averaged over the run), runtime workers 2 958 → 1 743, same fps/wire rate, 0 errors. Back on the world thread, `delta_with` was then 17.5 % of the node, hot on hash probes: a visible entity cost four lookups in three maps (`known`, `last_sent`, the per-scan seen-set) — they are one map entry now (`Known { pos, rev, sent, seen }`, the scan stamps `seen` with a per-interest scan counter and the gone sweep is a `retain`): per-player delta build 6.7 → 4.8 µs, `delta_with` 618 → 412 samples in the same window, world threads 1 490 → 1 137, gap p99 40 ms *under the profiler* (63 before), fps 30.05, 0 errors. And, unrelated to fan-out, the fleet reconciler was decoding every *terminated* server row of every fleet three times per 5-second cycle (`ServerRow` ~5 % of a node with no running servers — terminated rows stay for history and only grow); it now reads live rows only (`live_servers`: on the stand's biggest fleet 4 145 rows → 3, 9.8 → 5.9 ms in Postgres — the heap pages are still visited through the `(fleet_id, state)` index, a partial index on live rows is the next step if a real fleet shows it).
-
-Fencing of world persistence (plan 4.4): a node writes `world_snapshots` / `world_history` / `world_journal` rows only while it holds a current term in `musubi.world_hosts` (`insert … where exists`), taken when it creates the world, is assigned a cell through the directory or claims a dead home in `recover`. The node that takes a world or cell over deletes the loser's row, so a host cut off from the quorum but still reaching Postgres gets `fenced` on its next persist instead of overwriting the state the new host runs on; its last pre-fence snapshot remains what the new host restored from.
-
-Multi-region placement: `POST /v1/server/worlds` takes `region`; a world for another region with a live node there is created as an unowned row (`202 {pending: true}`) that a node of that region adopts on its next failover round (≤ 0.5 s), and failover itself prefers nodes of the world's region — a node elsewhere adopts only when none of them is alive (`musubi.worlds.region`, migration 0049). Without a live node in the asked region the world is simply placed on the creating node.
-
-Quadtree cells (plan 4.3): with `max_depth > 0` in the world config a cell is not a fixed square — a leaf whose cost (`cost_entity`/`cost_player`/`cost_traffic` weights in the controller) stays above `split_cell_cost` for `split_cell_after_rounds` control rounds splits into four children of half the side (down to `max_depth`); the owning simulator keeps all four (events `cell_assigned` with reason `split`, no handover, entities are re-homed by position), so a crowd no longer forces a whole 256 m square onto one simulator. Four sibling leaves whose summed cost stays under `merge_cell_cost` for `merge_cell_after_rounds` rounds merge back; siblings owned by different simulators are first `consolidate`d onto the one holding most of them, the `merge_cells` follows a round later. `World::pin_split` is the designer's static configuration — the cell (and its ancestors) are split now and never merged. Cells carry a `level` in every frame (`{x, y, level}`, 0 = base grid); `/view/{x}/{y}?level=`, `/cells/{x}/{y}/host?level=` and the cold-cell store address deeper cells, and a child inherits its parent's host node unless assigned its own.
-
-Automatic cell offload across nodes: with `controller.offload_above_cost > 0` the home node no longer needs an operator to spread a world: on every control round (every 30 ticks) it sums `cell_cost` over the cells it hosts itself and, when that exceeds the threshold and a peer with the `sim` role is alive, hands the hottest local cell with no entity in transit to the peer hosting the fewest cells of that world — the same path as `POST /v1/admin/worlds/{w}/cells/{x}/{y}/host` (directory write, `WorldCellAssign` on the bus, snapshot here, adoption there), one cell per round and then `offload_cooldown_rounds` (default 3) of quiet. `musubi_world_cells_offloaded_total` counts the moves. The peer then ticks those cells and fans their deltas out to every subscriber whose interest touches them (subscriptions are broadcast to all shards of a world), so a world's replication layer spreads over as many nodes as it has hot cells. Two things the first two-node stand exposed and that are fixed since: the bus does not echo to the publisher, so the home never released the moved cell itself — its simulator kept the lease and every tick failed with `not hosted here` (now the home snapshots the shard before announcing, then releases the cell and drops the lease like any other previous host, so the simulator's next lease redirects it); and a shard that comes up on a node *after* the players subscribed had never seen their interest and sent nothing — the new host now asks the home (`WorldSubsRequest`) and the home replays every live `world_subscribe` (`musubi_world_frames_total` on the peer went from 0 to 13 k per run). `musubi bench --url a,b` spreads the bot players over several nodes to measure exactly this. One race found by running the offload test for real: when the home shipped the cell's non-persistent entities with the forced handover before the peer's cell directory had caught up, the peer turned them away, the forced path did not retry and they were in no snapshot — lost, one run in two. A forced shipment is the home's authoritative assignment, so the peer now takes it even when its directory does not name it host yet (`musubi_world_handover_recv_total{path="forced_take"}`); the test passes three runs in a row. The same forced path still lost one entity in roughly one CI run out of three: the home despawned its copy before shipping, so any receiver-side drop was final. The home now keeps a released cell's entities in transit like any cross-node handover — the new host's ack despawns them, a timeout re-ships them to whoever the directory names (`musubi_world_handover_ended_total{path="remote_reship"}`), and a hosted-only shard is not dropped while anything is still in transit. Honest limit: the one loss caught with a state dump (the entity was gone from both nodes, not stuck or ghosted) was not traced to a specific drop path in 24 further instrumented runs; the fix removes the class (fire-and-forget shipment), not a proven single cause.
-
-Postgres-bus mode (no QUIC bus, so no raft directory): a cell assignment used to reach the target node as a single `WorldCellAssign` NOTIFY and live only in that node's cache — `pg_notify` is fire-and-forget, a listener reconnect (1 s gap) lost it for good and the node kept redirecting leases to the home (`409 … lives on node`; the ws suite hit it under a parallel run). Now the home writes `musubi.world_cell_hosts` before announcing; a node that missed the announcement reads the row on a cache miss (`cell_host_of`) and every 3 s re-reads the rows for its worlds and applies what the announcement would have (`musubi_world_cell_hosts_reconciled_total`; the cache is snapshotted before the read so an announcement landing in between wins). Fencing in this mode keeps the hosts the rows name, not the ones the local cache happens to know. Two bugs the record exposed, both fixed: a forced shipment (cell release) whose cell the record gives to a third node made the receiver *claim* that cell (home and B both ended up believing they hosted A's cell — it is now turned away and the sender retargets), and a lease served on a node whose hosting had not finished enrolling could spawn persistent entities it was not allowed to persist (`ensure_hosting` enrols before serving). Test: the row written directly with no bus message at all, the node starts hosting from the reconcile and serves the lease.
-
-3-D worlds (P1-57): `three_d: true` in the world config makes the base cell a `cell_size` cube and the partition an octree — positions carry `z` (`{x, y, z}`, omitted and 0 for flat worlds so nothing on the wire or in stored rows changes for existing games), `cell_of` picks the voxel by height, a hot cell splits into eight children (`cell_assigned` ×8 with reason `split`), eight sibling leaves merge back, ghosting/handover hysteresis and `border_distance` look at the vertical borders too, interest is a sphere (`cells_in_radius` covers the voxels above and below), and a cell has 26 same-level neighbours instead of 8 — so a tower, a flying layer or a mine under a city each get their own simulators instead of sharing the column with the ground. `/view/{x}/{y}?z=&level=` and `/cells/{x}/{y}/host?z=&level=` address voxels. Every cell also has a Morton (Z-order) code — `CellId::morton()` interleaves x/y(/z) bits so cells close in space are close in the code; the inspector sorts by it and embedders can pack contiguous intervals of space onto one simulator or answer range queries without visiting every cell.
-
-Placement strategies (plan 4.3): `controller.strategy` in the world config decides which simulator a free cell goes to — `{"kind": "adjacency"}` (default: a simulator owning a neighbour wins, then the lowest cost), `{"kind": "points_of_interest", "points": [{x, y}], "radius"}` (cells within reach of a point go to the simulator owning the point's cell — a city and its outskirts stay together), `{"kind": "player_density"}` (fewest players wins, adjacency only breaks ties — spreads crowds at the price of ghost traffic), `{"kind": "custom"}` (the module export `hook_mesh_place` decides: once per control round the node sends it `{world, tick, cells: [free cells], sims: [{id, capacity, cells, players, cost}]}` and it answers `{placements: [{cell, sim}]}` (or `sim_index` into the request's `sims`); a free cell waits `controller.custom_wait_ticks` (default 60, two rounds) for an answer before adjacency takes it, the answers place those cells on the next round, an embedder can also install a synchronous `Controller::set_picker`; anything outside the live candidates falls back to adjacency). Every strategy only sees simulators that are alive and under capacity.
-
-Operators: `GET /v1/admin/worlds/{w}/entities` dumps this node's shard of a world — every entity with cell, position, transit state and the live leases (where is entity X right now?); `GET /v1/admin/worlds/{w}/handovers?entity=&limit=` is the post-mortem trail (where did entity X go?): every step of every change of owner — `started` (local), `shipped` (`remote` / `forced` at offload), `received` with the branch the receiver took (`accepted`, `not_here`, `have_it`, collision kept/declined, `no_ghost`, `forced_take`, `forced_lost`…), `ack` (`accepted`, `refused`, `late_*`), `ended` (`completed`, `remote_reship`, `cancelled_local`, `late_dropped`) — recorded by every node into a bounded in-memory ring (65 536 steps) and flushed once a second to `musubi.handover_journal` (pruned with `world_history_days`); the endpoint merges the durable rows of all nodes with this node's unflushed tail. The offload test prints this trail when an entity does not arrive, so a lost entity in CI names its path instead of being caught live; `musubi soak --rejoin-delay-secs N` keeps a killed node down for N seconds so the survivors alone must account for every entity.
-
-Shard rows are merged with provenance: when a world is rebuilt from several nodes' snapshots and journals (home hand-off at drain, a host that died, a host that handed its cell back), a `Despawn`/`Apply` from node X only touches entities whose current copy came from X — a stale "it left my shard" record of a former host can no longer erase the fresh home snapshot. Hand-offs also stop a node from persisting stale rows afterwards: a drained home drops its worlds right after the hand-off snapshot, a shard that gave up its last cell (drain, reassignment, boot hand-back after a restart) is dropped with its journal buffer, and cell assignments consulted during adoption and pruning are confirmed through the Raft leader. Found by the soak with `--victim leader` and a 1 s rejoin: 1 in 2–3 runs lost 5–15 persistent entities at drain; three consecutive runs since are at 0.
-
-## Integrations (Zanshin LiveOps, Aurix voice)
-
-`[zanshin] url, server_key, flush_secs` and `[aurix] url, api_key, party_channel_type, match_channel_type` in the config (unset `url` = disabled). The Musubi account id is the `external_id` on both sides.
-
-- Zanshin: authentication is tracked as `musubi.authenticated` (batched `POST /server/v1/events`); clients evaluate flags / live events for themselves via `GET /v1/liveops/flags?names=` and `GET /v1/liveops/live-events` (proxied with the server key, never exposed).
-- Aurix: `POST /v1/voice/token {party_id | match_id, display_name?, speak?}` checks membership on this node and mints a player token for the ad-hoc channel `party-<id>` / `match-<id>` (created on first join, removed when empty); the response carries Aurix's `token`, `user_id`, `expires_at`, `channel_id`, `endpoint`.
-
-## Economy v0 (`musubi-economy`)
-
-Currencies with optional caps; wallets with an append-only ledger (`delta`, `balance_after`, `reason`, `ref`, idempotency key — a replayed key returns the original entry, balances never go negative); item catalog (stackable with `max_stack` or unique instances with `instance` JSON); store listings priced in several currencies with `max_per_account`, purchase = debit + grant in one transaction, idempotent. Players: `GET /v1/wallet`, `GET /v1/wallet/ledger?currency=&limit=`, `GET /v1/inventory`, `POST /v1/inventory/consume {id, quantity}`, `GET /v1/store`, `POST /v1/store/buy {store_item_id, currency, idempotency_key?}`. Server key: `GET|POST /v1/server/currencies`, `POST /v1/server/wallet/adjust {account_id, currency, delta, reason, ref, idempotency_key, metadata}`, `GET|POST /v1/server/items`, `POST /v1/server/inventory/grant`, `GET|POST /v1/server/store`. Rewards tables, progression, battle pass, auctions and IAP validation are next.
-
-**Inventory rules.** An item definition carries `unique` (one entry per account; a second grant is `409`), `bind` (`none` | `pickup` — bound on grant | `equip` — bound on first equip), `tradeable` (false = never leaves the account) and `slots` (equipment slots it fits). Players `POST /v1/inventory/equip {id, slot}` / `unequip {id}` — a slot holds one entry, equipping into an occupied slot takes the old entry off; entries report `bound` and `slot`. Bound, equipped or untradeable entries are refused by the market, direct trades, the order book and group deposits. Servers patch instance data with `POST /v1/server/inventory/{id}/instance {account_id, merge}` (shallow merge, `null` deletes, validated against the item's `instance_schema` — durability, level, enchants). `PUT /v1/server/inventory/limits {category, max_entries}` caps how many entries (stacks/instances) of a category an account can hold (`429` past it; `0` removes the cap).
-
-### Content bundles (environments)
-
-Definition tables — currencies, items, reward tables, progression tracks, quests, store items, coupons, rating queues — travel between environments as one document. `GET /v1/admin/content` exports them (`{format: 1, tables: {currencies: [...], ...}}`); `POST /v1/admin/content/import {bundle, dry_run?, prune?, note?}` applies a bundle in one transaction: rows are upserted parents-first (a row may carry only the columns it sets), `prune: true` also deletes rows the bundle does not list (children first), a foreign-key or check violation rolls everything back with 409 and the offending row. The reply carries a per-table diff (`added`/`changed`/`removed` counts and rows) — run with `dry_run: true` to review a dev → stage → prod promotion before it lands. Every applied import stores the state before it and the state after it in `musubi.content_versions` (`GET /v1/admin/content/versions`, `GET …/versions/{id}`); `POST …/versions/{id}/rollback {note?, prune?, dry_run?}` re-applies that version.
-
-**Deferred rewards.** A reward table with `deferred: {delay_secs, ttl_secs?, title, body}` does not pay out on roll/grant: the outcome (odds, pity and modifiers already applied) is frozen into a mailbox message with `reward_entries` and `available_at`; the roll/grant reports the `deferred` / `mail_id`, and the player claims it with `POST /v1/mail/{id}/claim` once it is available (`403` before, expires after the TTL). `POST /v1/server/mail` also takes inline `reward_entries` plus `available_in_seconds` for compensations and scheduled gifts without a table.
-
-### Operator roles
-
-Keys issued through `POST /v1/admin/keys {name, role}` carry a role: `server` (game servers — everything outside `/v1/admin/`), `admin` (everything), and three console roles that read everything but write only their own area — `support` (accounts, bans, kicks, reports, login queue, chat moderation, mail), `liveops` (content bundles, currencies, items, rewards, progression, quests, seasons, store, entitlements, grant limits, rating queues, leaderboards, tournaments), `ops` (fleets, builds, worlds, cluster, webhooks, integrations). A call outside the role's scope answers 403 naming the key and the route; only `admin` keys issue or revoke keys. The admin audit log records the key name on every mutation, so a console with per-operator keys gets per-operator history for free.
-
-### Subscriptions
-
-Platform friends: `POST /v1/friends/import {provider, subjects, add?}` maps the console/launcher friend list to accounts and remembers the ids, so when one of those friends links that identity later the match is made by the server — `friend.platform_match` event, and the friend request is sent when the import had `add: true` (`social.platform_match_secs`, one node by lease). `GET /v1/friends/import?provider=steam` shows the stored ids and who they resolved to; `POST /v1/server/friends/platform-match` runs the matcher on demand.
-
-Achievements carry `platform_ids` (`{"steam": "ACH_WIN", "psn": "trophy_7", "xbox": "..."}`): on unlock the `achievement.unlocked` event lists them for the client SDK (PSN trophies / Xbox achievements can only be unlocked on the device), and Steam is unlocked server-to-server through `ISteamUserStats/SetUserStatsForGame` with the publisher key from `[iap.steam]` for the player's linked Steam identity (`achievement.sync_failed` on error).
-
-Mail broadcasts take an `audience` instead of `account_ids`/`all`: `{"audience": {"lang": ["de"], "location": ["eu"], "platform": ["psn"], "age_bracket": ["adult"], "track": "xp", "min_level": 10, "active_within_days": 7 | "inactive_days": 30, "created_after": <unix>, "metadata": {"cohort": "b"}}}` — every listed condition must hold; `POST /v1/server/mail/audience/count` previews the reach before sending.
-
-Purchase-velocity heuristics: `[fraud] enabled = true`, `window_secs`, `max_purchases`, `max_spend = { gold = 100000 }`, `max_iap`, `action = "flag" | "block"` — an account over a limit inside the window gets a fraud flag (`economy.fraud_flag` event, `GET /v1/server/economy/fraud/flags`, `POST …/flags/{id}/resolve`, `GET /v1/server/economy/fraud/{account}` for live counters) and with `block` the purchase or IAP redeem is rejected with 429.
-
-Console and launcher stores verify server-to-server: `POST /v1/iap/{psn|xbox|nintendo|epic}` `{product_id, token?}` asks the platform what the player's linked identity owns (PSN Entitlement Web API, Microsoft Store Collections — `token` is the user collections id from the client —, Nintendo consumable service items, Epic Ecom), consumes one use of a consumable, and grants the mapped catalog product through the same receipt path as Apple/Google (idempotent per entitlement / consumption id). `[iap.psn] / [iap.xbox] / [iap.nintendo] / [iap.epic]`: `client_id`, `client_secret` (+ `tenant_id` for Xbox, `sandbox_id`/`deployment_id` for Epic, `url` for Nintendo); endpoints and the `verify_path`/`consume_path` templates default per platform and are overridable.
-
-Huawei AppGallery and Samsung Galaxy Store work like Google Play — the client sends what the store SDK returned: `POST /v1/iap/huawei {product_id, purchase_token}` (`[iap.huawei] app_id/app_secret`, Order Service `url`/`sub_url` for your region; consumables are confirmed server-to-server after the grant so a token cannot be redeemed twice) and `POST /v1/iap/samsung {product_id, purchase_id}` (`[iap.samsung] service_account_id/private_key_pem_path` of a Galaxy Store Developer API service account; receipt via `/iap/v6/receipt`, optional `acknowledge_path`). Both map store products through the same `/v1/server/iap/products` catalog and are idempotent per order.
-
-An IAP product mapped with `kind: "subscription"` (plus `grace_secs`) is auto-renewing: redeeming its receipt (`POST /v1/iap/apple` with the transaction id, `POST /v1/iap/google` with the purchase token — looked up through `purchases.subscriptionsv2`) grants the store item for the period and keeps one `iap_subscriptions` row per original transaction (Apple `originalTransactionId`, Google purchase token); every renewal is a new transaction, so the item is granted again and the period end moves forward. `GET /v1/iap/subscriptions` (and `GET /v1/server/iap/subscriptions?account_id=`) report `status` as of now — `active`, `grace` (period ended, still inside `grace_secs`), `expired`, `revoked`, `hold` — with `active: true` while the player keeps access. App Store Server Notifications V2 (`SUBSCRIBED`, `DID_RENEW`, `DID_FAIL_TO_RENEW`, `EXPIRED`, `GRACE_PERIOD_EXPIRED`, `REFUND`, `REVOKE`, renewal preference from `signedRenewalInfo`) and Google RTDN `subscriptionNotification` (types 1–13) update the row and emit `iap.subscription.<type>` events.
-
-### Web Push and e-mail
-
-`[push.webpush] vapid_private_key_pem` (PKCS#8 P-256) turns on Web Push next to FCM/APNs: browsers subscribe with the `vapid_public_key` returned by `GET /v1/account/push_tokens` and register the `PushSubscription` JSON as a `webpush` token; a notification that reaches no live socket is encrypted per RFC 8291 (aes128gcm, fresh ECDH key and salt per message) and posted with a VAPID `Authorization` header; 404/410 from the push service deletes the subscription.
-
-`[email] host/port/tls/username/password/from` enables the built-in SMTP mailer (STARTTLS, implicit TLS or plain; AUTH PLAIN) for `account.email_verification` and `account.password_reset`: the mail carries `verify_url` / `reset_url` with `{token}` substituted (or the bare token when no page is configured) and the outcome is recorded as `email.sent` / `email.failed`. The original events still reach webhooks and modules, so a game may keep its own mailer instead.
-
-### Collection contracts, migrations, indexes and live objects
-
-`PUT /v1/admin/storage_schemas/{collection}` (liveops/admin) attaches a contract to a storage collection: `schema` is a JSON Schema subset (`type`, `properties`, `required`, `additionalProperties`, `items`, `enum`/`const`, numeric and length bounds, `pattern`, `anyOf`/`oneOf`/`allOf`/`not`, `$ref` into `$defs`) enforced on every write and patch (400 names the offending path); unknown keywords are rejected up front. `version` + `migrations` (`[{from, to, ops: [{op: set|default|rename|remove, …}]}]`) move objects written under an older version forward when they are read or patched, and `POST …/migrate?batch=` rewrites them in place until `remaining` is 0. `indexes: [{field, kind: text|number, unique?}]` become partial expression indexes on the collection; `GET /v1/storage/{collection}?where=` accepts `"$where": [[field, op, value], …]` (`= != < <= > >=`, numbers compared numerically) next to the containment filter, on the same indexed expressions. Over the realtime socket `storage_subscribe {collection, key?, owner_id?}` streams `storage_update {key, version, value | deleted}` for one object (another user's object must be readable) or the caller's whole collection, across nodes via the fanout bus. From the CLI: `musubi schema push profiles.toml` (a file with `collection`, `version`, `schema`, `migrations`, `indexes`), `musubi schema list`, or `[[schemas]]` entries in `musubi.deploy.toml` — `musubi deploy` applies them before publishing modules, so contracts land before the code that relies on them.
-
-### IDL: one schema for types, collections and RPCs (`musubi-idl`)
-
-One TOML document describes the game's data once and everything is derived from it (plan 3.8): `[types.X]` with fields as type expressions (`string`, `int`, `float`, `bool`, `uuid`, `timestamp`, `json`, `list<T>`, `map<T>`, another type or enum, trailing `?` = optional) or tables with constraints (`{ type = "int", min = 1, max = 60, doc = "…" }`, `min_len`/`max_len`, `default`), `[enums.E] values = […]`, `[collections.c] type / version / indexes / migrations`, `[rpcs.r] input / output / auth = any|player|server`. `PUT /v1/admin/idl` (TOML body or `{"source"}`) validates it (unknown types, bad constraints and typos are refused and the previous document stays active), attaches every collection as a storage contract through the same path as `storage_schemas` (so version bumps still need migrations), and from then on `/v1/rpc/{name}` for declared RPCs enforces `auth` (403) and validates the JSON body against `input` before the module runs (400 names the field); `/openapi.json` gains the types under `components.schemas` (`package.Type`) and typed `POST /v1/rpc/{name}` paths. `GET /v1/admin/idl?format=source|summary|schemas|openapi|rust` shows the deployed document and what was derived from it; `DELETE` lifts RPC gating (attached contracts stay). CLI: `musubi idl check game.idl.toml`, `musubi idl push`, `musubi idl show --format schemas`, `musubi idl gen game.idl.toml --out generated` (serde `types.rs` for tools, `bindings.rs` for a Rust WASM module, `docs.md`, `openapi.json`, `schemas/<collection>.json`), and `idl = "game.idl.toml"` in `musubi.deploy.toml` is applied before `[[schemas]]` and modules. Client SDK generation sits on the same model and comes with the SDKs.
-
-Coming from Colyseus (plan 6.5): `musubi idl from-colyseus schema.ts --module game [--root GameState] [--out game.idl.toml]` turns the `Schema` classes (`@type("string")`, `@type([Card])`, `@type({ map: Player })`, …) into `[types.*]` plus `[matches.game] state = "GameState"`, so the typed state sync below replaces Colyseus' schema deltas without hand-written types.
-
-Deterministic rollback (plan 5.8 v2, Quantum-style): create an authoritative match with `params.rollback = { window = 8, hash_every = 1 }` and clients send `match_input {match_id, tick, seq, op_code, data}` stamped with the simulation tick the input belongs to (the SDK predicts locally meanwhile). The node keeps the pre-tick state of the last `window` ticks: an input for a future tick waits for it, an input for an already simulated tick inside the window makes the actor re-simulate from that tick with the input added (the module's `tick` is deterministic — same state + same inputs = same result), older inputs are dropped. Every input gets `match_input_ack {tick, seq, applied}`; every `hash_every` ticks players get `match_tick_hash {tick, hash}` (FNV-1a 64 of the state) to compare with their prediction and resync on mismatch. Modules opt in per match; without `rollback` tick-stamped inputs are applied on the next tick and acknowledged with `applied = false`.
-
-Typed match state sync (plan 5.8 v2): a match module that declares `[matches.<m>] state = "S"` in the IDL has its JSON state pushed to players automatically — `match_state {match_id, tick, state}` (full public snapshot) on join, `match_state_delta {match_id, tick, ops}` (RFC 6902 patch: `replace`/`add`/`remove`, arrays per index) after every handler call that changed something visible; `sync_exclude = ["/deck", "/players/*/hand"]` lists server-private JSON pointers stripped before diffing, `sync = false` turns the feature off; modules with binary state are untouched. Clients keep one document and apply patches in order (the `tick` tells them which simulation step the view belongs to).
-
-Storage access policies (plan 3.5): a collection contract (`PUT /v1/admin/storage_schemas/{collection}` or `[collections.c] policy = {…}` in the IDL) may carry `policy = { read = "…", write = "…", delete = "…" }` — CEL-like expressions a user call must satisfy on top of the owner/permission rules (server calls are never gated; `delete` falls back to `write`). Variables: `me`, `owner`, `key`, `collection`, `op`, `permission`, `now`, `value` (stored object), `new` (incoming value); operators `|| && ! == != < <= > >= in + - * /`, lists, dotted paths; functions `has(value.x)`, `size`, `startsWith`, `endsWith`, `contains`, `matches(s, regex)`, `int`, `string`. Example: `read = "owner == me || value.public == true"`, `write = "!(value.locked == true) && size(new.name) <= 32"`. Missing fields are `null`; anything but `true` denies (403).
-
-Named audiences (plan 5.12): `PUT /v1/server/audiences/{name} {rules, description}` stores the mailbox audience rules (`lang`, `location`, `platform`, `age_bracket`, `created_after/before`, `track` + `min_level/max_level`, `active_within_days`, `inactive_days`, `metadata`) under a name and answers with the current `count`; `GET /v1/server/audiences`, `DELETE …/{name}`, `GET /v1/server/audiences/of/{account_id}` → the audiences an account is in right now (cached 60 s per node, dropped on any change). Modules ask the same with the `audiences.of` host op. The matchmaker adds `audience_<name> = "true"` to the string properties of every ticket (queue rules and `query` can select by audience); a store listing with `audiences = ["vip"]` is listed and sold only to members.
-
-Title news: `POST /v1/server/news {title, body, published_at?, expires_at?, audience?, tags[], pinned, link?, image?, metadata, enabled, locales: {de: {title, body}}}` (`GET/PUT/DELETE …/news/{id}`, `GET …/news?tag&include_disabled`, `PUT/DELETE …/news/{id}/locales/{locale}`, `GET …/news/{id}/stats` for read counts) — operator-published items, scheduled (hidden until `published_at`), expiring, gated by a named audience, pinned to the top. Players call `GET /v1/news?count=20&locale=de-AT&since=&unread_only=&tag=` and get the feed localized with fallback (`de-AT` → `de` → base copy, `locale` says which copy was used), each item's `read` flag and an `unread` count for the badge; `POST /v1/news/{id}/read` / `POST /v1/news/read_all` track reads per account. Events `news.published|created|updated|deleted`. `GET /v1/server/liveops/timeline?from&to&kinds=live_event,flag,experiment,news,offer,changeset,tournament&label` is the LiveOps calendar: every scheduled thing in one chronological list — live-event cycles with recurrence expanded and phases listed, flag rule windows, experiments, news, store offers, tournaments (start/end or start+duration), scheduled economy changesets — each `past|active|upcoming`, plus `summary` (counts by kind/state, `active_now`, `next_24h`); the raw material for a timeline UI or a pre-release sanity check ("what overlaps the weekend event?"). Experiment context travels with the data: every account-bound event on the bus (stored rows, webhooks, analytics sinks, Zanshin) gets `payload.experiments = {experiment_id: variant}` for the account's running experiments (cached 60 s per account), so any downstream metric can be split by variant without joins; `GET /v1/server/experiments/of/{account_id}` is the player's experiment history (`current` + every assignment with the experiment's status). Flags, experiments and live events carry `labels: [..]` (`[a-z0-9_-]{1,32}`, ≤16) and news `tags`; `?label=` narrows `GET /v1/server/flags|experiments|live_events` and the timeline to one campaign.
-
-Dev loop (plan 3.6): `musubi dev` runs one node with migrations, insecure defaults allowed and `[runtime] watch_modules = true` — every second `modules_dir` is polled and a `*.wasm` / `*.wat` whose file changed is hot-reloaded under its file stem (match handlers re-registered; a module that fails to load keeps its previous version, a removed file unloads it), so `cargo build --target wasm32-unknown-unknown` + copy is the whole iteration.
-
-Host API for modules (plan 3.6; `musubi.host_call` / `abi::host` in the bindings, JSON `{"op": ...}`): besides `storage.read|write|delete`, `account.get`, `wallet.get|adjust`, `inventory.get|grant`, `notify.send`, `anticheat.flag` and `liveops.flags|live_events`, modules get `time.now` (`unix`, `unix_ms`, `iso`), `rng.random {seed?, count?, max?}` (with a seed the values are a pure function of it — a match passes `"<match_id>:<tick>"` and its rolls replay deterministically; without one, OS randomness), `secrets.get {name}` from `[runtime.secrets]` (`name = "value"` or `name = "env:VAR"`; modules never see the process environment), `metrics.inc|gauge {name, value?, labels?}` (exported as `musubi_module_<name>` on `/metrics`), `http.fetch {url, method?, headers?, body?}` (only hosts in `[runtime] http_allow = ["api.example.com", "*.example.org"]`, no redirects, `http_timeout_ms`, `http_max_body_kb`, a node-wide `http_rate_per_sec` token bucket; `{status, headers, body, json}`), and durable timers: `timer.schedule {rpc: "name" | hook: "name", payload, in_secs | at, key?}` stores a call in `musubi.timers`, the node holding the `schedules` lease runs due timers every second with a server context (`vars.timer_id`/`timer_key`), failures retry with 2^attempts seconds backoff and are dropped after 5; `key` makes scheduling idempotent (re-scheduling moves the timer), `timer.cancel {id | key}`; `GET /v1/admin/runtime/timers`, `DELETE …/{id}`, `POST …/timers/sweep`; generic streams (P1-59): `stream.join|leave {stream, session_id?}` (a player joins their own realtime session, server context may address any live session), `stream.send {stream, data, anonymous?}` (players must be members; `sender` presence is attached unless `anonymous`; ≤16 KB), `stream.count`, `stream.members` (members/server only), `stream.mine` — members receive `StreamData {stream, data, sender?}` on the socket; membership ends on leave or disconnect. The same primitive for game servers/tools: `GET /v1/server/streams[/{id}]`, `POST /v1/server/streams/{id}/join|leave {session_id}`, `POST …/send {data}`.
-
-Custom HTTP routes from modules (P1-36): an export `http_<name>` of module `<module>` is served at `/v1/x/{module}/{name}` (GET/POST/PUT/PATCH/DELETE/OPTIONS). The handler receives `{module, name, method, path, query, query_string, headers (no authorization/cookie), body (JSON or null), body_text, caller: {account_id, session_id, username, server, basic_user, anonymous}}` and returns either raw bytes (200; JSON if it parses) or an envelope `{status, headers, body}` (string body = `text/plain`, other = JSON). Undeclared handlers behave like RPCs (bearer or server key, any method). Per-route metadata lives in the IDL: `[http."shop/checkout"] methods = ["POST"], auth = "any|player|server|none|basic", basic = { realm, users = { admin = "…" } }, cors = { origins = ["https://game.example" | "*"], methods, headers, expose_headers, credentials, max_age_secs }, max_body_bytes, rate_per_sec` — 405 + `Allow` for other methods, 413 over the body limit, 401 + `WWW-Authenticate` for basic, 403 for a disallowed `Origin`, preflight `OPTIONS` answered without invoking the module, 429 per caller (account, basic user, server or client IP) when `rate_per_sec` is set.
-| `[http] cors_origins = ["https://play.example.com", "*.example.com"]`, `cors_max_age_secs = 600` | CORS allowlist for browser / WebGL clients: exact origins, wildcard subdomains or `*`; preflight for every API method, Bearer and `x-musubi-*` headers allowed, trace id exposed; empty = no CORS headers |
-
-Typed per-module environment (P1-63): a module declares what it needs in the IDL — `[env."shop/STRIPE_KEY"] type = "string", required = true, secret = true, doc = "…"`, `[env."shop/MAX_CART"] type = "int", default = 50` (`type = string|int|float|bool|json`) — and `PUT /v1/admin/idl` rejects bad types or defaults of the wrong type. Operators bind values per deployment with `PUT /v1/admin/runtime/modules/{name}/env {values: {STRIPE_KEY: "sk_…", MAX_CART: "80"}, secrets: [...]}` (values are coerced to the declared type, so `"80"`/`"true"` from a CLI work; undeclared keys are stored as `json`), `GET …/env` shows every declared key with `source = binding|default|missing`, `required`, `secret`, redacted (`***`) values for secrets plus `missing`/`ok`, `DELETE …/env/{key}` / `DELETE …/env` drop bindings; secrets are sealed with the `[security] master_keys` ring at rest and never appear in events (`module.env_updated` carries key names only). Uploading an active or canary build whose required env is unbound fails with 400 until it is bound (or `?force=true`). Module code reads it through `env.get {key}` / `env.all` (core ABI) or the WIT `env` interface (`get(key)` / `all()`, JSON-encoded values) — scoped to the calling module by the runtime, so modules never see each other's keys; `secrets.get` / `[runtime.secrets]` stays as the global untyped fallback.
-
-Component Model guests (WIT world `musubi:runtime@0.1.0`, printed by `wit::WIT` in `musubi-runtime`) get typed imports for every host capability, not just the JSON `host.call`: `storage` (read/write/delete), `account.get`, `wallet` (get/adjust), `inventory` (get/grant), `notify.send`, `time.now-ms`, `rng.random(seed?, count, max?)` (seeded = replayable), `secrets.get`, `metrics` (inc/gauge with JSON labels), `http.fetch` (allowlisted hosts), `timers` (schedule `rpc:<id>`/`hook:<name>` with `in-secs`/`at`/`key`, cancel) and `audiences.of`; each maps 1:1 onto the same host ops the core ABI uses, so a module written with wit-bindgen gets real signatures and the same limits.
-
-`bindings.rs` (also `GET /v1/admin/idl?format=bindings`) is a complete guest side of the module ABI for Rust: the types, `CallContext`/`Presence`/`Input`/`Outbound`, the `alloc`/`musubi.log|error|host_call` glue with no extra crates (serde + serde_json + uuid only), a `Rpcs` trait with one typed method per `[rpcs.*]` and a `<Module>Match` trait per `[matches.*]` (typed `params`/`state`, base64 and JSON handled for you), and the `rpc_<name>` / `match_<module>_*` exports that call `crate::Handlers`. A module is `pub struct Handlers; mod bindings; impl bindings::Rpcs for Handlers { … }` built with `--target wasm32-unknown-unknown` as a `cdylib`; a wrong reply shape can no longer happen, and `docs.md` is the matching reference for the team.
-
-Matches and configs come from the same document (plan 3.8). `[matches.<module>] params = "T"` validates the `params` of `POST /v1/matches` for that `match_<module>_*` module before it launches; `state = "S"` makes the node check the JSON state the module returns from every handler (`init`, `join`, `tick`, …) against `S` — a state that violates the schema fails the call instead of silently drifting (binary/empty state is left alone unless declared). `[configs.<name>] type = "T"` (+ `version`) types a config document: the server writes it with `PUT /v1/server/configs/{name} {value}` (400 on a schema violation, the row carries the declared `version`), players read `GET /v1/configs/{name}` / `GET /v1/configs` with a bearer token, `DELETE /v1/server/configs/{name}` removes it; undeclared names are free-form JSON at version 1, and every declared config gets a typed `GET` path in `/openapi.json`.
-
-### Tournament brackets
-
-`POST /v1/server/tournaments/{id}/bracket {format: single|double|swiss|round_robin, seeding?: score|join|random|list, participants?, size?, swiss_rounds?, deadline_secs?}` builds one bracket per tournament from its current participants (standings order by default): standard seeding (1 v n, 2 v n-1 …), byes for non-power-of-two fields resolved immediately, a losers bracket plus grand final for double elimination (no bracket reset), and Swiss rounds paired by wins/Buchholz without rematches (an odd player out gets a bye; `POST …/bracket/rounds` pairs the next round once the current one is decided). Matches are decided by `POST …/bracket/matches/{mid} {winner, score?}` or by the end-game report with `bracket_match: {tournament_id, match_id}` — the rank-1 team's participant wins; the same winner twice is a no-op, a different one is 409. `GET /v1/tournaments/{id}/bracket` returns the matches with `status` (pending/ready/done/void), `ready` ids, standings (wins, losses, byes, Buchholz, eliminated) and the champion; `tournament.bracket_created/match/round/done` go to the event bus. Round-robin builds every round up front (circle method, one bye a round for an odd field) and crowns the top standing. With `deadline_secs`, each ready match carries a `deadline`; past it `POST …/bracket/matches/{mid}/forfeit {participant}` hands the absent side a loss (`score: {forfeit}`).
-
-### Crafting
-
-`PUT /v1/server/crafting/recipes {id, inputs: [{item_id|currency, amount}], outputs: [{item_id|currency|reward_table, amount, instance?}], requires_item?, max_batch?, max_per_account?, enabled}` defines a recipe (referenced items, currencies and tables must exist). `POST /v1/crafting/craft {recipe_id, count?, idempotency_key?}` consumes the inputs (largest stacks first) and grants the outputs in one transaction — short inputs answer 429 with `have N, need M` and nothing moves; a required item (blueprint) must be owned but is kept; `max_per_account` is a lifetime cap and limited grants on output items/currencies are checked before anything is consumed. A repeated `idempotency_key` replays the stored result. `GET /v1/crafting/recipes` lists enabled recipes, `GET /v1/crafting/log` the caller's crafts; `economy.crafted` goes to the event bus.
-
-### User-generated content
-
-`POST /v1/ugc {kind: map|mod|skin|blueprint|replay|level|other, title, description?, tags?, url?, visibility?: public|unlisted|private}` registers a draft; `PUT /v1/ugc/{id}/blob` (raw body, ≤ 16 MiB, `Content-Type` kept) stores the content with its sha256 and bumps `version`; `POST …/submit` hands it to moderation. Moderators (`support`/`admin`) see `GET /v1/admin/ugc?status=pending` and decide with `POST /v1/admin/ugc/{id} {status: approved|rejected|hidden|pending, reason?}`; only approved items are browsable (`GET /v1/ugc?kind&tag&q&sort=new|top|downloads&owner_id`) and downloadable (`GET …/blob`, counts downloads, `ETag` = sha256, `x-ugc-version`). A new blob on an approved item goes back to `pending`, so subscribers (`POST …/subscribe`, `GET /v1/ugc/subscriptions` with current versions) only ever get moderated revisions. Ratings are 1–5 stars, one per account (`POST …/rate`), and everything emits `ugc.*` events.
-
-### Webhook fleet provider
-
-`[fleet.webhook] url = "https://orchestrator.example/musubi"` registers `provider = "webhook"`:
-Musubi starts a server with `POST {url}/servers` (`{server_id, port, fleet{id,name,region,pool,image,command,vcpu}, env}`,
-env already holds `MUSUBI_SERVER_ID/FLEET_ID/PORT/API/SERVER_KEY`), expects `{id?, address, port}`
-— or `202` + `id` and polls `GET {url}/servers/{id}` until `{status: "ready", address, port}` —
-and stops it with `DELETE {url}/servers/{id}`. Three endpoints put GameFabric, a home-grown
-scheduler or a bare-metal panel behind the same fleets, buffers, autoscaling and allocation
-API as Docker, Kubernetes, Firecracker, Edgegap and GameLift.
-
-### Firecracker snapshots and warm pool
-
-A microVM that boots a kernel takes a second; one restored from a snapshot takes tens of
-milliseconds. With `[fleet.firecracker] snapshot_dir = "/var/lib/musubi/firecracker/snap"`,
-`POST /v1/server/fleets/providers/firecracker/prepare` boots one VM with `musubi.warm=1`, waits
-up to `warm_boot_secs` for the guest to print `musubi: warm` (server loaded, nothing bound),
-pauses it and writes a full snapshot (`vmstate` + `mem`). From then on every start spawns a bare
-VMM, `PUT /snapshot/load`s the snapshot paused, hands the identity over MMDS (the kernel command
-line is frozen in the snapshot) and resumes. `warm_pool = N` keeps N VMs restored-and-paused
-ahead of demand — a start then is MMDS + resume — and a background task refills the pool.
-Guest contract on resume: `GET http://169.254.169.254/` returns `{server_id, fleet_id, port,
-api, server_key, env, ip?, gateway?, mask?}`; configure `eth0` from `ip/gateway/mask` when present
-(each VM gets its own tap and address via `network_overrides`) and start the server exactly as
-after a cold boot. Re-run `prepare` after a build change — the snapshot carries the loaded binary.
-
-Bare metal over SSH (plan 6.6 `hybrid`: control plane anywhere, servers on Hetzner/OVH boxes): `[fleet.ssh] hosts = [{ addr, public_addr?, user, port, key, capacity }]` registers the `ssh` provider — no agent to install, the game binary just has to be on the box. A start picks the host with the most free slots and runs `ssh user@addr 'cd <working_dir> && env <spec.env> MUSUBI_SERVER_ID=… MUSUBI_PORT=… nohup <spec.command> … & echo $!'`, the pid is kept, `stop` sends TERM then KILL, `probe` re-checks pids with `kill -0`; `ssh_command` / `ssh_args` / `connect_timeout_secs` tune the client.
-
-Host pool and node-level autoscaling (P1-11): the ssh hosts live in `musubi.fleet_hosts` (config hosts are seeded as `source = static`), so machines can be added and removed at runtime: `GET /v1/server/fleets/hosts?state&region&class&pool&source&include_gone` (with `used`/`free` slots), `POST /v1/server/fleets/hosts {addr, name?, public_addr?, user?, port?, key?, capacity?, region?, class?, labels?, spot?, cost_per_hour?, state?: ready|provisioning}`, `GET|PATCH|DELETE …/hosts/{id}` (`?force=true` stops what still runs there), `POST …/hosts/{id}/drain|undrain` (no new starts), `POST …/hosts/{id}/probe` (ssh reachability; `provisioning`/`failed` → `ready`, unreachable `ready` → `failed`). Fleets pin hardware with `spec.host_class` / `spec.host_labels` and only land on hosts of the fleet's region; `GET …/hosts/classes` sums hosts, slots and cost per class. Spot / preemption: `POST …/hosts/{id}/termination-notice {deadline_secs?, reason?}` (or `POST …/hosts/notice {addr}` from a watcher on the box reading the cloud metadata endpoint) stops idle servers immediately, gives busy ones `server.preempted` with the deadline and stops them when it passes; the host is released and its pool replaces the capacity. Capacity pools order machines when fleets starve for host slots (a start found every eligible host full), when `keep_free_slots` is not met or to hold `min_hosts`, and release provisioned hosts that sat empty for `scale_down_idle_secs` while the pool keeps its target: `[[fleet.capacity.pools]] name, kind = "manual" | "webhook" | "hetzner", region, class, capacity_per_host, min_hosts, max_hosts, keep_free_slots, scale_down_idle_secs, cooldown_secs, provision_timeout_secs, spot, cost_per_hour, ssh_user, ssh_port, ssh_key, labels` — `manual` raises `capacity.needed` (bare metal first: an operator racks a box and registers it), `webhook` calls `POST {url}/provision {pool, region, class, count, capacity, spot, labels}` → `{hosts: [{external_id, addr, public_addr?, name?}]}` and `POST {url}/deprovision {pool, external_id}` (any panel: OVH, Hetzner Robot, your own), `hetzner` uses the Hetzner Cloud API (`token`, `server_type`, `image`, `location`, `ssh_keys`, `user_data`). Provisioned hosts are probed over ssh until ready (or `failed` and released after `provision_timeout_secs`); `GET /v1/server/fleets/capacity` shows per pool hosts by state, slots total/used/free, starved starts, last action and cost per hour; `POST …/capacity/reconcile` runs a pass now (the reconciler runs one after every fleet pass). Events: `host.registered|ready|failed|draining|preempted|removed`, `capacity.scaled_up|scaled_down|needed`, `server.preempted`.
-
-### Durable workflows (sagas)
-
-Long-running server logic — a trade with a 24-hour escrow, a tournament payout, a cross-game
-grant with rollback — is a module export `workflow_<name>` called one step at a time with its
-persisted state. `POST /v1/server/workflows {name, input, key?, delay_secs?, account_id?,
-max_attempts?}` starts one (`key` makes the start idempotent); each step receives `{id, name,
-step, attempt, input, state, signal, timed_out}` and answers `{state?, sleep_secs | wait_signal
-(+ timeout_secs) | done (+ output) | fail}`. A trap retries with exponential backoff up to
-`max_attempts`; a permanent failure or `POST …/{id}/cancel` runs `workflow_<name>_compensate`
-when the module exports it (the saga's undo) and the workflow ends `compensated`.
-`POST …/{id}/signal {payload}` wakes a parked workflow with that payload; `GET …/{id}` shows
-state, step history (last 50) and the next wake. One node runs due steps cluster-wide (lease
-`workflows`), rows are claimed with `skip locked`, and the state is the row — a restart loses
-nothing. `musubi.workflows` is also plain SQL for your dashboards.
-
-### Age gate and parental controls
-
-`PUT /v1/account/age {birthdate | bracket}` puts an account in an age bracket — `child` (under
-`compliance.child_until`, 13), `teen` (under `adult_from`, 18), `adult` — from a birthdate the
-player gives or a platform's age signal; `PUT /v1/server/accounts/{id}/age` does it from a
-| `PUT /v1/server/effects/{account_id}/{key}`, `DELETE /v1/server/effects/{account_id}[/{key}]`, `GET /v1/server/effects?key`, `POST /v1/server/effects/sweep` | Timed status effects (buffs/debuffs/penalties) on the item-effect table: duration or permanent, stacks with cap, JSON `value`, `source`, `mode: replace|extend|stack`; client `GET /v1/effects[/{key}]` with `seconds_left`/`stacks`; expiry swept by the leader → `effect.expired` |
-| `PUT/GET/DELETE /v1/server/tutorials/{id}`, `GET /v1/server/tutorials[?label]`, `GET /v1/server/tutorials/{id}/progress?state&limit`, `GET /v1/server/accounts/{id}/tutorials`, `POST /v1/server/accounts/{id}/tutorials/{tid}/reset` | Tutorial sequences with step tracking: `start_step`/`max_step`, optional `reward_table` granted once on completion (reference `tutorial:{id}:{account}`), labels, metadata, `enabled`; per-player state `none → accepted → completed` with `declined`/`abandoned` on the way and `reset` (counted); client `GET /v1/tutorials[/{id}]`, `POST /v1/tutorials/{id}/accept|decline|abandon|reset`, `PUT /v1/tutorials/{id}/step {step | complete}` (monotonic, 400 backwards/over max, 409 when not accepted); events `tutorial.updated|deleted|accepted|declined|abandoned|step|completed|reset` for server-side hooks. |
-| `GET /v1/account/event_properties`, `GET/DELETE /v1/server/accounts/{id}/event_properties[/{event}]`; audience rules `events: [{event, field, min, max, seen_within_days, not_seen_days, never}]` | Computed per-event player properties (Hiro/Satori parity): every ingested telemetry event folds into `player_event_props` per (account, event) — `count`, `seen_first`/`seen_last`, `value_first`/`value_high`/`value_low`/`value_last`/`value_sum` of `properties.value`, `last_session_id`; the account view adds `last_active_session_id`. Audiences segment on them (`field` = `count` (default) or a value aggregate, bounds, recency, `never` sent) — "players with ≥ 50 kills who have not raided in 14 days" without a server-side stat write. `DELETE` forgets the aggregates, raw events stay. |
-| `PUT/GET/DELETE /v1/server/referrals/programs/{id}`, `GET /v1/server/referrals/programs[/{id}/referrals?status&referrer&limit]`, `POST /v1/server/referrals/{id}/void {reason}`, `GET /v1/server/accounts/{id}/referrals`; client `GET /v1/referrals`, `GET /v1/referrals/{program}/invite`, `POST /v1/referrals/{program}/redeem {code}`, `GET /v1/referrals/{program}/referrals` | Referral programs: per program `referee_reward_table` (paid to the invited player on redeem), `referrer_reward_table` (per accepted referral), `milestones: [{count, reward_table}]` (inviter crosses 2/5/10 friends), `max_referrals_per_player`, `referee_max_account_age_days` (only fresh accounts count), `starts_at`/`ends_at`, `enabled`. One `XXXX-XXXX` invite code per player and program (minted on first `invite`), redeem once per program (not your own code; 429 when the inviter is capped, 409 outside the window); stats (`accepted`, `voided`, `referrers`, `top_referrers`), listing, `void` frees the slot and stops milestone credit. Events `referral.accepted|redeemed|voided|program_updated|program_deleted`. |
-| `POST /v1/telemetry/attribution {source, medium, campaign, content, term, network, click_id, installed_at}`, `GET /v1/account/attribution`, `GET/DELETE /v1/server/accounts/{id}/attribution`, `GET /v1/server/analytics/attribution?group_by=source\|medium\|campaign\|content\|term\|network&touch=first\|last&since&limit`; audience rule `attribution: {source[], medium[], campaign[], network[], touch}` | User-acquisition attribution: the client relays the install referrer / MMP postback / deep-link UTM once it has a session; the first touch is immutable, the last touch follows, `touches` counts; mirrored as a `platform_ua_attribution` analytics event and `account.attributed` on the bus. Operators get account counts per campaign/source (first or last touch, since a date); audiences segment by acquisition channel, so offers, flags, news and experiments can target "players from the TikTok spring campaign" directly. |
-| `GET/POST /v1/server/analytics/reports`, `GET …/reports/latest?kind`, `GET …/reports/by-date/{YYYY-MM-DD}?kind&period_days`, `GET/DELETE …/reports/{id}` | Analytics report snapshots: one JSON per (kind, date, period) with active users, retention, revenue, event counts and first-touch attribution cohorts over the period. The leader generates `daily` (yesterday) every day and `weekly` (last 7 days) on Mondays; `POST {kind: daily\|weekly\|adhoc, for_date?, period_days? ≤ 365, replace}` builds one on demand (idempotent unless `replace`). Listing returns headers newest first (20 by default, ≤ 100), `latest`/`by-date`/`{id}` return the body; event `analytics.report_generated`. |
-| `GET/POST /v1/account/data_rights {kind: export\|erase, include_game_data?}`, `GET …/data_rights/{id}[/download]`, `POST …/data_rights/{id}/cancel`; server `GET/POST /v1/server/data_rights`, `GET …/{id}`, `POST …/{id}/cancel`, `POST /v1/server/data_rights/run`; `[compliance] data_rights_poll_minutes = 10`, `data_rights_include_game_data = true` | Asynchronous data-rights queue: a player (or the operator on their behalf) files an export or erasure request; one open request per kind; the leader processes the queue every `data_rights_poll_minutes` (or on `run`) — exports are built with `AccountService::export` (game-data tables omitted when `include_game_data: false`) and kept 7 days for download, erasure kicks every session and soft-deletes the account (deletions ledger applies). Statuses `pending → running → done\|failed`, `cancelled` while pending; events `data_rights.requested\|completed\|failed\|cancelled`. The synchronous `GET /v1/account/export` remains for small accounts. |
-| `POST/DELETE /v1/inventory/{id}/share {ttl_secs?}`, `GET /v1/inventory/shares`, public `GET /v1/inspect/{token}` | Inspect links for inventory items (Steamworks `InspectItem`): the owner mints a public token for one entry (reused while live, optional expiry 60 s … 1 year), anyone opens it without a session and sees the catalogue item, instance data, quantity, the owner card and a view counter — share a skin in Discord, show a market listing. Links die with the item, on expiry, on revoke, or when the item has `properties.inspectable = false`; events `inventory.shared\|share_revoked`. |
-| `GET/PUT /v1/account/privacy {profile, inventory: public\|friends\|private, show_online}`, `GET /v1/server/accounts/{id}/privacy` | Player privacy toggles: a `friends` or `private` profile collapses to id/username/avatar in `/v1/users` and `/v1/users/search` for everyone the owner did not allow (mutual friends see `friends` cards in full); `inventory` governs inspect links the same way (`GET /v1/inspect/{token}` answers 404 unless public, or the viewer is the owner / a mutual friend with a bearer token); defaults are public; event `account.privacy_updated`. |
-| `POST/GET /v1/admin/operators/invites`, `DELETE …/invites/{id}`, `GET /v1/operator_invites/{token}`, `POST …/accept\|reject`, `GET/DELETE /v1/admin/operators[/{id}]` | Operator team (Hathora org invites): admins invite colleagues by e-mail with a role (`server`, `admin`, `support`, TTL); the invitee previews the invite, accepts — becoming a member with a key of that role, shown once — or rejects; admins list members and pending invites, rescind invites and remove members (their key is revoked); events `operator.invited\|joined\|invite_rejected\|invite_rescinded\|removed`. |
-| `POST /v1/operator/login {email, password}` → `{key, expires_at, operator}` (12 h session key of the operator's role; 5 failures lock the account for 15 min); `GET /v1/operator/me`; `PUT /v1/operator/me/password {current, password}`; `DELETE /v1/operator/logout` (revokes the session key); `POST /v1/admin/operators {email, name?, role, password}`; `PUT /v1/admin/operators/{id}/password {password}` (also clears the lock and signs out their sessions) | — / session key / admin | console e-mail + password sign-in next to keys and SSO; passwords are argon2id hashes in `musubi.operators` (legacy bcrypt hashes are upgraded on the next sign-in), every operator role may manage its own sign-in |
-| `PUT/GET/DELETE /v1/server/storage_endpoints/{name}`, `GET /v1/server/storage_endpoints`, `POST …/{name}/test` | Registered object-storage endpoints (Edgegap endpoint storage): operators register S3-compatible buckets by name — endpoint, region, bucket, prefix, path-style, access key, secret sealed under the master key — list them redacted, and probe them (upload / read back / delete a small object, outcome and latency recorded). |
-| `PUT /v1/server/configs/{name}/source {url, format, target: content, table, prune}` | Sheets → content: a config source can target a content table (items, currencies, reward tables, quests, …) instead of a remote config — designers edit a published Google Sheet / CSV / JSON array, the server polls it (ETag/hash), parses typed cells (dotted headers nest into JSON columns) and applies the rows through the content-bundle import, so every sync is a diffed, versioned, roll-back-able content version; `prune` removes rows the sheet dropped. |
-| `PUT /v1/server/hero_classes/{id} {name, slots, can_equip, cant_equip, max_per_player}`, `POST/GET /v1/heroes`, `GET/PUT/DELETE /v1/heroes/{id\|default}`, `POST …/equip {inventory_id, slot?}`, `POST …/unequip`, `GET …/loadout`, `GET /v1/users/{uid}/heroes[/{id}/loadout]`, `GET /v1/server/accounts/{id}/heroes` | Hero classes and heroes (LootLocker): operator-defined classes with loadout slots and Can Equip / Can't Equip rules by item category or id; players create up to `max_per_player` heroes per class (one default), each with its own loadout — an inventory entry sits on one hero at a time and moves when equipped elsewhere, bind-on-equip items bind; other players' heroes follow the owner's inventory privacy; events `hero.created\|updated\|deleted\|equipped\|unequipped`. |
-| `POST /v1/server/leaderboards {…, bucket_size, race: {score_target, target_players, time_limit_secs, max_rolls, roll_cooldown_secs}}`, `GET /v1/leaderboards/{id}/cohort`, `POST /v1/leaderboards/{id}/reroll` | Race-to-target cohorts (Hiro score-based event leaderboards): a cohort of `bucket_size` players finishes as soon as `target_players` of them reach `score_target` — nobody in it can post afterwards (409) and `leaderboard.cohort_finished` fires; each member has `time_limit_secs` from their first score; a finished or timed-out player re-rolls into the newest open cohort with a zeroed score up to `max_rolls` times, waiting `roll_cooldown_secs` between rolls; the cohort card shows members, finishers, time left, rolls left and `can_reroll`. |
-| `POST /v1/server/worlds/{w}/spawn {…, global: true}`, `POST /v1/server/worlds/{w}/global {sim, entity, global}` | Always-relevant entities (coherence "Is Global"): a global entity is delivered to every subscriber of the world regardless of interest radius or cell — match state, world bosses, weather, objectives — with top delivery priority; component filters still apply; the owning simulator flips the flag at any time, it survives journal replay, and cell views list `globals`. |
-| `PUT /v1/admin/content/tags {entries: [{table, id}], add, remove, set}`, `GET /v1/admin/content/tags?tag&table`, `DELETE …/tags/{tag}`, `GET /v1/admin/content?tags=a,b&omit_tags`, client `GET /v1/content/tags/{tag}?table` | Tags on content entries (Beamable content tags): any currency, item, reward table, quest, store entry… carries free-form tags (`featured`, `season-4`); tags are themselves a content table, so they travel in bundles and promotions; `?tags=` exports only tagged entries (tag-based content query), `?omit_tags` strips them; clients resolve a tag to entry ids; event `content.tags_updated`. |
-| `GET/PATCH /v1/session/vars`, `GET/PATCH /v1/server/accounts/{id}/sessions/{sid}/vars` | Session baggage: free-form per-session vars (`party`, `region`, `shard`) seeded by login `vars`, patched with `{set, unset}`; the client PATCH returns an access token carrying the new bag and `POST /v1/auth/refresh` re-reads it; server stamps bags too |
-| `PUT/GET/DELETE /v1/server/accounts/{id}/clock`, `GET /v1/server/clocks` | QA clocks: pin a tester to a simulated date (`at`) or shift their clock (`offset_secs`); live events, flag windows, offers, news and `GET /v1/time` evaluate against it, everything else stays real; auto-expires |
-| fleet `policy.chain`, `creation_parallelism`, `overflow_labels` | Ordered autoscale policy chain (windowed buffer/utilisation/webhook with fallback), concurrent server starts per batch, labels for allocated servers still above `max_servers` after a scale-down |
-| `GET /v1/countries[/{code}]`, `PUT/DELETE /v1/server/countries/{code}`, `GET/PUT/DELETE /v1/server/country_groups[/{name}]` | Country API: ISO 3166-1 list with age restriction / blocked / metadata overrides and named country groups; remote-config selectors accept `countries: ["group:eu"]` |
-| `GET/PUT/DELETE /v1/server/configs/{name}/source`, `POST …/source/sync`, `GET /v1/server/config_sources` | Config sources: keep a config in sync with a published Google Sheet / CSV / JSON URL — polled on an interval (ETag + hash, new version only on change), manual sync, status/errors inline |
-| title files `?tags=`, manifest `?tags&any_tags&omit_tags`, `GET /v1/files/tags` | Content tags on title files: tag-based manifest queries (all-of / any-of), tag index with counts, optional tag-less manifest |
-| `PUT/GET/DELETE /v1/server/builds/{name}/{version}`, `…/download?token=`, `…/manifest?token=`, `POST …/delta?token= {have, from}`, `GET …/chunks/{hash}?token=`, `spec.artifact`, `spec.cost`, `GET /v1/server/fleets/{id}/cost` | Build artifact store: versioned binaries stored as content-defined chunks shared across versions (`[builds]`: `chunk_min_kb = 256`, `chunk_avg_kb = 1024`, `chunk_max_kb = 4096`, `cache = true`, `cache_max_mb = 4096`, `upload_ttl_hours = 24`), sha256 and capability download URLs, resolved into `MUSUBI_ARTIFACT_URL|MANIFEST_URL|SHA256|FILENAME|SIZE` env for fleets/builds; launchers fetch only the chunks their host lacks, every node serves chunks from a per-node disk cache; fleet cost attribute with live spend estimates |
-| `POST /v1/server/builds/{name}/{version}/upload {manifest, filename, mime, notes, metadata, max_new_pct}`, `PUT …/chunks/{hash}`, `POST …/commit`, `GET /v1/server/builds/chunking`, `POST /v1/server/builds/gc` | Delta build uploads (`musubi build push name@version file`): send the chunk manifest, get the difference analysis against the previous version (reused/new chunks, `new_pct`; over `max_new_pct` → 409) and the chunks the cluster lacks, transfer only those, commit re-hashes the assembled artifact; chunking/dedup/cache statistics and garbage collection of expired uploads and orphan chunks |
-| entitlement `license` / `trial_secs`, grant `license, expires_at | duration_secs, source`, `POST /v1/server/entitlements/sweep` | Timed trials / free weekends / demos / subscriptions on entitlements: expiring grants with in-place upgrade to full, client sees license and remaining time, sweeper emits `entitlement.expired` |
-| matchmaker queue `rules: [{kind, property, max, step, every_secs, max_limit, min, missing}]` | Attribute rules on queues: numeric difference (widening), string match, set intersection, group standard deviation — rejections visible in matchmaker stats |
-| match `crash_policy: restart \| sleep \| destroy` (module `init`, `[runtime].crash_policies`, `params.crash_policy`) | A failing tick handler (`Err` / wasm trap) no longer kills the match by default: `restart` rolls back to the pre-tick state and backs off 1→30 s (more than 5 crashes in 60 s destroy), `sleep` parks the snapshot and the next join wakes it, `destroy` terminates; `match.restarted\|crashed\|slept\|woken` events, `status: running\|crash_loop_backoff\|sleeping` + `crashes` on match info |
-| Steam browser login: provider kind `openid2` | OpenID 2.0 relying party in the provider catalog (`authorize_url` defaults to steamcommunity): `/v1/auth/providers/{name}/login` → Steam → callback verifies `return_to`/`op_endpoint`/signed fields and asks Steam `check_authentication`; `claims.subject: steam_id` lands on the same `steam` identity as session-ticket/app-ticket logins (so the web shop, forum and the game share the account), `claimed_id` keeps it generic for any OpenID 2.0 OP |
-| Steam encrypted app tickets: `POST /v1/auth/steam/app_ticket`, `/v1/account/link/steam/app_ticket`, `POST /v1/server/steam/app_ticket` | `ISteamUser::RequestEncryptedAppTicket` verified offline with `[social.steam].app_ticket_key` (SDK Auth key): login/link without a Web API key or Steam egress, game servers verify peers and get `steam_id`, licenses, DLC, `user_data` and the linked account; `app_ticket_max_age_secs` replay window, ticket must be for `app_id` or one of its DLC |
-| player files: `PUT/GET/PATCH/DELETE /v1/account/files/{key}`, `GET /v1/account/files?purpose&tag`, `GET /v1/accounts/{id}/files[/{key}]`, `/v1/server/accounts/{id}/files…` | Binary per-player files (saves, screenshots, replays, custom maps) up to `[files].player_max_bytes`, `player_max_files` keys per player; every upload is a new revision, the newest `player_keep_revisions` are kept and any of them can be promoted back to current (`PATCH {current_revision}`), `?revisions=1` lists them, `?revision=n` downloads one; `purpose`, content tags, metadata, `public` flag exposes a file to other players (and a CDN URL with `[files].public_base_url` on S3); ETag/304, `content-disposition`; game servers read/write any player's files; `player_file.updated\|promoted\|deleted` events |
-| donations: `GET /v1/donations/defs`, `POST /v1/donations {def_id}`, `GET /v1/donations[/accounts/{id}]`, `POST /v1/donations/{id}/give\|claim`; `PUT /v1/server/donations/defs/{id}` | Ask friends / group mates / anyone for help (Hiro donations): a definition sets the `cost` the requester pays, the `count` goal and `max_count` ceiling, `duration_secs`, `user_contribution_max_count` per helper, and two reward tables — the helper gets `contributor_reward` on every give, the requester accrues `recipient_reward` per contribution and claims it when convenient (deferred tables land in the mailbox); audience is enforced server-side (mutual friends / shared group / anyone), one live request per definition, live requests snapshot their definition; `donation.requested\|given\|claimed` events, sweep for finished requests |
-| VIP tiers: `GET /v1/vip[/{program}]`, `PUT /v1/server/vip/programs/{id}`, `GET /v1/server/accounts/{id}/vip`, `POST …/vip/{program}/points` | A program maps points to tiers (`[{name, threshold, perks, tier_up_reward}]`): points come from lifetime spending in the configured currencies (× points per unit, optionally only for some ledger reasons — real purchases count, refunds don't) plus points the server grants directly; evaluation is lazy and idempotent — every read recomputes the tier from the ledger and hands out tier-up reward tables still owed, once per tier; perks are free-form JSON the shop/game reads (`discount_pct`, multipliers); `vip.tier_up` / `vip.points_granted` events |
-| lobby bulk update: `POST /v1/server/lobbies/{id}/bulk {lobby?, host_id?, add[], remove[], players{}, ignore_ineffectual_updates}` | The game server reshapes a lobby in one transaction — settings patch, add members (team auto-balance, per-member data), remove members, per-member team/ready/data, host handoff — with the final capacity/team-size check over the resulting roster; either everything lands or nothing does, and with `ignore_ineffectual_updates` no-ops (removing a non-member, adding a member) are listed in `result.skipped` instead of failing; members get one `updated` lobby event, removed ones `kicked` |
-| image verification: `spec.verify_image` on `POST /v1/server/fleets` / `…/builds` | Before a fleet or build is saved the registry is asked for the image manifest (Docker Registry v2 / OCI distribution: anonymous first, then the `WWW-Authenticate: Bearer` token dance; `secret_env.REGISTRY_AUTH = "user:password"` for private registries, docker.io shorthand understood) — a typo in the tag or a private image without credentials is a 400 at save time instead of a fleet that never comes up; the manifest digest is pinned into `spec.image_digest` so what was verified is what runs |
-- **Egress accounting** — game servers report cumulative `bytes_out`/`bytes_in`; per-server totals and live rate, fleet rollup with cost (`spec.cost.egress_per_gb`).
-- **Rollout throttles** — `policy.max_pending` caps servers in `starting`, `creation_parallelism` / `deletion_parallelism` bound concurrent starts and terminations, `step_up` / `step_down` the per-pass batch.
-- **Developer players** — operator-flagged team accounts: enter maintenance mode, virtual audience `developers` for developer-only content, development-only actions in production (`[dev].environment`).
-- **Log follow / download** — `…/servers/{sid}/logs/stream` (SSE: `tail` history then live lines) and `…/logs/download` (plain-text file).
-- **Session baggage** — per-session key/value in `social` / `game` / `service` scopes (friends, game servers, event stamping), Pragma-style limits.
-- **Reserved servers** — `POST /v1/gameserver/reserve {seconds}` / `…/gameservers/{id}/reserve|unreserve`: hold a ready server out of allocation and scale-down, timed or until cancelled.
-- **Telemetry sampling policy** — global keep rate × per-schema rate, `always_enabled` events, deterministic per session; clients fetch `GET /v1/telemetry/sampling` and skip what would be dropped.
-- **Quiet relayed rooms** — `MatchCreate { suppress_presence }` drops join/leave events and member lists for large relayed matches (Photon `SuppressRoomEvents`).
-- **Broadcast notifications** — `POST /v1/server/notifications/broadcast` to every connected player, batched (`batch_size` / `batch_interval_ms`) per node, progress endpoint.
-- **UGC dependencies & collections** — dependency graph with transitive resolution, `collection` items with ordered children, `subscribe?include_dependencies` installs a whole pack.
-- **Sweepstakes / raffles** — paid entries, per-player cap, seeded reproducible weighted draw, prize + consolation reward tables, cancel-with-refund, auto-draw at `ends_at`.
-- **Fleet aliases** — stable allocation names (`alias:prod`) routed to a fleet/pool or retired with a message, swap fleets without touching clients.
-- **Custom incident kinds** — crash reports accept `connection`, `exception` and game-defined `custom.<name>` incidents, grouped and filtered like crashes.
-- **Client patch versions per logic version** — per-platform min/latest patch for each protocol version, hotfix bump and retirement endpoints, folded into the client version gate.
-- **Deletion ledger** — deleted accounts that come back from a backup are re-deleted automatically; export/import the ledger, lift entries on purpose.
-- **Explicit matchmaking sort** — queue `sort: absolute|distance` on any numeric property decides which candidates a match fills from first (FlexMatch absoluteSort / distanceSort).
-- **Server reputation** — game servers report gameplay stats (rounds, players, kicks, crashes); operators get a per-server / per-fleet reputation card combining them with player ratings.
-- **Stable server names** — `spec.dns_zone` gives each game server a DNS-style hostname (pod hostname/subdomain on Kubernetes, by-name lookup everywhere).
-- **Operator log tail** — in-memory ring of each node's log lines, `GET /v1/admin/logs` with level/target/text/time filters across the cluster.
-- **Install scripts** — `spec.install` runs once per node/host and build before the first server starts there (GameLift `install.sh`); runs and failures recorded per fleet, reset to re-run.
-| `GET /v1/time` | Authoritative server clock `{now, now_ms, iso}` |
-trusted source and a child cannot raise its own bracket. Per bracket `[compliance]` lists the
-closed features — defaults: children lose `chat` (sending; reading stays), `friends` (requests),
-`purchases` (store + IAP), `ugc` and `public_profile` (lookups show only id/username/avatar);
-`unknown_as_child = true` treats accounts without an age as children. `GET /v1/account/age`
-tells the client what is closed. `POST /v1/account/parental/request {parent_email}` emits
-`account.parental_consent_request` with a single-use token for your mailer;
-`POST /v1/auth/parental/consent {token}` (no session) records the parent's consent, after which
-only `consented_child_restrictions` (`purchases` by default) remain. The view lives in memory on
-every node like bans, so a change bites on the next request.
-
-Legal agreements are versioned documents: `PUT /v1/admin/legal/{key}/{version} {locale, title, url,
-body, mandatory, countries, grace_secs, published}` (ToS, privacy, EULA, marketing …; one row per
-locale, `countries` empty = everywhere), `…/retire`, `GET /v1/admin/legal` with acceptance counts and
-`GET /v1/admin/legal/{key}/consents` / `GET /v1/admin/accounts/{id}/consents` as the audit trail
-(version, locale, country, IP, user agent, time). Players read `GET /v1/legal?locale&country` (no
-token; locale falls back to `en`) and `GET /v1/legal/{key}` for the text, see what applies to them in
-`GET /v1/account/consents` (`pending` with `enforced` / `seconds_left`, `optional` with their choice,
-`history`), answer with `POST /v1/account/consents {accept: [{key, version}], decline: […], country,
-locale}` and withdraw optional ones with `DELETE /v1/account/consents/{key}`. Once a mandatory
-document's latest version is past `grace_secs`, every bearer call from an account that has not
-accepted it fails with `403 consent_required: tos v3` — except reading/accepting documents, auth,
-export and account deletion — so a new ToS can be rolled out with a week of grace and then enforced.
-Events `legal.published`, `legal.consented`, `legal.withdrawn`.
-
-### Storage: JSON Patch, aggregates, full-text
-
-`POST /v1/storage/patch` takes either a merge patch (`patch`, RFC 7386) or RFC 6902 operations
-(`ops`: add / remove / replace / move / copy / test — a failing `test` rejects the batch with 409,
-so read-modify-write races become guarded patches). `GET /v1/storage/{collection}/aggregate?field=stats.score&group=mode`
-rolls a numeric field up (count / sum / avg / min / max, optionally per group) under the same
-`where` / `prefix` / `owner_id` filters as listing. `"$q": "flaming sword"` inside `where`
-is a websearch-style full-text match over the whole value (GIN-indexed), combinable with
-containment and `$where` on `list` and `count`.
-
-### Magic links, custom auth, session cap
-
-`POST /v1/auth/email/magic/request {email, create?}` emits `account.magic_link` with a single-use
-token (15 min) for your mailer; `POST /v1/auth/email/magic {token, vars?}` turns it into a session
-and marks the address verified — passwordless login without account enumeration. A trusted game
-server mints sessions for identities it verified itself with `POST /v1/server/auth/custom {id}`
-(server key). `session.max_sessions_per_account` caps live sessions per account; a new login
-evicts the oldest.
-
-### Progress graphs: skill trees and timed unlockables
-
-`POST /v1/server/graphs` defines a graph of nodes; each node has prerequisites (`requires`), a
-price per rank (`cost: {currency: amount}`), an optional level gate (`min_level: {track, level}`),
-`max_rank`, a reward table granted per rank and an opaque `grants` payload for the game. A node
-with `unlock_seconds` is a timed unlockable: `POST /v1/graphs/{g}/nodes/{n}/unlock` pays and
-starts the timer, `…/claim` finishes it once it ran out, `…/skip` pays `skip_cost_per_hour` ×
-remaining time (rounded up) to finish now. `GET /v1/graphs` returns every node with the player's
-`rank`, `state` (`locked` / `available` / `unlocking` / `ready` / `maxed`), `blocked_by`,
-`unlocks_at` and the current `skip_cost`; `POST /v1/graphs/{g}/reset` pays `reset_cost`, refunds
-`refund_pct` of what was spent and locks everything again.
-
-### Reward modifiers
-
-`PUT /v1/server/rewards/modifiers {id, scope, factor, starts_at?, ends_at?, account_id?}` multiplies
-rewards for a time window — for everyone or for one player. Scopes: `xp` / `xp:<track>` (XP added
-to a track), `currency` / `currency:<code>` (currency entries of any reward table, quest, level,
-achievement, mail…), `table:<id>` (one reward table). Active modifiers multiply together; items are
-never multiplied. `POST /v1/server/progression/xp` reports `xp_factor` and `delta_applied`, players
-see what is active in `GET /v1/rewards/modifiers`.
-
-### Quests: rerolls
-
-A quest with `rerollable: true` can be swapped out by the player (`POST /v1/quests/{id}/reroll`):
-it disappears for the rest of its period, `rerolls_per_period` caps how many quests of that
-kind a player may reroll per period, completed quests stay. `GET /v1/quests` carries
-`rerollable` and `rerolls_left` per quest.
-
-### Store: per-platform listings
-
-A store listing carries `platforms` (`steam`, `ios`, `android`, `psn`, `xbox`, `nintendo`,
-`epic`, `web` …; empty = everywhere). Clients call `GET /v1/store?platform=ios` and only see
-what is open to them — the same catalogue item can be priced or bundled differently per store.
-
-### Presence: rich status and appear offline
-
-`status_update {status?, rich?, appear_offline?}` — `rich` is a JSON object (≤ 2 KB: activity,
-party size, joinable …) followers receive next to the status text; `appear_offline: true` sends
-followers a leave and keeps the session out of `status_follow` snapshots until it is turned off
-(a lone join), while the server still treats the player as online for delivery.
-
-### Notifications: TTL, push templates and schedule
-
-`POST /v1/server/notifications` takes `ttl_secs`: the notification carries `expire_time`, leaves
-the inbox and the unread count when it passes, and is purged by retention. Push grew a server
-surface: `PUT /v1/server/push/templates` (title/body/data with `{{var}}` placeholders;
-`{{username}}` is always set), `POST /v1/server/push {template_id | title/body/data, vars,
-account_ids | everyone with a token, send_at | local_date + local_time}` — immediate, at a UTC
-instant, or at a wall-clock time in each recipient's own timezone (`accounts.timezone`, rolled
-out zone by zone by the `push_schedule` lease holder every 30 s) — and
-`GET/DELETE /v1/server/push/schedule`.
-
-Platforms: `fcm`, `apns`, `webpush` and `hms` (Huawei Push Kit: `[push.hms] app_id/app_secret`,
-app-level OAuth token cached until it expires). `data.silent = true` sends a background push —
-FCM data-only message, APNs `content-available: 1` with `apns-push-type: background`, HMS data
-message — so the app wakes and reads `data` without showing a banner. `data.link` (or `data.deep_link`) is where a tap lands — an `https://` page or an app scheme like `mygame://shop/offer/7`: FCM `fcm_options.link` / Android `click_action`, APNs top-level `link` (+ `url-args`), HMS `click_action` URL/intent, Web Push `url`; templates can build it (`"link": "mygame://quest/{{id}}"`).
-
-### Chat: typing, attachments, automod
-
-`channel_typing {channel_id}` fans a `channel_typing {channel_id, user}` event to everyone else
-in the channel (at most one per 2 s per channel, never stored). `content.attachments` is a
-checked contract — up to 10 `{url, name?, mime?, size?}` with `https://` or `ugc:<id>` URLs and
-sizes ≤ 25 MiB — so clients can render it without defensive parsing. `chat.automod_url` points
-at your moderation service: every message is POSTed as `{channel_id, sender_id, username,
-content}` and the answer `{"action": "allow" | "block" | "replace", "content"?, "reason"?}` is
-applied after the built-in filters and the `before_chat_message` hook; `automod_timeout_ms` and
-`automod_fail_open` decide what a slow or dead service means.
-
-`chat.translate_url` adds translation: a message with a `text` is POSTed as `{channel_id,
-sender_id, text, source, targets}` — `source` is the sender's account language, `targets` the
-other languages of everyone present in the channel (at most `translate_max_langs`, nothing is
-sent when all speak one language) — and the answer `{"translations": {"de": "…"}}` rides on the
-message as `content.translations` (+ `source_lang`), stored with it so history has it too; each
-client renders its own language. Errors and timeouts (`translate_timeout_ms`, 800 ms) never hold
-a message back. Plug in DeepL, Google, Azure or an LLM behind that one endpoint.
-
-### Matchmaker observability
-
-`GET /v1/server/matchmaker/stats` adds `wait` — p50/p95/p99/max wait per queue × region over the
-| `POST /v1/server/matchmaker/queues/{name}/pause|drain|resume {reason}` | Operator queue controls: pause holds waiting tickets and forms nothing, drain lets them finish, both refuse new tickets with 503 + reason; `stats` lists paused/draining queues, events `matchmaker.queue_paused|draining|open` |
-last 2 048 matched tickets — and `waiting_ages` (how long the tickets in each queue have been
-there), next to the Prometheus histogram `musubi_matchmaker_wait_seconds`.
-`POST /v1/server/matchmaker/simulate {queue, arrivals_per_sec, duration_secs, mmr_mean, mmr_sd,
-regions, party_sizes, seed}` dry-runs a queue's rules on virtual time with synthetic players and
-returns matches, wait percentiles and quality (MMR gap, ping) — tune `mmr`/`ping` expansion before
-real players feel it; same seed, same answer.
-
-Observability per decision: every ticket carries a bounded trace (`enqueued`, ready-check /
-requeue / dodge notes, then `matched` with token, quality, MMR gap and partners — or `expired` /
-`cancelled`), read live or after the fact with `GET /v1/server/matchmaker/tickets/{id}/trace`;
-formed matches are persisted (`musubi.matchmaker_matches`: token, queue, region, quality, tickets,
-accounts, per-ticket wait) and listed with `GET /v1/server/matchmaker/matches?token|queue|account_id`;
-`GET /v1/server/matchmaker/rejections` is the cumulative queue × rule table of why tickets were kept
-apart (`query`, `count`, `mmr`, `ping`, `party`, …) — Prometheus `musubi_matchmaker_rejections_total`
-has the same numbers. `[retention] matchmaker_log_days` (14) bounds both tables.
-
-### Player statistics
-
-`PUT /v1/server/stats/defs` declares typed counters (`sum` / `max` / `min` / `last`, each
-`public`, `friends` or `private`); `POST /v1/server/stats/update {account_id, scope?, stats}` folds
-values into a scope slice (mode, season, map …) and the global slice at once;
-`GET /v1/server/stats/{account_id}`, `GET /v1/server/stats/top?stat&scope&limit`. Players read
-their own with `GET /v1/stats[?scope]` and others' with `GET /v1/stats/{account_id}` (public, plus
-`friends` stats for friends). `POST /v1/server/matches/{id}/results` with `stats_scope` folds each
-player's `stats` object in the same report that settles rating, rewards, quests and XP.
-
-### Anti-cheat signals
-
-Every match input in an authoritative match passes a per-session guard (`[anticheat] max_input_bytes`, `max_inputs_per_sec`): an oversized or too-frequent input is rejected and recorded as a signal. Game servers add their own with `POST /v1/server/anticheat/flag {account_id, kind, severity: 1..=100, details?, match_id?}`, modules with the `anticheat.flag` host op. Signals sum into a per-account score over `window_hours`; when it reaches `kick_score` the account is kicked from every node (`anticheat.kicked`). Moderators read `GET /v1/admin/anticheat?min_score` (worst accounts first) and `GET /v1/admin/accounts/{id}/anticheat`. `POST /v1/server/anticheat/verify {provider: eac|battleye, account_id, ticket}` relays a client session ticket to the configured vendor endpoint (`eac_url` / `battleye_url`, bearer key) and treats a rejection as a `vendor_rejected` signal. Everything emits `anticheat.signal`.
-
-### Georouting and fleet pools
-
-`GET /v1/regions` lists the regions a client should probe — `[regions] regions = [{name, echo, http}]` plus every fleet region — with `suggested` filled from the CDN country header (`cf-ipcountry` / `x-country`) through `[regions] country_map`; `[regions] echo_listen` runs a UDP echo on the node for the probes. The client puts its measurements into the matchmaker ticket as `ping_<region>` numeric properties (or a `region` string); the queue picks the region with the lowest worst ping and a dedicated server is allocated with `allocate_routed`: among the fleets named by the ticket's `fleet` property — a fleet name or a fleet `pool` — the match region first, then the rest. `POST /v1/server/allocate {pool, region?, payload, backfill?, wait_secs?}` does the same for game servers; with `wait_secs` (also on `/v1/server/fleets/{id}/allocate`) an empty pool cold-starts a server in the best fleet with room and waits for it, so fleets can run `min_servers = 0, buffer = 0` and scale to zero. Providers `edgegap` (`[fleet.edgegap] token, app, version`; a fleet `spec.image` of `app:version` overrides) and `gamelift` (`[fleet.gamelift] access_key, secret_key, region, fleet_id|alias_id`) start and stop servers through the vendors' APIs like the built-in local/docker/firecracker/kubernetes ones.
-
-### Realtime transport: channels and compression
-
-**Channels.** Every transport speaks the same four names: `reliable_ordered`, `reliable_unordered`, `unreliable_sequenced`, `unreliable`. `match_data_send {channel: "unreliable_sequenced"}` picks one (it overrides the older `reliable` flag); the frame arrives as `match_data {channel, seq}` — unreliable frames carry `seq` (per match, per session, from 0), so a client drops a frame whose `seq` is below the last applied. Transports without the channel degrade: WebSocket delivers everything reliable_ordered, QUIC/WebTransport/WebRTC send unreliable frames as datagrams / unordered channels, raw UDP uses its channel 1. The labels stay honest either way.
-
-**Capabilities.** `transport {}` replies `transport {transport: "ws"|"quic"|"webtransport"|"webrtc"|"udp", channels: [native channels], max_frame_bytes, compression: ["lz4"], compressed}` — ask once after connecting and decide how to pack state.
-
-**lz4.** On the binary (`postcard`) wire, `transport {compress: "lz4"}` switches the session to per-frame compression both ways: every binary frame from then on is a 1-byte tag — `0` raw, `1` `lz4_flex` block with the uncompressed size prepended (`musubi_proto::lz4_wrap / lz4_unwrap`) — and payloads over 256 bytes that actually shrink go compressed. JSON sessions get `invalid_argument`. A 2 KB repetitive delta lands in well under 300 bytes.
-
-### Developer tools
-
-**Module canaries.** `POST /v1/admin/runtime/modules/{name}/canary?percent=10&accounts=a,b` uploads a second build of a module: RPCs of the pinned accounts and a stable `percent` of all accounts run on it, everyone else stays on the active build, on every node (the canary travels with the usual reload broadcast). `POST …/canary/promote` makes it the active build, `DELETE …/canary` drops it; every upload is a row in `GET …/versions` (`active|canary|retired`, sha256, note) and `POST …/versions/{v}/rollback` re-activates an earlier one.
-
-**Request recording and replay.** `PUT /v1/admin/dev/recording {enabled, sample_percent?, path_prefix?}` keeps sampled requests with their responses (`GET /v1/admin/dev/recordings?path=`, `GET …/{id}`; secrets are stripped, `/v1/admin/dev/*` and replays are never recorded). `POST …/{id}/replay` re-issues the request on this node — as the server (current key) or as the recorded account (a 5-minute token) — and reports whether the status matches.
-
-**Fixtures.** `POST /v1/admin/dev/fixtures {name, accounts: [{username, display_name?, metadata?, wallet?: {gold: 100}, inventory?: [{item_id, quantity}], storage?: [{collection, key, value}]}], reset?}` creates the accounts once (re-applying finds them again), tops wallets up idempotently and seeds inventory and player data for new accounts (or all with `reset`); `DELETE /v1/admin/dev/fixtures/{name}` purges them.
-
-**CPU profiles on demand.** `GET /v1/admin/debug/profile?seconds=10&hz=99&format=flamegraph|pprof|folded` samples this node for `seconds` (1..=120, `SIGPROF` at `hz`) and answers with a flamegraph SVG, a `pprof` protobuf (`go tool pprof`, Pyroscope, speedscope) or folded stacks (`thread;frame;frame count` per line, for inferno/speedscope). Same guards as `/metrics` (`[metrics] allow_ips`, server key), one profile at a time per node (`409` otherwise), Linux only. Point it at the node that serves a hot match or a slow RPC instead of restarting under `perf`.
-
-**Deploy.** `Dockerfile` builds the server image; `deploy/helm/musubi` is a Helm chart (TOML config in a ConfigMap, secrets as `MUSUBI__*` env, Service for HTTP and the UDP edge, HPA and PDB). `deploy/terraform/musubi` wraps the chart as a Terraform module (namespace, Secret with database URL / server key, ConfigMap TOML, HPA/PDB, optional UDP edge Service) for EKS/GKE/AKS/k3s — Postgres comes from the caller (`database_url`). `deploy/terraform/musubi-hetzner` is the no-Kubernetes profile (`single`/`hybrid`) on Hetzner Cloud: core nodes behind a load balancer running the binary as a systemd service, Postgres 16 on its own server with a volume, optional fleet hosts wired into `[fleet.ssh]` automatically, firewalls and a private network — one `terraform apply`. `deploy/terraform/musubi-ovh` is the same layout on OVHcloud Public Cloud (OpenStack provider, shared cloud-init, optional Octavia LB, managed-database URL or a Postgres instance on block storage). The image ships `openssh-client` so the `ssh` fleet provider also works from containers.
+Apache-2.0 — see [LICENSE](LICENSE).
