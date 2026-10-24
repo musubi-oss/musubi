@@ -62,6 +62,7 @@ export const router = createRouter({
     { path: '/world', component: () => import('./pages/world/Index.vue'), children: [
       { path: 'netsim', component: () => import('./pages/world/NetSim.vue') },
       { path: '', component: () => import('./pages/world/Worlds.vue') },
+      { path: 'worlds/:w/entities/:id', component: () => import('./pages/world/Entity.vue') },
       { path: 'worlds/:w', component: () => import('./pages/world/World.vue') },
       { path: ':page/:id', component: () => import('./pages/Detail.vue'), props: (r) => ({ res: catalog.world.find((x) => x.id === r.params.page) ?? catalog.world[0] }) },
       { path: ':page', component: () => import('./pages/Generic.vue'), props: (r) => ({ res: catalog.world.find((x) => x.id === r.params.page) ?? catalog.world[0] }) },
