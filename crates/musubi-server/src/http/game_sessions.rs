@@ -29,7 +29,7 @@ const SESSION_INVITE_CODE: i32 = 32;
 
 pub fn routes() -> Router<AppState> {
     Router::new()
-        .route("/v1/server/sessions", post(create))
+        .route("/v1/server/sessions", get(list_server).post(create))
         .route("/v1/server/sessions/search", post(search_server))
         .route("/v1/server/sessions/stop", post(stop_many))
         .route(
@@ -299,6 +299,17 @@ async fn create(
 ) -> Result<Json<Value>, ApiError> {
     let (sess, reused) = create_session(&s, r).await?;
     Ok(Json(with_reused(sess, reused)))
+}
+
+/// `GET /v1/server/sessions?kind=&region=&has_slots=&include_terminated=&limit=&offset=` — the
+/// same search as `POST /search` for callers that can only GET (console lists, curl).
+async fn list_server(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    Query(r): Query<SearchSessions>,
+) -> Result<Json<Value>, ApiError> {
+    let page = s.game_sessions.search(&r, false).await?;
+    Ok(Json(serde_json::to_value(page).unwrap_or_default()))
 }
 
 async fn search_server(

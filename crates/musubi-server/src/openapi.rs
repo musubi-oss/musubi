@@ -1555,6 +1555,7 @@ pub const ROUTES: &[(&str, &str, &str)] = &[
     ),
     ("POST", "/v1/server/mail", "economy"),
     ("POST", "/v1/server/market/settle", "economy"),
+    ("GET", "/v1/server/sessions", "sessions"),
     ("POST", "/v1/server/sessions", "sessions"),
     ("POST", "/v1/server/sessions/stop", "sessions"),
     ("POST", "/v1/server/sessions/search", "sessions"),
