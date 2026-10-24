@@ -51,7 +51,14 @@ function itemPath(row: any) {
   if (!props.res.item) return null
   return props.res.item.replace(/\{([^}]+)\}/g, (_, k) => encodeURIComponent(row[k] ?? row[props.res.key ?? 'id'] ?? row.id ?? row.name))
 }
+const section = computed(() => String(route.path.split('/')[1]))
+function detailPath(row: any) {
+  if (props.res.link) return props.res.link(row)
+  if (!props.res.item) return null
+  const k = row[props.res.key ?? 'id'] ?? row.id ?? row.name; return k === undefined ? null : `/${section.value}/${props.res.id}/${encodeURIComponent(String(k))}`
+}
 async function pick(row: any) {
+  const to = detailPath(row); if (to) { router.push(to); return }
   const p = itemPath(row)
   open.value = row; edit.value = JSON.stringify(row, null, 2)
   if (p) { try { open.value = await get(p); edit.value = JSON.stringify(open.value, null, 2) } catch (e: any) { toast.err(e) } }
@@ -120,9 +127,9 @@ onMounted(() => { if (props.res.custom !== 'zanshin') load() })
     </template>
     <template v-else-if="isList && !off">
       <DataTable :cols="cols" :rows="shown" :loading="busy" pick @pick="pick" :empty="q ? 'Nothing matches the filter' : `No ${res.title.toLowerCase()} yet` + (res.template ? ' — Create one above' : ' — rows appear here as the game creates them')">
-        <template #actions="{ row }" v-if="res.actions || res.link">
+        <template #actions="{ row }" v-if="res.actions || res.link || res.item">
           <span style="display:flex;gap:6px;justify-content:flex-end">
-            <button v-if="res.link && res.link(row)" class="btn s" @click="router.push(res.link(row)!)">Open</button>
+            <button v-if="detailPath(row)" class="btn s" @click="router.push(detailPath(row)!)">Open</button>
             <button v-for="a in visible(res.actions, row)" :key="a.label" class="btn s" :class="{ d: a.danger }" @click="run(a, row)">{{ a.label }}</button>
           </span>
         </template>

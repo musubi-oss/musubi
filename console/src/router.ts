@@ -34,6 +34,7 @@ export const router = createRouter({
       { path: 'auth_providers', component: () => import('./pages/players/Providers.vue') },
       { path: 'data_rights', component: () => import('./pages/players/DataRights.vue') },
       { path: 'crashes', component: () => import('./pages/players/Crashes.vue') },
+      { path: ':page/:id', component: () => import('./pages/Detail.vue'), props: (r) => ({ res: catalog.players.find((x) => x.id === r.params.page) ?? catalog.players[0] }) },
       { path: ':page', component: () => import('./pages/Generic.vue'), props: (r) => ({ res: catalog.players.find((x) => x.id === r.params.page) ?? catalog.players[0] }) },
     ]},
     { path: '/servers', component: () => import('./pages/servers/Index.vue'), children: [
@@ -42,6 +43,7 @@ export const router = createRouter({
       { path: 'servers/:id', component: () => import('./pages/servers/GameServer.vue') },
       { path: 'edge', component: () => import('./pages/servers/Edge.vue') },
       { path: 'builds', component: () => import('./pages/servers/Builds.vue') },
+      { path: ':page/:id', component: () => import('./pages/Detail.vue'), props: (r) => ({ res: catalog.servers.find((x) => x.id === r.params.page) ?? catalog.servers[0] }) },
       { path: ':page', component: () => import('./pages/Generic.vue'), props: (r) => ({ res: catalog.servers.find((x) => x.id === r.params.page) ?? catalog.servers[0] }) },
     ]},
     { path: '/liveops', component: () => import('./pages/liveops/Index.vue'), children: [
@@ -54,12 +56,14 @@ export const router = createRouter({
       { path: 'offers/:id', component: () => import('./pages/liveops/Offer.vue') },
       { path: 'news/:id', component: () => import('./pages/liveops/News.vue') },
       { path: 'changesets/:id', component: () => import('./pages/liveops/Changeset.vue') },
+      { path: ':page/:id', component: () => import('./pages/Detail.vue'), props: (r) => ({ res: catalog.liveops.find((x) => x.id === r.params.page) ?? catalog.liveops[0] }) },
       { path: ':page', component: () => import('./pages/Generic.vue'), props: (r) => ({ res: catalog.liveops.find((x) => x.id === r.params.page) ?? catalog.liveops[1] }) },
     ]},
     { path: '/world', component: () => import('./pages/world/Index.vue'), children: [
       { path: 'netsim', component: () => import('./pages/world/NetSim.vue') },
       { path: '', component: () => import('./pages/world/Worlds.vue') },
       { path: 'worlds/:w', component: () => import('./pages/world/World.vue') },
+      { path: ':page/:id', component: () => import('./pages/Detail.vue'), props: (r) => ({ res: catalog.world.find((x) => x.id === r.params.page) ?? catalog.world[0] }) },
       { path: ':page', component: () => import('./pages/Generic.vue'), props: (r) => ({ res: catalog.world.find((x) => x.id === r.params.page) ?? catalog.world[0] }) },
     ]},
     { path: '/cluster', component: () => import('./pages/cluster/Index.vue'), children: [
@@ -69,6 +73,7 @@ export const router = createRouter({
       { path: '', component: () => import('./pages/cluster/Overview.vue') },
       { path: 'nodes', redirect: '/cluster' },
       { path: 'reports', redirect: '/analytics/reports' },
+      { path: ':page/:id', component: () => import('./pages/Detail.vue'), props: (r) => ({ res: catalog.cluster.find((x) => x.id === r.params.page) ?? catalog.cluster[0] }) },
       { path: ':page', component: () => import('./pages/Generic.vue'), props: (r) => ({ res: catalog.cluster.find((x) => x.id === r.params.page) ?? catalog.cluster[0] }) },
     ]},
     { path: '/social', component: () => import('./pages/social/Index.vue'), children: [
@@ -83,6 +88,7 @@ export const router = createRouter({
       { path: 'mm_stats', redirect: '/social/matches?tab=stats' },
       { path: 'mm_rejections', redirect: '/social/matches?tab=rejections' },
       { path: 'turns', redirect: '/social/matches?tab=turns' },
+      { path: ':page/:id', component: () => import('./pages/Detail.vue'), props: (r) => ({ res: catalog.social.find((x) => x.id === r.params.page) ?? catalog.social[0] }) },
       { path: ':page', component: () => import('./pages/Generic.vue'), props: (r) => ({ res: catalog.social.find((x) => x.id === r.params.page) ?? catalog.social[0] }) },
     ]},
     { path: '/economy', component: () => import('./pages/economy/Index.vue'), children: [
@@ -103,6 +109,7 @@ export const router = createRouter({
       { path: 'store/:id', component: () => import('./pages/economy/StoreItem.vue') },
       { path: 'seasons/:id', component: () => import('./pages/economy/Season.vue') },
       { path: 'progression/:id', component: () => import('./pages/economy/Track.vue') },
+      { path: ':page/:id', component: () => import('./pages/Detail.vue'), props: (r) => ({ res: catalog.economy.find((x) => x.id === r.params.page) ?? catalog.economy[0] }) },
       { path: ':page', component: () => import('./pages/Generic.vue'), props: (r) => ({ res: catalog.economy.find((x) => x.id === r.params.page) ?? catalog.economy[0] }) },
     ]},
     { path: '/content', component: () => import('./pages/content/Index.vue'), children: [
@@ -115,6 +122,7 @@ export const router = createRouter({
       { path: 'bundles', component: () => import('./pages/content/Versions.vue') },
       { path: 'bundles/:id', component: () => import('./pages/content/Version.vue') },
       { path: 'modules/:name', component: () => import('./pages/content/Module.vue') },
+      { path: ':page/:id', component: () => import('./pages/Detail.vue'), props: (r) => ({ res: catalog.content.find((x) => x.id === r.params.page) ?? catalog.content[0] }) },
       { path: ':page', component: () => import('./pages/Generic.vue'), props: (r) => ({ res: catalog.content.find((x) => x.id === r.params.page) ?? catalog.content[0] }) },
     ]},
     { path: '/analytics', component: () => import('./pages/analytics/Index.vue'), children: [
@@ -122,6 +130,7 @@ export const router = createRouter({
       { path: 'events', component: () => import('./pages/analytics/Events.vue') },
       { path: 'overview', redirect: '/analytics' },
       { path: 'crashes', redirect: '/players/crashes' },
+      { path: ':page/:id', component: () => import('./pages/Detail.vue'), props: (r) => ({ res: catalog.analytics.find((x) => x.id === r.params.page) ?? catalog.analytics[0] }) },
       { path: ':page', component: () => import('./pages/Generic.vue'), props: (r) => ({ res: catalog.analytics.find((x) => x.id === r.params.page) ?? catalog.analytics[0] }) },
     ]},
     { path: '/settings', component: () => import('./pages/settings/Index.vue'), children: [
@@ -141,6 +150,7 @@ export const router = createRouter({
       { path: 'invites', redirect: '/settings/operators' },
       { path: 'jwt_keys', redirect: '/settings/operators' },
       { path: 'sso', redirect: '/settings/operators' },
+      { path: ':page/:id', component: () => import('./pages/Detail.vue'), props: (r) => ({ res: catalog.settings.find((x) => x.id === r.params.page) ?? catalog.settings[0] }) },
       { path: ':page', component: () => import('./pages/Generic.vue'), props: (r) => ({ res: catalog.settings.find((x) => x.id === r.params.page) ?? catalog.settings[0] }) },
     ]},
     { path: '/:section/:page?', component: () => import('./pages/Section.vue') },

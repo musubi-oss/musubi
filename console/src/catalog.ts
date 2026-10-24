@@ -4,7 +4,9 @@
 // Row actions: `path` may use {field} placeholders from the row; `body` is a JSON template the
 // operator can edit before sending (omit for a bare call); `confirm` asks first.
 export interface Act { label: string; method: 'POST' | 'PUT' | 'PATCH' | 'DELETE'; path: string; body?: Record<string, unknown>; confirm?: string; danger?: boolean; when?: (row: any) => boolean }
-export interface Res { id: string; title: string; list: string; items?: string; key?: string; rowsKey?: string; item?: string; create?: string; method?: 'POST' | 'PUT'; template?: Record<string, unknown>; cols?: string[]; group?: string; custom?: string; actions?: Act[]; pageActions?: Act[]; link?: (row: any) => string | null; newPath?: string }
+/** Related lists shown as tabs on the generic detail page; `list` may use {id} and {field} placeholders from the record. */
+export interface DetailTab { id: string; title: string; list: string; rowsKey?: string; cols?: string[] }
+export interface Res { id: string; title: string; list: string; detail?: { tabs?: DetailTab[] }; items?: string; key?: string; rowsKey?: string; item?: string; create?: string; method?: 'POST' | 'PUT'; template?: Record<string, unknown>; cols?: string[]; group?: string; custom?: string; actions?: Act[]; pageActions?: Act[]; link?: (row: any) => string | null; newPath?: string }
 export const catalog: Record<string, Res[]> = {
   players: [
     { id: 'accounts', title: 'Accounts', list: '/v1/admin/accounts', rowsKey: 'accounts', custom: 'accounts' },
