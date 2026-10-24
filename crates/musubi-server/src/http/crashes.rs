@@ -267,7 +267,7 @@ async fn ingest_anonymous(
         .get("x-telemetry-key")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    if key.is_empty() || !s.analytics.cfg.telemetry_keys.iter().any(|k| k == key) {
+    if !telemetry_key_ok(&s.analytics.cfg.telemetry_keys, key) {
         return Err(Error::Unauthenticated("telemetry key".into()).into());
     }
     let device = r
@@ -627,9 +627,23 @@ pub struct ListQ {
     pub offset: Option<i64>,
 }
 
+/// Longest look-back a `since_secs` query may ask for (10 years); anything wider is clamped so
+/// the timestamp arithmetic cannot overflow (`OffsetDateTime - Duration` panics on overflow).
+const MAX_SINCE_SECS: i64 = 10 * 365 * 86_400;
+
 fn since(secs: Option<i64>) -> Option<OffsetDateTime> {
     secs.filter(|s| *s > 0)
-        .map(|s| OffsetDateTime::now_utc() - Duration::from_secs(s as u64))
+        .map(|s| OffsetDateTime::now_utc() - Duration::from_secs(s.min(MAX_SINCE_SECS) as u64))
+}
+
+/// `X-Telemetry-Key` of the anonymous ingest route against the configured keys, compared in
+/// constant time so a probing client learns nothing from response timing.
+fn telemetry_key_ok(keys: &[String], key: &str) -> bool {
+    use subtle::ConstantTimeEq as _;
+    !key.is_empty()
+        && keys
+            .iter()
+            .any(|k| bool::from(k.as_bytes().ct_eq(key.as_bytes())))
 }
 
 async fn list_groups_rows(db: &PgPool, q: &ListQ) -> Result<Vec<GroupRow>> {
@@ -1040,7 +1054,11 @@ async fn summary(
     ServerKey: ServerKey,
     Query(q): Query<SinceQ>,
 ) -> std::result::Result<Json<Value>, ApiError> {
-    let window = q.since_secs.filter(|v| *v > 0).unwrap_or(86_400);
+    let window = q
+        .since_secs
+        .filter(|v| *v > 0)
+        .unwrap_or(86_400)
+        .min(MAX_SINCE_SECS);
     let from = OffsetDateTime::now_utc() - Duration::from_secs(window as u64);
     let (reports, groups, affected, affected_accounts, crashes): (i64, i64, i64, i64, i64) =
         sqlx::query_as(
@@ -1531,6 +1549,30 @@ async fn delete_note(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn since_clamps_huge_windows_instead_of_panicking() {
+        assert!(since(None).is_none());
+        assert!(since(Some(0)).is_none());
+        assert!(since(Some(-5)).is_none());
+        let far = since(Some(i64::MAX)).unwrap();
+        let cap = since(Some(MAX_SINCE_SECS)).unwrap();
+        assert!((far - cap).whole_seconds().abs() <= 1);
+        let hour = since(Some(3600)).unwrap();
+        assert!((OffsetDateTime::now_utc() - hour).whole_seconds() >= 3600);
+    }
+
+    #[test]
+    fn telemetry_key_matches_any_configured_key_only() {
+        let keys = vec!["alpha".to_string(), "beta-key".to_string()];
+        assert!(telemetry_key_ok(&keys, "alpha"));
+        assert!(telemetry_key_ok(&keys, "beta-key"));
+        assert!(!telemetry_key_ok(&keys, "alph"));
+        assert!(!telemetry_key_ok(&keys, "alphaa"));
+        assert!(!telemetry_key_ok(&keys, "Alpha"));
+        assert!(!telemetry_key_ok(&keys, ""));
+        assert!(!telemetry_key_ok(&[], "alpha"));
+    }
 
     #[test]
     fn fingerprint_ignores_numbers_and_addresses() {

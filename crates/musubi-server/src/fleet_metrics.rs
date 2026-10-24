@@ -74,12 +74,7 @@ impl Sample {
             return Err(Error::InvalidArgument("at most 32 custom gauges".into()));
         }
         for (k, v) in &self.custom {
-            if k.is_empty()
-                || k.len() > 64
-                || !k
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
-            {
+            if !valid_gauge_name(k) {
                 return Err(Error::InvalidArgument(format!(
                     "bad custom gauge name {k:?}"
                 )));
@@ -183,6 +178,14 @@ pub struct Transition {
     pub alert: Alert,
 }
 
+/// Name of a game-defined gauge (`custom.<key>` in samples and rules): 1..=64 of `[A-Za-z0-9_.]`.
+pub fn valid_gauge_name(k: &str) -> bool {
+    !k.is_empty()
+        && k.len() <= 64
+        && k.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
+}
+
 pub fn valid_rule_name(n: &str) -> bool {
     !n.is_empty()
         && n.len() <= 64
@@ -271,27 +274,22 @@ impl FleetMetricsService {
         breach: bool,
     ) -> Result<Vec<Transition>> {
         let mut out = Vec::new();
-        let open: Option<Alert> = sqlx::query_as(
-            "select id, fleet_id, server_id, rule, metric, severity, value, threshold, breach_since, fired_at, resolved_at
-             from musubi.fleet_alerts where server_id = $1 and rule = $2 and resolved_at is null",
-        )
-        .bind(server_id)
-        .bind(&r.name)
-        .fetch_optional(&self.db)
-        .await
-        .map_err(Error::internal)?;
+        let open = self.open_alert(server_id, &r.name).await?;
         let now = OffsetDateTime::now_utc();
         if breach {
             let a = match open {
                 Some(a) => a,
                 None => {
-                    let id = Uuid::now_v7();
-                    sqlx::query(
+                    // `fleet_alerts_open_idx` allows one open alert per (server, rule): when two
+                    // samples race, only one insert lands and the other must continue with the
+                    // row that won, not with an id that never existed.
+                    let inserted: Option<(Uuid, OffsetDateTime)> = sqlx::query_as(
                         "insert into musubi.fleet_alerts (id, fleet_id, server_id, rule, metric, severity, value, threshold)
                          values ($1, $2, $3, $4, $5, $6, $7, $8)
-                         on conflict do nothing",
+                         on conflict do nothing
+                         returning id, breach_since",
                     )
-                    .bind(id)
+                    .bind(Uuid::now_v7())
                     .bind(r.fleet_id)
                     .bind(server_id)
                     .bind(&r.name)
@@ -299,65 +297,87 @@ impl FleetMetricsService {
                     .bind(&r.severity)
                     .bind(value)
                     .bind(r.threshold)
-                    .execute(&self.db)
+                    .fetch_optional(&self.db)
                     .await
                     .map_err(Error::internal)?;
-                    Alert {
-                        id,
-                        fleet_id: r.fleet_id,
-                        server_id,
-                        rule: r.name.clone(),
-                        metric: r.metric.clone(),
-                        severity: r.severity.clone(),
-                        value: Some(value),
-                        threshold: r.threshold,
-                        breach_since: now,
-                        fired_at: None,
-                        resolved_at: None,
+                    match inserted {
+                        Some((id, breach_since)) => Alert {
+                            id,
+                            fleet_id: r.fleet_id,
+                            server_id,
+                            rule: r.name.clone(),
+                            metric: r.metric.clone(),
+                            severity: r.severity.clone(),
+                            value: Some(value),
+                            threshold: r.threshold,
+                            breach_since,
+                            fired_at: None,
+                            resolved_at: None,
+                        },
+                        None => self
+                            .open_alert(server_id, &r.name)
+                            .await?
+                            .ok_or_else(|| Error::internal("open alert vanished"))?,
                     }
                 }
             };
             let sustained = (now - a.breach_since).whole_seconds() >= r.for_secs as i64;
-            let fire = a.fired_at.is_none() && sustained;
-            sqlx::query(
-                "update musubi.fleet_alerts set value = $2, last_value_at = now(),
-                     fired_at = case when $3 then now() else fired_at end
-                 where id = $1",
-            )
-            .bind(a.id)
-            .bind(value)
-            .bind(fire)
-            .execute(&self.db)
-            .await
-            .map_err(Error::internal)?;
-            if fire {
-                out.push(Transition {
-                    kind: "fired",
-                    alert: Alert {
-                        value: Some(value),
-                        fired_at: Some(now),
-                        ..a
-                    },
-                });
-            }
-        } else if let Some(a) = open {
-            if a.fired_at.is_some() {
+            // the row decides who fires: of two racing samples only the one whose update still
+            // finds `fired_at` null reports the transition (one event, one webhook)
+            let fired: Option<OffsetDateTime> = if a.fired_at.is_none() && sustained {
+                sqlx::query_scalar(
+                    "update musubi.fleet_alerts set value = $2, last_value_at = now(), fired_at = now()
+                     where id = $1 and fired_at is null returning fired_at",
+                )
+                .bind(a.id)
+                .bind(value)
+                .fetch_optional(&self.db)
+                .await
+                .map_err(Error::internal)?
+            } else {
+                None
+            };
+            if fired.is_none() {
                 sqlx::query(
-                    "update musubi.fleet_alerts set resolved_at = now(), value = $2 where id = $1",
+                    "update musubi.fleet_alerts set value = $2, last_value_at = now() where id = $1",
                 )
                 .bind(a.id)
                 .bind(value)
                 .execute(&self.db)
                 .await
                 .map_err(Error::internal)?;
+            }
+            if let Some(at) = fired {
                 out.push(Transition {
-                    kind: "resolved",
+                    kind: "fired",
                     alert: Alert {
                         value: Some(value),
-                        resolved_at: Some(now),
+                        fired_at: Some(at),
                         ..a
                     },
                 });
+            }
+        } else if let Some(a) = open {
+            if a.fired_at.is_some() {
+                let resolved: Option<OffsetDateTime> = sqlx::query_scalar(
+                    "update musubi.fleet_alerts set resolved_at = now(), value = $2
+                     where id = $1 and resolved_at is null returning resolved_at",
+                )
+                .bind(a.id)
+                .bind(value)
+                .fetch_optional(&self.db)
+                .await
+                .map_err(Error::internal)?;
+                if let Some(at) = resolved {
+                    out.push(Transition {
+                        kind: "resolved",
+                        alert: Alert {
+                            value: Some(value),
+                            resolved_at: Some(at),
+                            ..a
+                        },
+                    });
+                }
             } else {
                 sqlx::query("delete from musubi.fleet_alerts where id = $1")
                     .bind(a.id)
@@ -429,6 +449,19 @@ impl FleetMetricsService {
         Ok(out)
     }
 
+    /// The one open (unresolved) alert of `rule` on `server_id`, if any.
+    async fn open_alert(&self, server_id: Uuid, rule: &str) -> Result<Option<Alert>> {
+        sqlx::query_as(
+            "select id, fleet_id, server_id, rule, metric, severity, value, threshold, breach_since, fired_at, resolved_at
+             from musubi.fleet_alerts where server_id = $1 and rule = $2 and resolved_at is null",
+        )
+        .bind(server_id)
+        .bind(rule)
+        .fetch_optional(&self.db)
+        .await
+        .map_err(Error::internal)
+    }
+
     pub async fn rules(&self, fleet_id: Uuid) -> Result<Vec<Rule>> {
         sqlx::query_as(
             "select fleet_id, name, metric, op, threshold, for_secs, severity, enabled, updated_at
@@ -444,7 +477,11 @@ impl FleetMetricsService {
         if !valid_rule_name(name) {
             return Err(Error::InvalidArgument("bad rule name".into()));
         }
-        if !METRICS.contains(&r.metric.as_str()) && !r.metric.starts_with("custom.") {
+        let custom_ok = r
+            .metric
+            .strip_prefix("custom.")
+            .is_some_and(valid_gauge_name);
+        if !METRICS.contains(&r.metric.as_str()) && !custom_ok {
             return Err(Error::InvalidArgument(format!(
                 "unknown metric {:?}; one of {} or custom.<key>",
                 r.metric,
@@ -554,39 +591,39 @@ impl FleetMetricsService {
         limit: i64,
     ) -> Result<Vec<Value>> {
         let limit = limit.clamp(1, 5000);
-        let since = if since_secs > 0 {
-            format!(
-                "and at > now() - make_interval(secs => {}::float8)",
-                since_secs
-            )
-        } else {
-            String::new()
-        };
+        // `since_secs <= 0` means the whole retention window; both knobs travel as bound
+        // parameters, never spliced into the statement text
+        let since_secs = since_secs.clamp(0, 10 * 365 * 86_400);
         let rows: Vec<Value> = if step_secs > 0 {
             let step = step_secs.clamp(1, 86_400);
-            sqlx::query_scalar(&format!(
+            sqlx::query_scalar(
                 "select to_jsonb(b) from (
-                    select to_timestamp(floor(extract(epoch from at) / {step}) * {step}) as at,
+                    select to_timestamp((floor(extract(epoch from at) / $4) * $4)::float8) as at,
                         count(*) as samples, avg(cpu_pct)::float8 as cpu_pct, max(cpu_pct)::float8 as cpu_pct_max,
                         avg(mem_bytes)::float8 as mem_bytes, max(mem_limit_bytes) as mem_limit_bytes,
                         avg(net_in_bps)::float8 as net_in_bps, avg(net_out_bps)::float8 as net_out_bps,
                         avg(tick_ms)::float8 as tick_ms, max(tick_p99_ms)::float8 as tick_p99_ms, avg(tick_hz)::float8 as tick_hz,
                         max(players) as players
-                    from musubi.server_metrics where server_id = $1 {since}
-                    group by 1 order by 1 desc limit $2) b"
-            ))
+                    from musubi.server_metrics
+                    where server_id = $1 and ($3 = 0 or at > now() - make_interval(secs => $3::float8))
+                    group by 1 order by 1 desc limit $2) b",
+            )
             .bind(server_id)
             .bind(limit)
+            .bind(since_secs)
+            .bind(step)
             .fetch_all(&self.db)
             .await
             .map_err(Error::internal)?
         } else {
-            sqlx::query_scalar(&format!(
+            sqlx::query_scalar(
                 "select to_jsonb(m) - 'id' - 'fleet_id' - 'server_id' from musubi.server_metrics m
-                 where server_id = $1 {since} order by at desc limit $2"
-            ))
+                 where server_id = $1 and ($3 = 0 or at > now() - make_interval(secs => $3::float8))
+                 order by at desc limit $2",
+            )
             .bind(server_id)
             .bind(limit)
+            .bind(since_secs)
             .fetch_all(&self.db)
             .await
             .map_err(Error::internal)?
@@ -603,6 +640,7 @@ impl FleetMetricsService {
         stale_secs: i64,
     ) -> Result<Value> {
         let window = window_secs.clamp(10, 7 * 86_400);
+        let stale_secs = stale_secs.clamp(1, 7 * 86_400);
         let servers: Vec<Value> = sqlx::query_scalar(
             "select to_jsonb(x) from (
                 select g.id as server_id, g.state, g.players as reported_players, g.capacity,
@@ -668,6 +706,148 @@ impl FleetMetricsService {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn test_db() -> Option<PgPool> {
+        let url = std::env::var("MUSUBI_TEST_DATABASE_URL").ok()?;
+        let db = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(4)
+            .connect(&url)
+            .await
+            .ok()?;
+        crate::db::migrate(&db).await.ok()?;
+        Some(db)
+    }
+
+    async fn fleet_row(db: &PgPool) -> Uuid {
+        let id = Uuid::now_v7();
+        sqlx::query("insert into musubi.fleets (id, name) values ($1, $2)")
+            .bind(id)
+            .bind(format!("audit-metrics-{id}"))
+            .execute(db)
+            .await
+            .unwrap();
+        id
+    }
+
+    #[test]
+    fn gauge_names_are_bounded() {
+        assert!(valid_gauge_name("entities"));
+        assert!(valid_gauge_name("ai.active_1"));
+        assert!(!valid_gauge_name(""));
+        assert!(!valid_gauge_name("bad key"));
+        assert!(!valid_gauge_name("x'; drop"));
+        assert!(!valid_gauge_name(&"a".repeat(65)));
+    }
+
+    #[tokio::test]
+    async fn rule_custom_metric_key_is_validated() {
+        let Some(db) = test_db().await else { return };
+        let fleet = fleet_row(&db).await;
+        let svc = FleetMetricsService::new(db);
+        let input = |metric: &str| RuleInput {
+            metric: metric.into(),
+            op: "gt".into(),
+            threshold: 1.0,
+            for_secs: 0,
+            severity: "warning".into(),
+            enabled: true,
+        };
+        assert!(svc
+            .put_rule(fleet, "ok", input("custom.entities"))
+            .await
+            .is_ok());
+        assert!(svc
+            .put_rule(fleet, "empty", input("custom."))
+            .await
+            .is_err());
+        assert!(svc
+            .put_rule(fleet, "space", input("custom.bad key"))
+            .await
+            .is_err());
+        assert!(svc
+            .put_rule(fleet, "long", input(&format!("custom.{}", "a".repeat(65))))
+            .await
+            .is_err());
+        assert!(svc.put_rule(fleet, "unknown", input("nope")).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn history_filters_with_bound_parameters() {
+        let Some(db) = test_db().await else { return };
+        let fleet = fleet_row(&db).await;
+        let svc = FleetMetricsService::new(db);
+        let sid = Uuid::now_v7();
+        let sample = Sample {
+            cpu_pct: Some(42.0),
+            players: Some(2),
+            ..Default::default()
+        };
+        svc.ingest(fleet, sid, &sample).await.unwrap();
+        assert_eq!(svc.history(sid, 0, 0, 10).await.unwrap().len(), 1);
+        assert_eq!(svc.history(sid, -1, 0, 10).await.unwrap().len(), 1);
+        assert_eq!(svc.history(sid, 3600, 0, 10).await.unwrap().len(), 1);
+        assert_eq!(svc.history(sid, i64::MAX, 0, 10).await.unwrap().len(), 1);
+        let bucketed = svc.history(sid, 3600, 60, 10).await.unwrap();
+        assert_eq!(bucketed.len(), 1);
+        assert_eq!(bucketed[0]["samples"], 1);
+        assert_eq!(bucketed[0]["players"], 2);
+        assert_eq!(svc.history(sid, 3600, i64::MAX, 10).await.unwrap().len(), 1);
+        assert!(svc.summary(fleet, 300, -1).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn concurrent_breaches_open_exactly_one_alert() {
+        let Some(db) = test_db().await else { return };
+        let fleet = fleet_row(&db).await;
+        let svc = FleetMetricsService::new(db.clone());
+        let rule = svc
+            .put_rule(
+                fleet,
+                "cpu",
+                RuleInput {
+                    metric: "cpu_pct".into(),
+                    op: "gt".into(),
+                    threshold: 90.0,
+                    for_secs: 0,
+                    severity: "warning".into(),
+                    enabled: true,
+                },
+            )
+            .await
+            .unwrap();
+        let sid = Uuid::now_v7();
+        let (a, b) = tokio::join!(
+            svc.evaluate(&rule, sid, 95.0, true),
+            svc.evaluate(&rule, sid, 96.0, true)
+        );
+        let transitions: Vec<Transition> = a.unwrap().into_iter().chain(b.unwrap()).collect();
+        let open: Vec<Uuid> = sqlx::query_scalar(
+            "select id from musubi.fleet_alerts where server_id = $1 and rule = 'cpu' and resolved_at is null",
+        )
+        .bind(sid)
+        .fetch_all(&db)
+        .await
+        .unwrap();
+        assert_eq!(open.len(), 1, "one open alert per (server, rule)");
+        assert!(!transitions.is_empty());
+        for t in &transitions {
+            assert_eq!(t.kind, "fired");
+            assert_eq!(
+                t.alert.id, open[0],
+                "transition must carry the stored alert id"
+            );
+        }
+        // the losing sample must not have raised a second `fired`
+        assert_eq!(transitions.len(), 1, "{transitions:?}");
+        let (a, b) = tokio::join!(
+            svc.evaluate(&rule, sid, 10.0, false),
+            svc.evaluate(&rule, sid, 11.0, false)
+        );
+        let resolved: Vec<Transition> = a.unwrap().into_iter().chain(b.unwrap()).collect();
+        assert_eq!(resolved.len(), 1, "{resolved:?}");
+        assert_eq!(resolved[0].kind, "resolved");
+        assert_eq!(resolved[0].alert.id, open[0]);
+    }
 
     #[test]
     fn derived_metrics_and_custom_paths() {

@@ -1076,7 +1076,29 @@ async fn stream(
 ) -> Result<Response, Response> {
     ensure_shard(&s, &w, &uri).await?;
     let codec = q.codec();
-    Ok(ws.on_upgrade(move |socket| serve_stream(s, w, q.sim, q.delta(), codec, uri, socket)))
+    Ok(ws
+        .max_message_size(SIM_WS_MAX_MESSAGE)
+        .max_frame_size(SIM_WS_MAX_MESSAGE)
+        .on_upgrade(move |socket| serve_stream(s, w, q.sim, q.delta(), codec, uri, socket)))
+}
+
+/// Largest command a simulator may send on `/stream` (tungstenite would otherwise accept 64 MiB
+/// and buffer it): a `net_meta` carries `NET_MAX_META` (256 KiB) of base64, components stay far
+/// below that.
+const SIM_WS_MAX_MESSAGE: usize = 4 * 1024 * 1024;
+// base64 of a NET_MAX_META payload plus its JSON envelope must fit under the cap
+const _: () = assert!(NET_MAX_META.div_ceil(3) * 4 + 4096 < SIM_WS_MAX_MESSAGE);
+
+/// What a simulator sees of an error: internal failures are traced here and reported generically,
+/// like `ApiError` does over HTTP.
+fn err_text(e: &Error) -> String {
+    match e {
+        Error::Internal(_) => {
+            tracing::error!(error = %e, "sim stream request failed");
+            "internal error".to_string()
+        }
+        other => other.to_string(),
+    }
 }
 
 async fn serve_stream(
@@ -1123,7 +1145,7 @@ async fn serve_stream(
                 };
                 let frame = match tick_frame(&s, &w, sim, t, known.as_mut()) {
                     Ok(f) => f,
-                    Err(e) => json!({ "type": "error", "tick": t, "error": e.to_string() }),
+                    Err(e) => json!({ "type": "error", "tick": t, "error": err_text(&e) }),
                 };
                 slot.send(codec.message(&frame));
             }
@@ -1422,7 +1444,7 @@ async fn stream_command(s: &AppState, w: &str, sim: Uuid, uri: &OriginalUri, cmd
     match r {
         Ok(v) => v,
         Err(e) => {
-            let mut reply = json!({ "op": op, "error": e.to_string() });
+            let mut reply = json!({ "op": op, "error": err_text(&e) });
             if let Some(id) = cmd_id {
                 reply["id"] = id;
             }
@@ -1477,4 +1499,21 @@ async fn tx_status(
     ensure_shard(&s, &w, &uri).await?;
     let res: Result<Json<Value>, ApiError> = async { Ok(Json(s.worlds.tx_status(&w, id)?)) }.await;
     res.map_err(IntoResponse::into_response)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn internal_errors_are_not_echoed_to_simulators() {
+        assert_eq!(
+            err_text(&Error::internal("pool timed out: postgres://user:pw@db")),
+            "internal error"
+        );
+        let e = Error::InvalidArgument("x and y go together".into());
+        assert_eq!(err_text(&e), e.to_string());
+        let e = Error::NotFound("world w".into());
+        assert_eq!(err_text(&e), e.to_string());
+    }
 }

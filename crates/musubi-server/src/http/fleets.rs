@@ -689,6 +689,7 @@ async fn server_logs(
     Query(q): Query<LogsQ>,
 ) -> Result<Json<Value>, ApiError> {
     let (fid, sid) = (parse(&id)?, parse(&sid)?);
+    owned_server(&s, fid, sid).await?;
     let mut filter = q.filter;
     if filter.limit == 0 {
         filter.limit = 200;
@@ -1082,6 +1083,9 @@ async fn rollout_rollback(
     body: Option<Json<RollbackReq>>,
 ) -> Result<Json<musubi_fleet::Rollout>, ApiError> {
     let reason = body.map(|b| b.0.reason).unwrap_or_default();
+    if reason.len() > 256 {
+        return Err(Error::InvalidArgument("reason ≤ 256 bytes".into()).into());
+    }
     let reason = if reason.is_empty() {
         "operator"
     } else {
@@ -1404,6 +1408,9 @@ async fn put_alias(
     }
     if !b.metadata.is_object() {
         return Err(Error::InvalidArgument("metadata must be an object".into()).into());
+    }
+    if b.metadata.to_string().len() > 16 * 1024 {
+        return Err(Error::InvalidArgument("metadata ≤ 16 KiB".into()).into());
     }
     let target = b.target.filter(|t| !t.is_empty());
     match b.routing.as_str() {
