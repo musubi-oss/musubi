@@ -713,13 +713,22 @@ pub async fn join_live_event(s: &AppState, account: AccountId, id: &str) -> Resu
     let ends_at = ev
         .participation_secs
         .map_or(cycle_end, |p| (now + p).min(cycle_end));
+    // count + insert run under a per-(event, cycle) advisory lock so concurrent joins cannot
+    // overshoot `max_participants`
+    let mut tx = s.db.begin().await.map_err(Error::internal)?;
     if let Some(max) = ev.max_participants {
+        sqlx::query("select pg_advisory_xact_lock(hashtext($1), hashtext($2))")
+            .bind(format!("live_event_join:{id}"))
+            .bind(cycle.to_string())
+            .execute(&mut *tx)
+            .await
+            .map_err(Error::internal)?;
         let n: i64 = sqlx::query_scalar(
             "select count(*) from musubi.live_event_participants where event_id = $1 and cycle_started_at = $2",
         )
         .bind(id)
         .bind(cycle)
-        .fetch_one(&s.db)
+        .fetch_one(&mut *tx)
         .await
         .map_err(Error::internal)?;
         let already: bool = sqlx::query_scalar(
@@ -728,7 +737,7 @@ pub async fn join_live_event(s: &AppState, account: AccountId, id: &str) -> Resu
         .bind(id)
         .bind(cycle)
         .bind(account.0)
-        .fetch_one(&s.db)
+        .fetch_one(&mut *tx)
         .await
         .map_err(Error::internal)?;
         if n >= max && !already {
@@ -746,9 +755,10 @@ pub async fn join_live_event(s: &AppState, account: AccountId, id: &str) -> Resu
     .bind(cycle)
     .bind(now)
     .bind(ends_at)
-    .fetch_one(&s.db)
+    .fetch_one(&mut *tx)
     .await
     .map_err(Error::internal)?;
+    tx.commit().await.map_err(Error::internal)?;
     Ok(json!({
         "id": id, "joined": true, "already": !inserted, "cycle_started_at": cycle,
         "joined_at": joined_at, "participation_ends_at": ends_at,

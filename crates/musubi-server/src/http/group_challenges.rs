@@ -77,6 +77,9 @@ pub struct CreateReq {
     pub metadata: Value,
 }
 
+/// Longest window a challenge may span (10 years); keeps `starts_at + duration` in range.
+const MAX_WINDOW_SECS: i64 = 10 * 366 * 86_400;
+
 fn default_kind() -> String {
     "challenge".into()
 }
@@ -147,15 +150,29 @@ async fn create(
     if r.kind == "war" && r.groups.len() < 2 {
         return Err(Error::InvalidArgument("a war needs at least two groups".into()).into());
     }
+    if r.groups.len() > 64 {
+        return Err(Error::InvalidArgument("groups: at most 64".into()).into());
+    }
+    if r.metric.is_empty() || r.metric.len() > 64 {
+        return Err(Error::InvalidArgument("metric: 1..64 characters".into()).into());
+    }
     let now = OffsetDateTime::now_utc();
     let starts_at = r.starts_at.unwrap_or(now);
     let ends_at = match (r.ends_at, r.duration_secs) {
         (Some(e), _) => e,
-        (None, Some(d)) if d > 0 => starts_at + time::Duration::seconds(d),
-        _ => return Err(Error::InvalidArgument("ends_at or duration_secs required".into()).into()),
+        (None, Some(d)) if d > 0 && d <= MAX_WINDOW_SECS => starts_at + time::Duration::seconds(d),
+        _ => {
+            return Err(Error::InvalidArgument(
+                "ends_at or duration_secs (1..10 years) required".into(),
+            )
+            .into())
+        }
     };
-    if ends_at <= starts_at {
-        return Err(Error::InvalidArgument("ends_at must be after starts_at".into()).into());
+    if ends_at <= starts_at || ends_at - starts_at > time::Duration::seconds(MAX_WINDOW_SECS) {
+        return Err(Error::InvalidArgument(
+            "ends_at must be after starts_at, at most 10 years later".into(),
+        )
+        .into());
     }
     if let Some(t) = &r.rewards.treasury {
         if t.amount <= 0 || t.currency.is_empty() {
@@ -479,9 +496,15 @@ pub async fn settle(s: &AppState, c: &Challenge) -> Result<Option<Uuid>> {
             .await
             .map_err(Error::internal)?;
         if let Some(t) = &rewards.treasury {
-            s.economy
+            // the row is already marked settled: a failed treasury credit must not abort the
+            // member/participant payouts below (they would never be retried)
+            if let Err(e) = s
+                .economy
                 .treasury_grant(w, &t.currency, t.amount, &reference)
-                .await?;
+                .await
+            {
+                tracing::warn!(challenge = %c.id, group = %w, error = %e, "treasury prize failed");
+            }
         }
         if let Some(table) = &rewards.winner_table {
             let members: Vec<Uuid> = sqlx::query_scalar(

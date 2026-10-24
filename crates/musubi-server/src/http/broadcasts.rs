@@ -130,7 +130,7 @@ pub fn run_local(s: &AppState, b: Broadcast) -> Arc<Status> {
     statuses().insert(b.id, st.clone());
     let (s, st2) = (s.clone(), st.clone());
     tokio::spawn(async move {
-        for (i, chunk) in ids.chunks(b.batch_size).enumerate() {
+        for (i, chunk) in ids.chunks(b.batch_size.max(1)).enumerate() {
             if i > 0 && b.batch_interval_ms > 0 {
                 tokio::time::sleep(Duration::from_millis(b.batch_interval_ms)).await;
             }
@@ -185,7 +185,7 @@ async fn start(
         return Ok(Json(json!({
             "dry_run": true, "local_targets": local,
             "batches": local.div_ceil(b.batch_size),
-            "estimated_secs": (local.div_ceil(b.batch_size).saturating_sub(1) as u64 * b.batch_interval_ms) as f64 / 1000.0,
+            "estimated_secs": (local.div_ceil(b.batch_size).saturating_sub(1) as u64).saturating_mul(b.batch_interval_ms) as f64 / 1000.0,
         })));
     }
     let mut nodes = 1;
@@ -233,8 +233,16 @@ pub fn start_sync(s: AppState) {
         loop {
             match rx.recv().await {
                 Ok(m) if m.topic == TOPIC && m.origin != me => {
-                    if let Ok(b) = m.decode::<Broadcast>() {
-                        run_local(&s, b);
+                    // a peer's payload is still untrusted input for this node (older/newer
+                    // version, replayed frame): apply the same limits as the HTTP route
+                    match m.decode::<Broadcast>() {
+                        Ok(b) if validate(&b).is_ok() => {
+                            run_local(&s, b);
+                        }
+                        Ok(b) => {
+                            tracing::warn!(broadcast = %b.id, "ignoring invalid relayed broadcast")
+                        }
+                        Err(_) => {}
                     }
                 }
                 Ok(_) => {}

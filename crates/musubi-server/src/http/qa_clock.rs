@@ -101,12 +101,22 @@ fn cache() -> &'static Cache {
     C.get_or_init(Default::default)
 }
 
+/// Entries the per-account cache may hold before stale ones are swept on insert.
+const CACHE_MAX: usize = 50_000;
+
 fn forget(account: Uuid) {
-    cache().write().unwrap().remove(&account);
+    cache()
+        .write()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&account);
 }
 
 async fn load(s: &AppState, account: Uuid) -> Result<Option<Clock>> {
-    if let Some((at, c)) = cache().read().unwrap().get(&account) {
+    if let Some((at, c)) = cache()
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&account)
+    {
         if at.elapsed().as_secs() < CACHE_SECS {
             return Ok(c.clone());
         }
@@ -119,10 +129,13 @@ async fn load(s: &AppState, account: Uuid) -> Result<Option<Clock>> {
     .await
     .map_err(Error::internal)?;
     let c = row.as_ref().map(clock_of);
-    cache()
-        .write()
-        .unwrap()
-        .insert(account, (Instant::now(), c.clone()));
+    let mut w = cache().write().unwrap_or_else(|e| e.into_inner());
+    if w.len() >= CACHE_MAX {
+        // every account that ever touched a liveops route lands here: drop expired entries
+        // instead of growing forever
+        w.retain(|_, (at, _)| at.elapsed().as_secs() < CACHE_SECS);
+    }
+    w.insert(account, (Instant::now(), c.clone()));
     Ok(c)
 }
 
@@ -202,7 +215,7 @@ async fn put_clock(
             return Err(Error::InvalidArgument("at and offset_secs are exclusive".into()).into())
         }
         (Some(at), None) => {
-            if (at - real).abs() > MAX_SHIFT_SECS || at < 0 {
+            if at < 0 || at.abs_diff(real) > MAX_SHIFT_SECS as u64 {
                 return Err(
                     Error::InvalidArgument("at: within 20 years of the real clock".into()).into(),
                 );
@@ -210,7 +223,7 @@ async fn put_clock(
             ("fixed", Some(at), None)
         }
         (None, Some(o)) => {
-            if o == 0 || o.abs() > MAX_SHIFT_SECS {
+            if o == 0 || o.unsigned_abs() > MAX_SHIFT_SECS as u64 {
                 return Err(Error::InvalidArgument(
                     "offset_secs: non-zero, within 20 years".into(),
                 )

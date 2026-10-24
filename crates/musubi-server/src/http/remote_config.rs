@@ -988,6 +988,21 @@ pub struct LogicRule {
     pub message: Option<String>,
 }
 
+/// Clients open these URLs: an absolute URL with a scheme that is not a script/data/file
+/// vector. Store deep links (`market://`, `itms-apps://`) stay allowed.
+fn is_safe_url(u: &str) -> bool {
+    if u.len() > 2048 {
+        return false;
+    }
+    match reqwest::Url::parse(u) {
+        Ok(url) => !matches!(
+            url.scheme(),
+            "javascript" | "data" | "file" | "vbscript" | "blob" | "about"
+        ),
+        Err(_) => false,
+    }
+}
+
 fn validate_logic_rules(rules: &[LogicRule]) -> Result<(), Error> {
     if rules.len() > 32 {
         return Err(Error::InvalidArgument("at most 32 logic rules".into()));
@@ -1079,6 +1094,22 @@ async fn put_client_version(
                 Error::InvalidArgument("redirect: min_version and url required".into()).into(),
             );
         }
+        if !is_safe_url(&r.url) {
+            return Err(Error::InvalidArgument(
+                "redirect.url: absolute URL (no javascript:/data:/file:), at most 2048 chars"
+                    .into(),
+            )
+            .into());
+        }
+    }
+    if b.store_url.as_deref().is_some_and(|u| !is_safe_url(u)) {
+        return Err(Error::InvalidArgument(
+            "store_url: absolute URL (no javascript:/data:/file:), at most 2048 chars".into(),
+        )
+        .into());
+    }
+    if b.message.as_deref().is_some_and(|m| m.len() > 2000) {
+        return Err(Error::InvalidArgument("message: at most 2000 chars".into()).into());
     }
     if let (Some(min), Some(latest)) = (&b.min_version, &b.latest_version) {
         if cmp_version(min, latest) == Ordering::Greater {
@@ -1349,13 +1380,19 @@ struct LogicRuleBody {
     message: Option<String>,
 }
 
-async fn load_logic_rules(s: &AppState, platform: &str) -> Result<Vec<LogicRule>, ApiError> {
-    let row: Option<Value> =
-        sqlx::query_scalar("select logic_rules from musubi.client_versions where platform = $1")
-            .bind(platform)
-            .fetch_optional(&s.db)
-            .await
-            .map_err(Error::internal)?;
+/// Locks the platform row for the rest of the transaction: two hotfix PUTs for different logic
+/// versions must not overwrite each other's read-modify-write.
+async fn load_logic_rules(
+    tx: &mut sqlx::PgConnection,
+    platform: &str,
+) -> Result<Vec<LogicRule>, ApiError> {
+    let row: Option<Value> = sqlx::query_scalar(
+        "select logic_rules from musubi.client_versions where platform = $1 for update",
+    )
+    .bind(platform)
+    .fetch_optional(tx)
+    .await
+    .map_err(Error::internal)?;
     match row {
         Some(v) => Ok(serde_json::from_value(v).unwrap_or_default()),
         None => Err(Error::NotFound(format!("client_versions/{platform}")).into()),
@@ -1364,6 +1401,7 @@ async fn load_logic_rules(s: &AppState, platform: &str) -> Result<Vec<LogicRule>
 
 async fn save_logic_rules(
     s: &AppState,
+    mut tx: sqlx::Transaction<'_, sqlx::Postgres>,
     platform: &str,
     rules: &[LogicRule],
     logic_version: i64,
@@ -1375,9 +1413,10 @@ async fn save_logic_rules(
     )
     .bind(platform)
     .bind(serde_json::to_value(rules).unwrap_or(json!([])))
-    .execute(&s.db)
+    .execute(&mut *tx)
     .await
     .map_err(Error::internal)?;
+    tx.commit().await.map_err(Error::internal)?;
     s.events
         .emit(
             "client_version.updated",
@@ -1397,7 +1436,8 @@ async fn put_logic_rule(
     Json(b): Json<LogicRuleBody>,
 ) -> Result<Json<Value>, ApiError> {
     let platform = platform.to_ascii_lowercase();
-    let mut rules = load_logic_rules(&s, &platform).await?;
+    let mut tx = s.db.begin().await.map_err(Error::internal)?;
+    let mut rules = load_logic_rules(&mut tx, &platform).await?;
     rules.retain(|l| l.logic_version != logic_version);
     rules.push(LogicRule {
         logic_version,
@@ -1406,7 +1446,7 @@ async fn put_logic_rule(
         message: b.message,
     });
     rules.sort_by_key(|l| l.logic_version);
-    save_logic_rules(&s, &platform, &rules, logic_version, "upsert").await
+    save_logic_rules(&s, tx, &platform, &rules, logic_version, "upsert").await
 }
 
 /// Retire a logic version: clients on it get `logic_supported: false`.
@@ -1416,11 +1456,12 @@ async fn delete_logic_rule(
     Path((platform, logic_version)): Path<(String, i64)>,
 ) -> Result<Json<Value>, ApiError> {
     let platform = platform.to_ascii_lowercase();
-    let mut rules = load_logic_rules(&s, &platform).await?;
+    let mut tx = s.db.begin().await.map_err(Error::internal)?;
+    let mut rules = load_logic_rules(&mut tx, &platform).await?;
     let before = rules.len();
     rules.retain(|l| l.logic_version != logic_version);
     if rules.len() == before {
         return Err(Error::NotFound(format!("logic version {logic_version}")).into());
     }
-    save_logic_rules(&s, &platform, &rules, logic_version, "delete").await
+    save_logic_rules(&s, tx, &platform, &rules, logic_version, "delete").await
 }

@@ -526,7 +526,12 @@ async fn mark_read(
     Bearer(me): Bearer,
     Path(id): Path<Uuid>,
 ) -> Result<Json<Value>, ApiError> {
-    load(&s, id).await?;
+    // only what the caller can see: no read marks (or existence oracle) for disabled,
+    // unpublished, expired or audience-gated items
+    let rows = visible(&s, me.account_id).await?;
+    if !rows.iter().any(|r| r.id == id) {
+        return Err(Error::NotFound("news item".into()).into());
+    }
     sqlx::query(
         "insert into musubi.news_reads (news_id, account_id) values ($1, $2) on conflict do nothing",
     )
@@ -535,7 +540,6 @@ async fn mark_read(
     .execute(&s.db)
     .await
     .map_err(Error::internal)?;
-    let rows = visible(&s, me.account_id).await?;
     let ids: Vec<Uuid> = rows.iter().map(|r| r.id).collect();
     let read = read_set(&s, me.account_id, &ids).await?;
     Ok(Json(

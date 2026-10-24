@@ -28,6 +28,8 @@ static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 /// account → (lang, fetched at); languages change rarely, one minute of staleness is fine.
 static LANGS: OnceLock<DashMap<Uuid, (String, Instant)>> = OnceLock::new();
 const LANG_TTL: Duration = Duration::from_secs(60);
+/// Cached accounts before expired entries are swept (the map otherwise only shrinks on `forget`).
+const LANGS_MAX: usize = 50_000;
 const MAX_TEXT: usize = 4096;
 
 /// `en-US` → `en`; empty/odd values → `en`.
@@ -79,6 +81,9 @@ impl Translator {
                     .fetch_all(&self.db)
                     .await
                     .unwrap_or_default();
+            if cache.len() >= LANGS_MAX {
+                cache.retain(|_, (_, at)| now.duration_since(*at) < LANG_TTL);
+            }
             for (id, lang) in rows {
                 let lang = base_lang(&lang);
                 cache.insert(id, (lang.clone(), now));

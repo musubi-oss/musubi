@@ -574,28 +574,43 @@ async fn step(
         .into());
     }
     let done = target == d.3;
-    sqlx::query(
-        "update musubi.tutorial_progress set step = $3, updated_at = now(),
-            state = case when $4 then 'completed' else state end,
-            completed_at = case when $4 then now() else completed_at end
-         where account_id = $1 and tutorial_id = $2",
+    // conditional update: a concurrent step/complete for the same row loses here instead of
+    // completing (and paying the reward table) a second time
+    // `rewarded_at` is stamped with the first completion: a later re-completion (after a
+    // player reset) sees `first_pay = false` and does not pay the table again
+    let moved: Option<bool> = sqlx::query_scalar(
+        "with old as (select rewarded_at from musubi.tutorial_progress where account_id = $1 and tutorial_id = $2)
+         update musubi.tutorial_progress t set step = $3, updated_at = now(),
+            state = case when $4 then 'completed' else t.state end,
+            completed_at = case when $4 then now() else t.completed_at end,
+            rewarded_at = case when $4 and $5 then coalesce(t.rewarded_at, now()) else t.rewarded_at end
+         from old
+         where t.account_id = $1 and t.tutorial_id = $2 and t.state = 'accepted' and t.step < $3
+         returning (old.rewarded_at is null)",
     )
     .bind(me.account_id.0)
     .bind(&id)
     .bind(target)
     .bind(done)
-    .execute(&s.db)
+    .bind(d.4.is_some())
+    .fetch_optional(&s.db)
     .await
     .map_err(Error::internal)?;
+    let Some(first_pay) = moved else {
+        return Err(Error::Conflict(format!("tutorial {id} is not accepted")).into());
+    };
     let mut rewards = Value::Null;
-    if done {
+    if done && !first_pay {
+        rewards = json!([]);
+    }
+    if done && first_pay {
         if let Some(t) = d.4.as_deref() {
             let reference = format!("tutorial:{id}:{}", me.account_id.0);
             rewards = match s.economy.grant_table(me.account_id, t, &reference).await {
                 Ok(r) => json!(r),
                 Err(e) => {
                     tracing::warn!(tutorial = %id, error = %e, "tutorial reward grant failed");
-                    json!({ "error": e.to_string() })
+                    json!({ "error": "reward grant failed" })
                 }
             };
         }

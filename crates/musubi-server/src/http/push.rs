@@ -33,6 +33,15 @@ pub fn routes() -> Router<AppState> {
 }
 
 const MAX_RECIPIENTS: usize = 10_000;
+/// Outbound provider requests in flight at once for `deliver` (a 10k-recipient send used to
+/// spawn 10k concurrent HTTP calls).
+const MAX_INFLIGHT: usize = 64;
+
+fn inflight() -> &'static std::sync::Arc<tokio::sync::Semaphore> {
+    static S: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> =
+        std::sync::OnceLock::new();
+    S.get_or_init(|| std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_INFLIGHT)))
+}
 
 #[derive(Deserialize)]
 struct Template {
@@ -227,6 +236,12 @@ async fn resolve(
     if t.trim().is_empty() || t.chars().count() > 256 {
         return Err(Error::InvalidArgument("title 1..=256 chars".into()));
     }
+    if b.chars().count() > 2048 {
+        return Err(Error::InvalidArgument("body ≤ 2048 chars".into()));
+    }
+    if d.to_string().len() > 16 * 1024 {
+        return Err(Error::InvalidArgument("data must be <= 16 KiB".into()));
+    }
     Ok((t, b, d, c))
 }
 
@@ -374,7 +389,13 @@ async fn deliver(
             .map_err(Error::internal)?;
         }
         let push = push.clone();
+        let permit = inflight()
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(Error::internal)?;
         tokio::spawn(async move {
+            let _permit = permit;
             if let Err(e) = push.send(AccountId(id), &t, &d, code).await {
                 tracing::warn!(error = %e, "push delivery failed");
             }

@@ -508,11 +508,7 @@ fn parse_subscription(token: &str) -> Result<Subscription> {
         Error::InvalidArgument("webpush token must be the PushSubscription JSON".into())
     })?;
     let endpoint = v["endpoint"].as_str().unwrap_or("");
-    if !(endpoint.starts_with("https://") || endpoint.starts_with("http://")) {
-        return Err(Error::InvalidArgument(
-            "webpush subscription needs an http(s) endpoint".into(),
-        ));
-    }
+    check_endpoint(endpoint)?;
     let key = |k: &str| -> Result<Vec<u8>> {
         v["keys"][k]
             .as_str()
@@ -538,6 +534,73 @@ fn parse_subscription(token: &str) -> Result<Subscription> {
         p256dh,
         auth,
     })
+}
+
+/// Where a push service may live. The subscription comes from the player, so the endpoint is
+/// attacker-controlled and the node POSTs to it (SSRF surface): only `https://` is accepted —
+/// except plain `http://` to a loopback address (local push mocks) — and literal addresses in
+/// private, link-local (cloud metadata), unspecified or multicast ranges are refused outright.
+fn check_endpoint(endpoint: &str) -> Result<()> {
+    let bad = |m: &str| Error::InvalidArgument(format!("webpush subscription endpoint: {m}"));
+    if endpoint.len() > 2048 {
+        return Err(bad("at most 2048 chars"));
+    }
+    let url = reqwest::Url::parse(endpoint).map_err(|_| bad("not a valid URL"))?;
+    let scheme = url.scheme();
+    if scheme != "https" && scheme != "http" {
+        return Err(bad("must be https://"));
+    }
+    let host = url.host_str().ok_or_else(|| bad("host required"))?;
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    let ip: Option<std::net::IpAddr> = host.parse().ok().or_else(|| {
+        host.eq_ignore_ascii_case("localhost")
+            .then_some(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST))
+    });
+    let loopback = ip.is_some_and(|ip| ip.is_loopback());
+    if let Some(ip) = ip {
+        if !loopback && !is_public_ip(ip) {
+            return Err(bad("private, link-local or reserved address"));
+        }
+    }
+    if scheme == "http" && !loopback {
+        return Err(bad("must be https://"));
+    }
+    if url.username() != "" || url.password().is_some() {
+        return Err(bad("credentials are not allowed"));
+    }
+    Ok(())
+}
+
+fn is_public_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(a) => {
+            let o = a.octets();
+            !(a.is_private()
+                || a.is_link_local()
+                || a.is_loopback()
+                || a.is_unspecified()
+                || a.is_broadcast()
+                || a.is_multicast()
+                || a.is_documentation()
+                || o[0] == 0
+                || (o[0] == 100 && (o[1] & 0xc0) == 64)
+                || (o[0] == 192 && o[1] == 0 && o[2] == 0)
+                || o[0] >= 240)
+        }
+        std::net::IpAddr::V6(a) => {
+            let s = a.segments();
+            if let Some(v4) = a.to_ipv4_mapped() {
+                return is_public_ip(std::net::IpAddr::V4(v4));
+            }
+            !(a.is_loopback()
+                || a.is_unspecified()
+                || a.is_multicast()
+                || (s[0] & 0xfe00) == 0xfc00
+                || (s[0] & 0xffc0) == 0xfe80
+                || (s[0] == 0x2001 && s[1] == 0x0db8)
+                || (s[0] == 0x0064 && s[1] == 0xff9b))
+        }
+    }
 }
 
 struct Len(usize);
@@ -707,5 +770,42 @@ mod tests {
         let mut bad = good.clone();
         bad["endpoint"] = json!("ftp://x");
         assert!(parse_subscription(&bad.to_string()).is_err());
+    }
+
+    /// The endpoint is player-supplied and the node POSTs to it: no plain http to the outside,
+    /// no private / link-local / metadata / loopback-by-ip-literal tricks; loopback stays
+    /// available for local push mocks.
+    #[test]
+    fn endpoint_policy_blocks_ssrf_targets() {
+        for ok in [
+            "https://fcm.googleapis.com/fcm/send/abc",
+            "https://updates.push.services.mozilla.com/wpush/v2/x",
+            "http://127.0.0.1:8080/ok",
+            "http://localhost:9000/mock",
+            "http://[::1]:7000/mock",
+            "https://8.8.8.8/x",
+        ] {
+            assert!(check_endpoint(ok).is_ok(), "{ok}");
+        }
+        for bad in [
+            "http://169.254.169.254/latest/meta-data/",
+            "https://169.254.169.254/latest/meta-data/",
+            "http://10.0.0.5/admin",
+            "https://10.0.0.5/admin",
+            "https://172.16.3.4/",
+            "https://192.168.1.1/",
+            "https://100.64.0.1/",
+            "https://0.0.0.0/",
+            "https://[fd00::1]/",
+            "https://[fe80::1]/",
+            "https://[::ffff:10.0.0.1]/",
+            "http://push.example.com/plain",
+            "https://user:pw@push.example.com/",
+            "ftp://push.example.com/",
+            "https://",
+            "not a url",
+        ] {
+            assert!(check_endpoint(bad).is_err(), "{bad}");
+        }
     }
 }

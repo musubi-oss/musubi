@@ -310,18 +310,25 @@ async fn save_experiment(s: &AppState, id: &str, b: ExperimentBody) -> Result<Ex
 }
 
 async fn set_status(s: &AppState, id: &str, from: &[&str], to: &str) -> Result<Experiment> {
-    let e = liveops::load_experiment(s, id)
-        .await?
-        .ok_or_else(|| Error::NotFound("experiment".into()))?;
-    if !from.contains(&e.status.as_str()) {
+    // one conditional UPDATE: two operators racing start/stop cannot both win
+    let from_states: Vec<String> = from.iter().map(|f| f.to_string()).collect();
+    let moved = sqlx::query(
+        "update musubi.experiments set status = $2, updated_at = now()
+         where id = $1 and status = any($3)",
+    )
+    .bind(id)
+    .bind(to)
+    .bind(&from_states)
+    .execute(&s.db)
+    .await
+    .map_err(Error::internal)?
+    .rows_affected();
+    if moved == 0 {
+        let e = liveops::load_experiment(s, id)
+            .await?
+            .ok_or_else(|| Error::NotFound("experiment".into()))?;
         return Err(Error::Conflict(format!("experiment is {}", e.status)));
     }
-    sqlx::query("update musubi.experiments set status = $2, updated_at = now() where id = $1")
-        .bind(id)
-        .bind(to)
-        .execute(&s.db)
-        .await
-        .map_err(Error::internal)?;
     changed(s, "experiment", id).await;
     s.events
         .emit(
@@ -491,6 +498,9 @@ fn one() -> f64 {
 
 /// `POST /v1/liveops/experiments/{id}/outcome {metric, value}` — an outcome for the caller's
 /// variant (conversion = value 1, revenue = amount, …).
+/// Distinct `metric` names a player-facing experiment may accumulate.
+const MAX_OUTCOME_METRICS: i64 = 64;
+
 async fn outcome(
     State(s): State<AppState>,
     Bearer(me): Bearer,
@@ -512,6 +522,31 @@ async fn outcome(
     let Some(variant) = variant else {
         return Err(Error::NotFound("not in this experiment".into()).into());
     };
+    // players name the metric: cap the distinct names per experiment so a client cannot grow
+    // the outcome table's metric cardinality (and the stats endpoint's work) without bound
+    let known: bool = sqlx::query_scalar(
+        "select exists(select 1 from musubi.experiment_outcomes where experiment_id = $1 and metric = $2)",
+    )
+    .bind(&id)
+    .bind(&b.metric)
+    .fetch_one(&s.db)
+    .await
+    .map_err(Error::internal)?;
+    if !known {
+        let distinct: i64 = sqlx::query_scalar(
+            "select count(distinct metric) from musubi.experiment_outcomes where experiment_id = $1",
+        )
+        .bind(&id)
+        .fetch_one(&s.db)
+        .await
+        .map_err(Error::internal)?;
+        if distinct >= MAX_OUTCOME_METRICS {
+            return Err(Error::ResourceExhausted(format!(
+                "at most {MAX_OUTCOME_METRICS} distinct metrics per experiment"
+            ))
+            .into());
+        }
+    }
     record_outcome(&s, &id, me.account_id, &variant, &b.metric, b.value).await?;
     Ok(Json(json!({ "recorded": true, "variant": variant })))
 }
@@ -611,6 +646,12 @@ struct EventBodyWithId {
     body: EventBody,
 }
 
+const MAX_DESCRIPTION: usize = 4096;
+/// 100 years: the longest phase / recurrence / participation window an event may declare.
+const MAX_SPAN_SECS: i64 = 100 * 366 * 86_400;
+/// 9999-12-31T23:59:59Z.
+const MAX_UNIX_SECS: i64 = 253_402_300_799;
+
 fn validate_event(b: &EventBody) -> Result<()> {
     if b.name.trim().is_empty() || b.name.len() > 128 {
         return Err(Error::InvalidArgument("name: 1..128 chars".into()));
@@ -618,23 +659,49 @@ fn validate_event(b: &EventBody) -> Result<()> {
     if b.phases.is_empty() || b.phases.len() > 32 {
         return Err(Error::InvalidArgument("phases: 1..32".into()));
     }
+    if b.description.len() > MAX_DESCRIPTION {
+        return Err(Error::InvalidArgument(format!(
+            "description: at most {MAX_DESCRIPTION} chars"
+        )));
+    }
+    // every duration below is added to unix timestamps in `phase_at`/timeline: bound them so
+    // the arithmetic can never overflow i64 (and a 300-year phase is a typo anyway)
     let mut end = 0;
     for p in &b.phases {
-        if p.offset_secs < end || p.duration_secs <= 0 {
+        if p.offset_secs < end
+            || p.duration_secs <= 0
+            || p.offset_secs > MAX_SPAN_SECS
+            || p.duration_secs > MAX_SPAN_SECS
+        {
             return Err(Error::InvalidArgument(
-                "phases must be ordered, non-overlapping, with positive duration".into(),
+                "phases must be ordered, non-overlapping, with positive duration (<= 100 years)"
+                    .into(),
             ));
         }
         end = p.offset_secs + p.duration_secs;
     }
-    if b.recurrence_secs.is_some_and(|r| r < end) {
+    if b.recurrence_secs
+        .is_some_and(|r| r < end || r > MAX_SPAN_SECS)
+    {
         return Err(Error::InvalidArgument(
-            "recurrence_secs must cover every phase".into(),
+            "recurrence_secs must cover every phase (<= 100 years)".into(),
+        ));
+    }
+    if !(0..=MAX_UNIX_SECS).contains(&b.starts_at)
+        || b.ends_at.is_some_and(|e| !(0..=MAX_UNIX_SECS).contains(&e))
+    {
+        return Err(Error::InvalidArgument(
+            "starts_at / ends_at: unix seconds between 1970 and 9999".into(),
         ));
     }
     if b.ends_at.is_some_and(|e| e <= b.starts_at) {
         return Err(Error::InvalidArgument(
             "ends_at must be after starts_at".into(),
+        ));
+    }
+    if b.participation_secs.is_some_and(|p| p > MAX_SPAN_SECS) {
+        return Err(Error::InvalidArgument(
+            "participation_secs: at most 100 years".into(),
         ));
     }
     valid_labels(&b.labels)?;

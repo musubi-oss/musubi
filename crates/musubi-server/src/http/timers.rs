@@ -61,7 +61,7 @@ pub fn due_of(req: &Value) -> Result<i64> {
     let now = chrono::Utc::now().timestamp();
     let due = match (req["at"].as_i64(), req["in_secs"].as_i64()) {
         (Some(at), None) => at,
-        (None, Some(d)) if d >= 0 => now + d,
+        (None, Some(d)) if d >= 0 => now.saturating_add(d),
         _ => {
             return Err(Error::InvalidArgument(
                 "timer: exactly one of `at` (unix seconds) or `in_secs` (>= 0)".into(),

@@ -109,6 +109,9 @@ async fn server_send(
             musubi_core::Error::InvalidArgument("subject must be 1..=256 chars".into()).into(),
         );
     }
+    if r.content.to_string().len() > 16 * 1024 {
+        return Err(musubi_core::Error::InvalidArgument("content must be <= 16 KiB".into()).into());
+    }
     s.notify
         .send(vec![musubi_social::notifications::NewNotification {
             user_id: musubi_core::AccountId(r.user_id),
