@@ -72,8 +72,9 @@ public:
 	/** Ask the node for more cells (it may refuse or redirect; the result arrives as CellAssigned events / the reply). */
 	UFUNCTION(BlueprintCallable, Category = "Musubi|Simulator") void LeaseCells(const TArray<FString>& Cells);
 	/** Spawn an entity we will own; the actor appears when the node confirms (OnEntitySpawned). */
-	UFUNCTION(BlueprintCallable, Category = "Musubi|Simulator") void SpawnEntity(double X, double Y, const FString& ComponentsJson, bool bPersistent = false, bool bGlobal = false);
-	void Spawn(double X, double Y, const FMusubiJson& Components, bool bPersistent, bool bGlobal, bool bQueue, TOptional<uint64> DecayTicks, FMusubiSimReply OnReply = nullptr);
+	/** Spawn an entity owned by this server's cell. `Owner` (account id, optional) makes it that player's avatar: only their sessions may relay/input on it, and `world_join` finds it. */
+	UFUNCTION(BlueprintCallable, Category = "Musubi|Simulator") void SpawnEntity(double X, double Y, const FString& ComponentsJson, bool bPersistent = false, bool bGlobal = false, const FString& Owner = TEXT(""));
+	void Spawn(double X, double Y, const FMusubiJson& Components, bool bPersistent, bool bGlobal, bool bQueue, TOptional<uint64> DecayTicks, FMusubiSimReply OnReply = nullptr, TOptional<FMusubiUuid> Owner = TOptional<FMusubiUuid>());
 	void Despawn(const FMusubiUuid& Entity, FMusubiSimReply OnReply = nullptr);
 	void Attach(const FMusubiUuid& Entity, const FMusubiUuid& Root, bool bContained, FMusubiSimReply OnReply = nullptr);
 	void Detach(const FMusubiUuid& Entity, FMusubiSimReply OnReply = nullptr);

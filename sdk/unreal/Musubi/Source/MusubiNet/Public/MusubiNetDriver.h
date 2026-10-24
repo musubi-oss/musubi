@@ -95,6 +95,10 @@ private:
 	void FinishRehome(bool bOk, const FString& Why);
 	void OnEntityIdentified(AActor* Actor, const FString& Id);
 	void OnNetOpened(bool bOk, const FMusubiServerEnvelope& Reply);
+	/** URL without `?entity=`: `world_join` reply — the account's avatar (found or spawned by the world's player_spawn policy); opens the relay on it. */
+	void OnWorldJoined(bool bOk, const FMusubiServerEnvelope& Reply);
+	/** `net_open` on `Entity` for the pending client connection. */
+	void OpenRelay(const FString& Entity);
 	void OnClientMsg(const FMusubiServerEnvelope& Env);
 	// server
 	TWeakObjectPtr<UMusubiSimulatorSubsystem> Sim;

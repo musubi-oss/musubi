@@ -730,6 +730,8 @@ pub enum WorldCmd {
         conn: u64,
         reason: String,
     },
+    /// `world_join`: the session's avatar (found by `Entity::owner`, or spawned by policy).
+    Join,
 }
 
 /// Largest engine packet the relay accepts (`net_opened.max_packet`): a QUIC datagram after the
@@ -2475,8 +2477,14 @@ impl WorldRegistry {
                     .unwrap_or_else(|e| ServerMessage::error(&e)),
             );
         }
+        if let WorldCmd::Join = &env.cmd {
+            return Some(
+                self.join(&env.world, env.account)
+                    .unwrap_or_else(|e| ServerMessage::error(&e)),
+            );
+        }
         let r = match env.cmd {
-            WorldCmd::NetOpen { .. } => unreachable!("handled above"),
+            WorldCmd::NetOpen { .. } | WorldCmd::Join => unreachable!("handled above"),
             WorldCmd::NetPacket { entity, conn, data } => {
                 if data.len() > NET_MAX_PACKET {
                     Err(Error::InvalidArgument(format!(
@@ -5277,6 +5285,73 @@ impl WorldRegistry {
             push_event(st, sim, ev);
         }
         Ok(())
+    }
+
+    /// `world_join`: the avatar `account` owns in `name`, else one spawned from the world's
+    /// `player_spawn` policy (owner set, cell leased to whoever hosts it, no simulator needed).
+    /// A split world whose shards may hold the avatar elsewhere refuses rather than spawn a
+    /// twin.
+    pub fn join(&self, name: &str, account: Option<Uuid>) -> Result<ServerMessage> {
+        let account = account
+            .ok_or_else(|| Error::Unauthenticated("world_join needs a signed-in session".into()))?;
+        let w = self.get(name)?;
+        let mut st = w.lock();
+        let st = &mut *st;
+        if let Some(id) = st.world.owned_by(account) {
+            let e = st.world.get(id).expect("indexed");
+            metrics::counter!("musubi_world_join_total", "outcome" => "found").increment(1);
+            return Ok(ServerMessage::WorldJoined {
+                world: name.to_string(),
+                entity: id,
+                spawned: false,
+                x: e.pos.x,
+                y: e.pos.y,
+            });
+        }
+        if self.is_split(name) {
+            return Err(Error::Unavailable(format!(
+                "world {name} is split across shards; join is served only for avatars on the home shard"
+            )));
+        }
+        let Some(policy) = st.world.cfg.player_spawn.clone() else {
+            return Err(Error::Conflict(format!(
+                "world {name} has no player_spawn policy and {account} owns no entity in it: spawn the avatar from the server with owner set"
+            )));
+        };
+        let pos = policy.point_for(account);
+        let cell = st.world.cell_of(pos);
+        if st.world.owner(cell).is_none() {
+            if let Some(a) = st
+                .controller
+                .ensure_leased(&mut st.world, cell, None, "player_spawn")
+            {
+                announce(st, &a);
+            }
+        }
+        if !st.world.cell_has_room(cell) {
+            return Err(mesh_err(musubi_mesh::MeshError::CellFull(
+                cell,
+                st.world.cfg.soft_cap,
+            )));
+        }
+        let comps = components_from_json(&policy.components);
+        let id = spawn_entity(
+            st,
+            pos,
+            comps,
+            policy.persistent,
+            false,
+            policy.decay_ticks,
+            Some(account),
+        );
+        metrics::counter!("musubi_world_join_total", "outcome" => "spawned").increment(1);
+        Ok(ServerMessage::WorldJoined {
+            world: name.to_string(),
+            entity: id,
+            spawned: true,
+            x: pos.x,
+            y: pos.y,
+        })
     }
 
     // ----- engine packet relay (`net_*`) -----

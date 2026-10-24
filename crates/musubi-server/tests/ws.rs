@@ -22790,3 +22790,122 @@ async fn owned_entity_refuses_other_accounts() {
     assert_eq!(st, 200, "{e}");
     assert_eq!(e["owner"].as_str(), Some(owner.as_str()), "{e}");
 }
+
+/// `world_join` gives a session its avatar: spawned from the world's `player_spawn` policy the
+/// first time (owner = the account, at the policy's spawn point), found again afterwards, one per
+/// account; a world without the policy refuses instead of guessing.
+#[tokio::test]
+async fn world_join_finds_or_spawns_the_avatar() {
+    let Some((addr, router)) = start().await else {
+        return;
+    };
+    let world = format!("ws-{}", uuid::Uuid::now_v7().simple());
+    let (st, r) = http_json(
+        &router,
+        "POST",
+        "/v1/server/worlds",
+        None,
+        true,
+        Some(
+            json!({"name": world, "config": {"cell_size": 100.0, "player_spawn": {
+                "components": {"hp": 100, "class": "scout"},
+                "points": [{"x": 12.0, "y": 34.0, "z": 0.0}],
+                "persistent": true
+            }}}),
+        ),
+    )
+    .await;
+    assert_eq!(st, 200, "{r}");
+    let f = "json";
+    let (ta, acc_a) = token(&router).await;
+    let (tb, _) = token(&router).await;
+    let mut a = connect(&addr, &ta, f).await;
+    let mut b = connect(&addr, &tb, f).await;
+    async fn join(ws: &mut Ws, world: &str, cid: &str) -> (uuid::Uuid, bool, f64, f64) {
+        send(
+            ws,
+            "json",
+            Some(cid),
+            ClientMessage::WorldJoin {
+                world: world.to_string(),
+            },
+        )
+        .await;
+        match recv(ws).await.msg {
+            ServerMessage::WorldJoined {
+                entity,
+                spawned,
+                x,
+                y,
+                ..
+            } => (entity, spawned, x, y),
+            m => panic!("join failed: {m:?}"),
+        }
+    }
+    let (avatar, spawned, x, y) = join(&mut a, &world, "1").await;
+    assert!(spawned, "first join spawns");
+    assert_eq!((x, y), (12.0, 34.0));
+    let (again, spawned2, ..) = join(&mut a, &world, "2").await;
+    assert_eq!(again, avatar, "second join finds the same avatar");
+    assert!(!spawned2);
+    let (other, spawned3, ..) = join(&mut b, &world, "3").await;
+    assert!(spawned3);
+    assert_ne!(other, avatar, "one avatar per account");
+    // the avatar carries the template and the owner
+    let (st, e) = http_json(
+        &router,
+        "GET",
+        &format!("/v1/server/worlds/{world}/entities/{avatar}"),
+        None,
+        true,
+        None,
+    )
+    .await;
+    assert_eq!(st, 200, "{e}");
+    assert_eq!(e["owner"].as_str(), Some(acc_a.as_str()), "{e}");
+    assert_eq!(e["components"]["hp"]["value"], json!(100), "{e}");
+    // and only its owner may relay on it
+    send(
+        &mut b,
+        f,
+        Some("4"),
+        ClientMessage::NetOpen {
+            world: world.clone(),
+            entity: avatar.to_string(),
+        },
+    )
+    .await;
+    assert!(matches!(
+        recv(&mut b).await.msg,
+        ServerMessage::Error {
+            code: Code::PermissionDenied,
+            ..
+        }
+    ));
+    // no policy → an explicit refusal, not a guess
+    let bare = format!("ws-{}", uuid::Uuid::now_v7().simple());
+    let (st, _) = http_json(
+        &router,
+        "POST",
+        "/v1/server/worlds",
+        None,
+        true,
+        Some(json!({"name": bare, "config": {"cell_size": 100.0}})),
+    )
+    .await;
+    assert_eq!(st, 200);
+    send(
+        &mut a,
+        f,
+        Some("5"),
+        ClientMessage::WorldJoin { world: bare },
+    )
+    .await;
+    match recv(&mut a).await.msg {
+        ServerMessage::Error { code, message } => {
+            assert_eq!(code, Code::Conflict, "{message}");
+            assert!(message.contains("player_spawn"), "{message}");
+        }
+        m => panic!("expected an error, got {m:?}"),
+    }
+}

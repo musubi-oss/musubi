@@ -296,6 +296,11 @@ pub enum ClientMessage {
     WorldUnsubscribe {
         world: String,
     },
+    /// "Give me my avatar in `world`": the entity this account owns there, or a new one from the
+    /// world's `player_spawn` policy. Reply `world_joined`; then `net_open`/`world_input` on it.
+    WorldJoin {
+        world: String,
+    },
     /// Player input for an entity; the replication layer routes it to the current owner.
     WorldInput {
         world: String,
@@ -579,6 +584,15 @@ pub enum ServerMessage {
     MatchHost {
         match_id: String,
         host: UserPresence,
+    },
+    /// Reply to `world_join`: the account's avatar in `world` and where it is.
+    WorldJoined {
+        world: String,
+        entity: uuid::Uuid,
+        /// Freshly spawned from the `player_spawn` policy (false: it already existed).
+        spawned: bool,
+        x: f64,
+        y: f64,
     },
     /// Server meshing: what changed inside the client's interest since the last delta.
     WorldDelta {

@@ -951,6 +951,7 @@ async fn handle_inner(ctx: &Ctx<'_>, msg: ClientMessage) -> Option<ServerMessage
         ClientMessage::WorldUnsubscribe { world } => {
             world_dispatch(ctx, &world, WorldCmd::Unsubscribe).await
         }
+        ClientMessage::WorldJoin { world } => world_dispatch(ctx, &world, WorldCmd::Join).await,
         ClientMessage::WorldInput {
             world,
             entity,
@@ -1491,6 +1492,7 @@ async fn world_dispatch(ctx: &Ctx<'_>, world: &str, cmd: WorldCmd) -> Option<Ser
             reply
         }
         WorldCmd::Input { .. }
+        | WorldCmd::Join
         | WorldCmd::NetOpen { .. }
         | WorldCmd::NetPacket { .. }
         | WorldCmd::NetClose { .. }
@@ -1499,6 +1501,7 @@ async fn world_dispatch(ctx: &Ctx<'_>, world: &str, cmd: WorldCmd) -> Option<Ser
             ctx.worlds.exec(env, ctx.fanout)
         }
         WorldCmd::Input { .. }
+        | WorldCmd::Join
         | WorldCmd::NetOpen { .. }
         | WorldCmd::NetPacket { .. }
         | WorldCmd::NetClose { .. } => {

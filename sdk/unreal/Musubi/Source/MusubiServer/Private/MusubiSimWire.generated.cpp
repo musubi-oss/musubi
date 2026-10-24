@@ -1745,6 +1745,7 @@ TSharedPtr<FJsonValue> FMusubiSimCommandSpawn::ToJson(const FMusubiSimCommandSpa
 	if (V.global) O->SetField(TEXT("global"), MakeShared<FJsonValueBoolean>(V.global));
 	if (V.queue) O->SetField(TEXT("queue"), MakeShared<FJsonValueBoolean>(V.queue));
 	if (V.decay_ticks.IsSet()) O->SetField(TEXT("decay_ticks"), (V.decay_ticks.IsSet() ? TSharedPtr<FJsonValue>(MakeShared<FJsonValueNumber>((double)V.decay_ticks.GetValue())) : MusubiJson::Null()));
+	if (V.owner.IsSet()) O->SetField(TEXT("owner"), (V.owner.IsSet() ? TSharedPtr<FJsonValue>(MakeShared<FJsonValueString>(V.owner.GetValue().ToString())) : MusubiJson::Null()));
 	return MakeShared<FJsonValueObject>(O);
 }
 
@@ -1761,6 +1762,7 @@ bool FMusubiSimCommandSpawn::FromJson(const TSharedPtr<FJsonValue>& J, FMusubiSi
 	if (TSharedPtr<FJsonValue> F = O.TryGetField(TEXT("global")); F.IsValid() && !F->IsNull()) { { bool V0; if (F->TryGetBool(V0)) Out.global = V0; else bOk = false; } }
 	if (TSharedPtr<FJsonValue> F = O.TryGetField(TEXT("queue")); F.IsValid() && !F->IsNull()) { { bool V0; if (F->TryGetBool(V0)) Out.queue = V0; else bOk = false; } }
 	if (TSharedPtr<FJsonValue> F = O.TryGetField(TEXT("decay_ticks")); F.IsValid() && !F->IsNull()) { if (F->IsNull()) Out.decay_ticks.Reset(); else { uint64 V0{}; { double V1; if (F->TryGetNumber(V1)) V0 = (uint64)V1; else bOk = false; } Out.decay_ticks = MoveTemp(V0); } }
+	if (TSharedPtr<FJsonValue> F = O.TryGetField(TEXT("owner")); F.IsValid() && !F->IsNull()) { if (F->IsNull()) Out.owner.Reset(); else { FMusubiUuid V0{}; { FString V1; if (F->TryGetString(V1) && FMusubiUuid::Parse(V1, V0)) {} else bOk = false; } Out.owner = MoveTemp(V0); } }
 	return bOk;
 }
 
@@ -1773,6 +1775,7 @@ void FMusubiSimCommandSpawn::Write(FMusubiPostcardWriter& W, const FMusubiSimCom
 	W.Bool(V.global);
 	W.Bool(V.queue);
 	if (V.decay_ticks.IsSet()) { W.Byte(1); W.Varint((uint64)V.decay_ticks.GetValue()); } else W.Byte(0);
+	if (V.owner.IsSet()) { W.Byte(1); W.Uuid(V.owner.GetValue()); } else W.Byte(0);
 }
 
 void FMusubiSimCommandSpawn::Read(FMusubiPostcardReader& R, FMusubiSimCommandSpawn& Out)
@@ -1784,6 +1787,7 @@ void FMusubiSimCommandSpawn::Read(FMusubiPostcardReader& R, FMusubiSimCommandSpa
 	Out.global = R.Bool();
 	Out.queue = R.Bool();
 	if (R.Byte() == 1) { uint64 V0{}; V0 = R.Varint(); Out.decay_ticks = MoveTemp(V0); } else Out.decay_ticks.Reset();
+	if (R.Byte() == 1) { FMusubiUuid V0{}; V0 = R.Uuid(); Out.owner = MoveTemp(V0); } else Out.owner.Reset();
 }
 
 TSharedPtr<FJsonValue> FMusubiSimCommandTickDone::ToJson(const FMusubiSimCommandTickDone& V)

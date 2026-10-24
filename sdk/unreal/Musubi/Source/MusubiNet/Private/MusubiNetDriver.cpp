@@ -91,9 +91,9 @@ bool UMusubiNetDriver::InitConnect(FNetworkNotify* InNotify, const FURL& Connect
 		return false;
 	}
 	const FString Entity = ConnectURL.GetOption(TEXT("entity="), TEXT(""));
-	if (ConnectURL.Host.IsEmpty() || Entity.IsEmpty())
+	if (ConnectURL.Host.IsEmpty())
 	{
-		Error = TEXT("MusubiNet: URL must be musubi://<world>:0?entity=<uuid>");
+		Error = TEXT("MusubiNet: URL must be musubi://<world>:0[?entity=<uuid>]");
 		return false;
 	}
 	Client = Sub;
@@ -106,15 +106,53 @@ bool UMusubiNetDriver::InitConnect(FNetworkNotify* InNotify, const FURL& Connect
 	RehomeHandle = Sock->OnTag(EMusubiServerMessageTag::NetRehome).AddUObject(this, &UMusubiNetDriver::OnClientMsg);
 	MetaHandle = Sock->OnTag(EMusubiServerMessageTag::NetMeta).AddUObject(this, &UMusubiNetDriver::OnClientMsg);
 	IdentifiedHandle = UMusubiAuthorityComponent::OnClientEntityIdentified.AddUObject(this, &UMusubiNetDriver::OnEntityIdentified);
+	CreateInitialClientChannels();
+	if (Entity.IsEmpty())
+	{
+		// no entity in the URL: ask the node for this account's avatar (found, or spawned from
+		// the world's player_spawn policy), then open the relay on it
+		FMusubiClientMessage Join;
+		Join.Tag = EMusubiClientMessageTag::WorldJoin;
+		Join.WorldJoin.Emplace();
+		Join.WorldJoin->world = ConnectURL.Host;
+		Sock->Request(Join, FMusubiReply::CreateUObject(this, &UMusubiNetDriver::OnWorldJoined));
+		UE_LOG(LogMusubiNet, Log, TEXT("connecting through the node: world=%s, asking for my avatar"), *ConnectURL.Host);
+		return true;
+	}
+	OpenRelay(Entity);
+	return true;
+}
+
+void UMusubiNetDriver::OpenRelay(const FString& Entity)
+{
+	UMusubiNetConnection* Conn = Cast<UMusubiNetConnection>(ServerConnection);
+	TSharedPtr<FMusubiSocket> Sock = Client.IsValid() ? Client->Socket() : nullptr;
+	if (!Conn || !Sock.IsValid()) return;
+	Conn->Entity = Entity;
 	FMusubiClientMessage Open;
 	Open.Tag = EMusubiClientMessageTag::NetOpen;
 	Open.NetOpen.Emplace();
-	Open.NetOpen->world = ConnectURL.Host;
+	Open.NetOpen->world = ClientURL.Host;
 	Open.NetOpen->entity = Entity;
 	Sock->Request(Open, FMusubiReply::CreateUObject(this, &UMusubiNetDriver::OnNetOpened));
-	CreateInitialClientChannels();
-	UE_LOG(LogMusubiNet, Log, TEXT("connecting through the node: world=%s entity=%s"), *ConnectURL.Host, *Entity);
-	return true;
+	UE_LOG(LogMusubiNet, Log, TEXT("connecting through the node: world=%s entity=%s"), *ClientURL.Host, *Entity);
+}
+
+void UMusubiNetDriver::OnWorldJoined(bool bOk, const FMusubiServerEnvelope& Reply)
+{
+	if (!Cast<UMusubiNetConnection>(ServerConnection)) return;
+	if (!bOk || !Reply.Msg.WorldJoined.IsSet())
+	{
+		const FString Why = Reply.Msg.Error.IsSet() ? Reply.Msg.Error->message : TEXT("world_join failed");
+		UE_LOG(LogMusubiNet, Error, TEXT("world_join refused: %s"), *Why);
+		if (GEngine) GEngine->BroadcastNetworkFailure(GetWorld(), this, ENetworkFailure::ConnectionLost, Why);
+		return;
+	}
+	const FMusubiServerMessageWorldJoined& J = *Reply.Msg.WorldJoined;
+	const FString Entity = J.entity.ToString();
+	ClientURL.AddOption(*FString::Printf(TEXT("entity=%s"), *Entity));
+	UE_LOG(LogMusubiNet, Log, TEXT("my avatar in %s is %s (%s) at %.1f,%.1f"), *J.world, *Entity, J.spawned ? TEXT("spawned") : TEXT("found"), J.x, J.y);
+	OpenRelay(Entity);
 }
 
 void UMusubiNetDriver::OnNetOpened(bool bOk, const FMusubiServerEnvelope& Reply)

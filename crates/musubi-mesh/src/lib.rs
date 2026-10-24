@@ -384,6 +384,44 @@ pub struct WorldConfig {
     /// Complete picture to the replicas every N ticks (0 = only the first).
     #[serde(default = "repl_keyframe")]
     pub repl_keyframe_ticks: u64,
+    /// How a player's avatar comes to exist when a client joins (`world_join`) and owns no entity
+    /// here yet. `None`: the project spawns avatars itself and `world_join` only finds them.
+    #[serde(default)]
+    pub player_spawn: Option<PlayerSpawn>,
+}
+
+/// Avatar template for `world_join`: components it starts with, where it appears, whether it
+/// survives the player leaving. Position comes from `points` (chosen by the account id, so a
+/// player keeps a spawn point) or the origin.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct PlayerSpawn {
+    pub components: serde_json::Value,
+    pub points: Vec<Pos>,
+    pub persistent: bool,
+    pub decay_ticks: Option<u64>,
+}
+
+impl Default for PlayerSpawn {
+    fn default() -> Self {
+        Self {
+            components: serde_json::Value::Object(Default::default()),
+            points: Vec::new(),
+            persistent: true,
+            decay_ticks: None,
+        }
+    }
+}
+
+impl PlayerSpawn {
+    /// Spawn point for `account`: stable per account while `points` does not change.
+    pub fn point_for(&self, account: Uuid) -> Pos {
+        if self.points.is_empty() {
+            return Pos::default();
+        }
+        let n = u128::from_be_bytes(*account.as_bytes()) % self.points.len() as u128;
+        self.points[n as usize]
+    }
 }
 
 impl Default for WorldConfig {
@@ -411,6 +449,7 @@ impl Default for WorldConfig {
             history_ticks: 15,
             ghost_budget_bytes: 256 * 1024,
             ghost_keyframe_ticks: 30,
+            player_spawn: None,
             ghost_stale_ticks: 60,
             unload_after_ticks: 0,
             replicas: 1,
@@ -728,6 +767,8 @@ pub struct World {
     split: HashSet<CellId>,
     /// Split cells a designer pinned (a city, a dungeon entrance): never merged by the controller.
     pinned_splits: HashSet<CellId>,
+    /// `Entity::owner` → entity, for `world_join` (one avatar per account per world).
+    owners: HashMap<Uuid, EntityId>,
 }
 
 impl World {
@@ -750,6 +791,7 @@ impl World {
             cell_scale: HashMap::new(),
             split: HashSet::new(),
             pinned_splits: HashSet::new(),
+            owners: HashMap::new(),
         }
     }
 
@@ -1334,11 +1376,27 @@ impl World {
     pub fn set_owner(&mut self, id: EntityId, owner: Option<Uuid>) -> bool {
         match self.entities.get_mut(&id) {
             Some(e) => {
+                if let Some(old) = e.owner.take() {
+                    if self.owners.get(&old) == Some(&id) {
+                        self.owners.remove(&old);
+                    }
+                }
                 e.owner = owner;
+                if let Some(o) = owner {
+                    self.owners.insert(o, id);
+                }
                 true
             }
             None => false,
         }
+    }
+
+    /// The entity `account` owns in this shard (`world_join` finds it instead of spawning).
+    pub fn owned_by(&self, account: Uuid) -> Option<EntityId> {
+        self.owners
+            .get(&account)
+            .copied()
+            .filter(|id| self.entities.contains_key(id))
     }
 
     fn record_pos(&mut self, id: EntityId, pos: Pos) {
@@ -1385,6 +1443,11 @@ impl World {
         };
         if e.global {
             self.globals_changed = self.tick;
+        }
+        if let Some(o) = e.owner {
+            if self.owners.get(&o) == Some(&id) {
+                self.owners.remove(&o);
+            }
         }
         self.by_cell.remove(&e.cell, &id, self.tick);
         self.buffered_inputs.remove(&id);
@@ -2392,6 +2455,9 @@ impl World {
             e.changed_tick = self.tick;
             self.by_cell.insert(e.cell, e.id, self.tick);
             let (id, pos) = (e.id, e.pos);
+            if let Some(o) = e.owner {
+                self.owners.insert(o, e.id);
+            }
             self.entities.insert(e.id, e);
             self.record_pos(id, pos);
         }

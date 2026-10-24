@@ -406,6 +406,14 @@ Module `MusubiNet` (runtime, all tiers: the driver uses only classic `UNetDriver
   `net_open{world, entity}` → `net_opened{world, entity, conn, server?, max_packet}` | `error`;
   `net_packet{world, entity, conn, data: bytes}` up, `net_packet{conn, data}` down; `net_close{world, entity,
   conn, reason}` up, `net_close{conn, reason}` down; `net_rehome{world, entity, conn, server?}` down.
+  **Join (`world_join`):** a client URL without `?entity=` — `musubi://<world>:0` — makes the driver ask the
+  node for *this account's avatar* first: `world_join{world}` → `world_joined{world, entity, spawned, x, y}`
+  — the entity the account owns in the world, or a new one spawned from the world's `player_spawn`
+  policy (`config.player_spawn = {components, points: [{x,y}], persistent, decay_ticks}` on
+  `POST /v1/server/worlds`; the point is chosen by account id so a player keeps it). The relay is then
+  opened on it. A world without the policy answers `conflict` ("spawn the avatar from the server with
+  owner set") — the project-driven flow (`SpawnEntity` with `Owner`, then `?entity=`) keeps working.
+  Caveat: on a split world only avatars on the home shard are found.
   **Ownership:** an entity spawned with `owner: <account id>` (REST `spawn`, sim `spawn`, `SpawnEntity`'s
   `Owner`) is that account's avatar — `net_open` and `world_input` from any other account's session are
   refused with `permission_denied` (also on the shard hosting the cell when the world is split); an entity

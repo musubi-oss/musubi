@@ -600,6 +600,7 @@ const TCHAR* MusubiTagName(EMusubiClientMessageTag Tag)
 	case EMusubiClientMessageTag::MatchLeave: return TEXT("match_leave");
 	case EMusubiClientMessageTag::WorldSubscribe: return TEXT("world_subscribe");
 	case EMusubiClientMessageTag::WorldUnsubscribe: return TEXT("world_unsubscribe");
+	case EMusubiClientMessageTag::WorldJoin: return TEXT("world_join");
 	case EMusubiClientMessageTag::WorldInput: return TEXT("world_input");
 	case EMusubiClientMessageTag::NetOpen: return TEXT("net_open");
 	case EMusubiClientMessageTag::NetPacket: return TEXT("net_packet");
@@ -650,6 +651,7 @@ bool MusubiTagFromName(const FString& Name, EMusubiClientMessageTag& Out)
 	if (Name == TEXT("match_leave")) { Out = EMusubiClientMessageTag::MatchLeave; return true; }
 	if (Name == TEXT("world_subscribe")) { Out = EMusubiClientMessageTag::WorldSubscribe; return true; }
 	if (Name == TEXT("world_unsubscribe")) { Out = EMusubiClientMessageTag::WorldUnsubscribe; return true; }
+	if (Name == TEXT("world_join")) { Out = EMusubiClientMessageTag::WorldJoin; return true; }
 	if (Name == TEXT("world_input")) { Out = EMusubiClientMessageTag::WorldInput; return true; }
 	if (Name == TEXT("net_open")) { Out = EMusubiClientMessageTag::NetOpen; return true; }
 	if (Name == TEXT("net_packet")) { Out = EMusubiClientMessageTag::NetPacket; return true; }
@@ -1830,6 +1832,33 @@ void FMusubiClientMessageWorldUnsubscribe::Read(FMusubiPostcardReader& R, FMusub
 	Out.world = R.Str();
 }
 
+TSharedPtr<FJsonValue> FMusubiClientMessageWorldJoin::ToJson(const FMusubiClientMessageWorldJoin& V)
+{
+	TSharedPtr<FJsonObject> O = MakeShared<FJsonObject>();
+	O->SetField(TEXT("world"), MakeShared<FJsonValueString>(V.world));
+	return MakeShared<FJsonValueObject>(O);
+}
+
+bool FMusubiClientMessageWorldJoin::FromJson(const TSharedPtr<FJsonValue>& J, FMusubiClientMessageWorldJoin& Out)
+{
+	const TSharedPtr<FJsonObject>* OP;
+	if (!J.IsValid() || !J->TryGetObject(OP)) return false;
+	const FJsonObject& O = **OP;
+	bool bOk = true;
+	if (TSharedPtr<FJsonValue> F = O.TryGetField(TEXT("world")); F.IsValid()) { { FString V0; if (F->TryGetString(V0)) Out.world = MoveTemp(V0); else bOk = false; } } else bOk = false;
+	return bOk;
+}
+
+void FMusubiClientMessageWorldJoin::Write(FMusubiPostcardWriter& W, const FMusubiClientMessageWorldJoin& V)
+{
+	W.Str(V.world);
+}
+
+void FMusubiClientMessageWorldJoin::Read(FMusubiPostcardReader& R, FMusubiClientMessageWorldJoin& Out)
+{
+	Out.world = R.Str();
+}
+
 TSharedPtr<FJsonValue> FMusubiClientMessageWorldInput::ToJson(const FMusubiClientMessageWorldInput& V)
 {
 	TSharedPtr<FJsonObject> O = MakeShared<FJsonObject>();
@@ -2162,6 +2191,7 @@ TSharedPtr<FJsonValue> FMusubiClientMessage::ToJson(const FMusubiClientMessage& 
 	case EMusubiClientMessageTag::MatchLeave: return MusubiJson::Tagged(TEXT("match_leave"), V.MatchLeave.IsSet() ? FMusubiClientMessageMatchLeave::ToJson(V.MatchLeave.GetValue()) : MusubiJson::Null());
 	case EMusubiClientMessageTag::WorldSubscribe: return MusubiJson::Tagged(TEXT("world_subscribe"), V.WorldSubscribe.IsSet() ? FMusubiClientMessageWorldSubscribe::ToJson(V.WorldSubscribe.GetValue()) : MusubiJson::Null());
 	case EMusubiClientMessageTag::WorldUnsubscribe: return MusubiJson::Tagged(TEXT("world_unsubscribe"), V.WorldUnsubscribe.IsSet() ? FMusubiClientMessageWorldUnsubscribe::ToJson(V.WorldUnsubscribe.GetValue()) : MusubiJson::Null());
+	case EMusubiClientMessageTag::WorldJoin: return MusubiJson::Tagged(TEXT("world_join"), V.WorldJoin.IsSet() ? FMusubiClientMessageWorldJoin::ToJson(V.WorldJoin.GetValue()) : MusubiJson::Null());
 	case EMusubiClientMessageTag::WorldInput: return MusubiJson::Tagged(TEXT("world_input"), V.WorldInput.IsSet() ? FMusubiClientMessageWorldInput::ToJson(V.WorldInput.GetValue()) : MusubiJson::Null());
 	case EMusubiClientMessageTag::NetOpen: return MusubiJson::Tagged(TEXT("net_open"), V.NetOpen.IsSet() ? FMusubiClientMessageNetOpen::ToJson(V.NetOpen.GetValue()) : MusubiJson::Null());
 	case EMusubiClientMessageTag::NetPacket: return MusubiJson::Tagged(TEXT("net_packet"), V.NetPacket.IsSet() ? FMusubiClientMessageNetPacket::ToJson(V.NetPacket.GetValue()) : MusubiJson::Null());
@@ -2219,6 +2249,7 @@ bool FMusubiClientMessage::FromJson(const TSharedPtr<FJsonValue>& J, FMusubiClie
 	case EMusubiClientMessageTag::MatchLeave: { FMusubiClientMessageMatchLeave V0{}; if (!FMusubiClientMessageMatchLeave::FromJson(P, V0)) bOk = false; Out.MatchLeave = MoveTemp(V0); break; }
 	case EMusubiClientMessageTag::WorldSubscribe: { FMusubiClientMessageWorldSubscribe V0{}; if (!FMusubiClientMessageWorldSubscribe::FromJson(P, V0)) bOk = false; Out.WorldSubscribe = MoveTemp(V0); break; }
 	case EMusubiClientMessageTag::WorldUnsubscribe: { FMusubiClientMessageWorldUnsubscribe V0{}; if (!FMusubiClientMessageWorldUnsubscribe::FromJson(P, V0)) bOk = false; Out.WorldUnsubscribe = MoveTemp(V0); break; }
+	case EMusubiClientMessageTag::WorldJoin: { FMusubiClientMessageWorldJoin V0{}; if (!FMusubiClientMessageWorldJoin::FromJson(P, V0)) bOk = false; Out.WorldJoin = MoveTemp(V0); break; }
 	case EMusubiClientMessageTag::WorldInput: { FMusubiClientMessageWorldInput V0{}; if (!FMusubiClientMessageWorldInput::FromJson(P, V0)) bOk = false; Out.WorldInput = MoveTemp(V0); break; }
 	case EMusubiClientMessageTag::NetOpen: { FMusubiClientMessageNetOpen V0{}; if (!FMusubiClientMessageNetOpen::FromJson(P, V0)) bOk = false; Out.NetOpen = MoveTemp(V0); break; }
 	case EMusubiClientMessageTag::NetPacket: { FMusubiClientMessageNetPacket V0{}; if (!FMusubiClientMessageNetPacket::FromJson(P, V0)) bOk = false; Out.NetPacket = MoveTemp(V0); break; }
@@ -2272,6 +2303,7 @@ void FMusubiClientMessage::Write(FMusubiPostcardWriter& W, const FMusubiClientMe
 	case EMusubiClientMessageTag::MatchLeave: if (V.MatchLeave.IsSet()) FMusubiClientMessageMatchLeave::Write(W, V.MatchLeave.GetValue()); else W.Fail(); break;
 	case EMusubiClientMessageTag::WorldSubscribe: if (V.WorldSubscribe.IsSet()) FMusubiClientMessageWorldSubscribe::Write(W, V.WorldSubscribe.GetValue()); else W.Fail(); break;
 	case EMusubiClientMessageTag::WorldUnsubscribe: if (V.WorldUnsubscribe.IsSet()) FMusubiClientMessageWorldUnsubscribe::Write(W, V.WorldUnsubscribe.GetValue()); else W.Fail(); break;
+	case EMusubiClientMessageTag::WorldJoin: if (V.WorldJoin.IsSet()) FMusubiClientMessageWorldJoin::Write(W, V.WorldJoin.GetValue()); else W.Fail(); break;
 	case EMusubiClientMessageTag::WorldInput: if (V.WorldInput.IsSet()) FMusubiClientMessageWorldInput::Write(W, V.WorldInput.GetValue()); else W.Fail(); break;
 	case EMusubiClientMessageTag::NetOpen: if (V.NetOpen.IsSet()) FMusubiClientMessageNetOpen::Write(W, V.NetOpen.GetValue()); else W.Fail(); break;
 	case EMusubiClientMessageTag::NetPacket: if (V.NetPacket.IsSet()) FMusubiClientMessageNetPacket::Write(W, V.NetPacket.GetValue()); else W.Fail(); break;
@@ -2286,7 +2318,7 @@ void FMusubiClientMessage::Write(FMusubiPostcardWriter& W, const FMusubiClientMe
 void FMusubiClientMessage::Read(FMusubiPostcardReader& R, FMusubiClientMessage& Out)
 {
 	uint64 Idx = R.Varint();
-	if (Idx >= 44) { R.Fail(); return; }
+	if (Idx >= 45) { R.Fail(); return; }
 	Out.Tag = (EMusubiClientMessageTag)Idx;
 	switch (Out.Tag)
 	{
@@ -2326,6 +2358,7 @@ void FMusubiClientMessage::Read(FMusubiPostcardReader& R, FMusubiClientMessage& 
 	case EMusubiClientMessageTag::MatchLeave: { FMusubiClientMessageMatchLeave V0{}; FMusubiClientMessageMatchLeave::Read(R, V0); Out.MatchLeave = MoveTemp(V0); break; }
 	case EMusubiClientMessageTag::WorldSubscribe: { FMusubiClientMessageWorldSubscribe V0{}; FMusubiClientMessageWorldSubscribe::Read(R, V0); Out.WorldSubscribe = MoveTemp(V0); break; }
 	case EMusubiClientMessageTag::WorldUnsubscribe: { FMusubiClientMessageWorldUnsubscribe V0{}; FMusubiClientMessageWorldUnsubscribe::Read(R, V0); Out.WorldUnsubscribe = MoveTemp(V0); break; }
+	case EMusubiClientMessageTag::WorldJoin: { FMusubiClientMessageWorldJoin V0{}; FMusubiClientMessageWorldJoin::Read(R, V0); Out.WorldJoin = MoveTemp(V0); break; }
 	case EMusubiClientMessageTag::WorldInput: { FMusubiClientMessageWorldInput V0{}; FMusubiClientMessageWorldInput::Read(R, V0); Out.WorldInput = MoveTemp(V0); break; }
 	case EMusubiClientMessageTag::NetOpen: { FMusubiClientMessageNetOpen V0{}; FMusubiClientMessageNetOpen::Read(R, V0); Out.NetOpen = MoveTemp(V0); break; }
 	case EMusubiClientMessageTag::NetPacket: { FMusubiClientMessageNetPacket V0{}; FMusubiClientMessageNetPacket::Read(R, V0); Out.NetPacket = MoveTemp(V0); break; }
@@ -2369,6 +2402,7 @@ const TCHAR* MusubiTagName(EMusubiServerMessageTag Tag)
 	case EMusubiServerMessageTag::PartyList: return TEXT("party_list");
 	case EMusubiServerMessageTag::Match: return TEXT("match");
 	case EMusubiServerMessageTag::MatchHost: return TEXT("match_host");
+	case EMusubiServerMessageTag::WorldJoined: return TEXT("world_joined");
 	case EMusubiServerMessageTag::WorldDelta: return TEXT("world_delta");
 	case EMusubiServerMessageTag::NetOpened: return TEXT("net_opened");
 	case EMusubiServerMessageTag::NetPacket: return TEXT("net_packet");
@@ -2419,6 +2453,7 @@ bool MusubiTagFromName(const FString& Name, EMusubiServerMessageTag& Out)
 	if (Name == TEXT("party_list")) { Out = EMusubiServerMessageTag::PartyList; return true; }
 	if (Name == TEXT("match")) { Out = EMusubiServerMessageTag::Match; return true; }
 	if (Name == TEXT("match_host")) { Out = EMusubiServerMessageTag::MatchHost; return true; }
+	if (Name == TEXT("world_joined")) { Out = EMusubiServerMessageTag::WorldJoined; return true; }
 	if (Name == TEXT("world_delta")) { Out = EMusubiServerMessageTag::WorldDelta; return true; }
 	if (Name == TEXT("net_opened")) { Out = EMusubiServerMessageTag::NetOpened; return true; }
 	if (Name == TEXT("net_packet")) { Out = EMusubiServerMessageTag::NetPacket; return true; }
@@ -3384,6 +3419,49 @@ void FMusubiServerMessageMatchHost::Read(FMusubiPostcardReader& R, FMusubiServer
 	FMusubiUserPresence::Read(R, Out.host);
 }
 
+TSharedPtr<FJsonValue> FMusubiServerMessageWorldJoined::ToJson(const FMusubiServerMessageWorldJoined& V)
+{
+	TSharedPtr<FJsonObject> O = MakeShared<FJsonObject>();
+	O->SetField(TEXT("world"), MakeShared<FJsonValueString>(V.world));
+	O->SetField(TEXT("entity"), MakeShared<FJsonValueString>(V.entity.ToString()));
+	O->SetField(TEXT("spawned"), MakeShared<FJsonValueBoolean>(V.spawned));
+	O->SetField(TEXT("x"), MakeShared<FJsonValueNumber>((double)V.x));
+	O->SetField(TEXT("y"), MakeShared<FJsonValueNumber>((double)V.y));
+	return MakeShared<FJsonValueObject>(O);
+}
+
+bool FMusubiServerMessageWorldJoined::FromJson(const TSharedPtr<FJsonValue>& J, FMusubiServerMessageWorldJoined& Out)
+{
+	const TSharedPtr<FJsonObject>* OP;
+	if (!J.IsValid() || !J->TryGetObject(OP)) return false;
+	const FJsonObject& O = **OP;
+	bool bOk = true;
+	if (TSharedPtr<FJsonValue> F = O.TryGetField(TEXT("world")); F.IsValid()) { { FString V0; if (F->TryGetString(V0)) Out.world = MoveTemp(V0); else bOk = false; } } else bOk = false;
+	if (TSharedPtr<FJsonValue> F = O.TryGetField(TEXT("entity")); F.IsValid()) { { FString V0; if (F->TryGetString(V0) && FMusubiUuid::Parse(V0, Out.entity)) {} else bOk = false; } } else bOk = false;
+	if (TSharedPtr<FJsonValue> F = O.TryGetField(TEXT("spawned")); F.IsValid()) { { bool V0; if (F->TryGetBool(V0)) Out.spawned = V0; else bOk = false; } } else bOk = false;
+	if (TSharedPtr<FJsonValue> F = O.TryGetField(TEXT("x")); F.IsValid()) { { double V0; if (F->TryGetNumber(V0)) Out.x = V0; else bOk = false; } } else bOk = false;
+	if (TSharedPtr<FJsonValue> F = O.TryGetField(TEXT("y")); F.IsValid()) { { double V0; if (F->TryGetNumber(V0)) Out.y = V0; else bOk = false; } } else bOk = false;
+	return bOk;
+}
+
+void FMusubiServerMessageWorldJoined::Write(FMusubiPostcardWriter& W, const FMusubiServerMessageWorldJoined& V)
+{
+	W.Str(V.world);
+	W.Uuid(V.entity);
+	W.Bool(V.spawned);
+	W.F64(V.x);
+	W.F64(V.y);
+}
+
+void FMusubiServerMessageWorldJoined::Read(FMusubiPostcardReader& R, FMusubiServerMessageWorldJoined& Out)
+{
+	Out.world = R.Str();
+	Out.entity = R.Uuid();
+	Out.spawned = R.Bool();
+	Out.x = R.F64();
+	Out.y = R.F64();
+}
+
 TSharedPtr<FJsonValue> FMusubiServerMessageWorldDelta::ToJson(const FMusubiServerMessageWorldDelta& V)
 {
 	TSharedPtr<FJsonObject> O = MakeShared<FJsonObject>();
@@ -4032,6 +4110,7 @@ TSharedPtr<FJsonValue> FMusubiServerMessage::ToJson(const FMusubiServerMessage& 
 	case EMusubiServerMessageTag::PartyList: return MusubiJson::Tagged(TEXT("party_list"), V.PartyList.IsSet() ? FMusubiServerMessagePartyList::ToJson(V.PartyList.GetValue()) : MusubiJson::Null());
 	case EMusubiServerMessageTag::Match: return MusubiJson::Tagged(TEXT("match"), V.Match.IsSet() ? FMusubiServerMessageMatch::ToJson(V.Match.GetValue()) : MusubiJson::Null());
 	case EMusubiServerMessageTag::MatchHost: return MusubiJson::Tagged(TEXT("match_host"), V.MatchHost.IsSet() ? FMusubiServerMessageMatchHost::ToJson(V.MatchHost.GetValue()) : MusubiJson::Null());
+	case EMusubiServerMessageTag::WorldJoined: return MusubiJson::Tagged(TEXT("world_joined"), V.WorldJoined.IsSet() ? FMusubiServerMessageWorldJoined::ToJson(V.WorldJoined.GetValue()) : MusubiJson::Null());
 	case EMusubiServerMessageTag::WorldDelta: return MusubiJson::Tagged(TEXT("world_delta"), V.WorldDelta.IsSet() ? FMusubiServerMessageWorldDelta::ToJson(V.WorldDelta.GetValue()) : MusubiJson::Null());
 	case EMusubiServerMessageTag::NetOpened: return MusubiJson::Tagged(TEXT("net_opened"), V.NetOpened.IsSet() ? FMusubiServerMessageNetOpened::ToJson(V.NetOpened.GetValue()) : MusubiJson::Null());
 	case EMusubiServerMessageTag::NetPacket: return MusubiJson::Tagged(TEXT("net_packet"), V.NetPacket.IsSet() ? FMusubiServerMessageNetPacket::ToJson(V.NetPacket.GetValue()) : MusubiJson::Null());
@@ -4089,6 +4168,7 @@ bool FMusubiServerMessage::FromJson(const TSharedPtr<FJsonValue>& J, FMusubiServ
 	case EMusubiServerMessageTag::PartyList: { FMusubiServerMessagePartyList V0{}; if (!FMusubiServerMessagePartyList::FromJson(P, V0)) bOk = false; Out.PartyList = MoveTemp(V0); break; }
 	case EMusubiServerMessageTag::Match: { FMusubiServerMessageMatch V0{}; if (!FMusubiServerMessageMatch::FromJson(P, V0)) bOk = false; Out.Match = MoveTemp(V0); break; }
 	case EMusubiServerMessageTag::MatchHost: { FMusubiServerMessageMatchHost V0{}; if (!FMusubiServerMessageMatchHost::FromJson(P, V0)) bOk = false; Out.MatchHost = MoveTemp(V0); break; }
+	case EMusubiServerMessageTag::WorldJoined: { FMusubiServerMessageWorldJoined V0{}; if (!FMusubiServerMessageWorldJoined::FromJson(P, V0)) bOk = false; Out.WorldJoined = MoveTemp(V0); break; }
 	case EMusubiServerMessageTag::WorldDelta: { FMusubiServerMessageWorldDelta V0{}; if (!FMusubiServerMessageWorldDelta::FromJson(P, V0)) bOk = false; Out.WorldDelta = MoveTemp(V0); break; }
 	case EMusubiServerMessageTag::NetOpened: { FMusubiServerMessageNetOpened V0{}; if (!FMusubiServerMessageNetOpened::FromJson(P, V0)) bOk = false; Out.NetOpened = MoveTemp(V0); break; }
 	case EMusubiServerMessageTag::NetPacket: { FMusubiServerMessageNetPacket V0{}; if (!FMusubiServerMessageNetPacket::FromJson(P, V0)) bOk = false; Out.NetPacket = MoveTemp(V0); break; }
@@ -4142,6 +4222,7 @@ void FMusubiServerMessage::Write(FMusubiPostcardWriter& W, const FMusubiServerMe
 	case EMusubiServerMessageTag::PartyList: if (V.PartyList.IsSet()) FMusubiServerMessagePartyList::Write(W, V.PartyList.GetValue()); else W.Fail(); break;
 	case EMusubiServerMessageTag::Match: if (V.Match.IsSet()) FMusubiServerMessageMatch::Write(W, V.Match.GetValue()); else W.Fail(); break;
 	case EMusubiServerMessageTag::MatchHost: if (V.MatchHost.IsSet()) FMusubiServerMessageMatchHost::Write(W, V.MatchHost.GetValue()); else W.Fail(); break;
+	case EMusubiServerMessageTag::WorldJoined: if (V.WorldJoined.IsSet()) FMusubiServerMessageWorldJoined::Write(W, V.WorldJoined.GetValue()); else W.Fail(); break;
 	case EMusubiServerMessageTag::WorldDelta: if (V.WorldDelta.IsSet()) FMusubiServerMessageWorldDelta::Write(W, V.WorldDelta.GetValue()); else W.Fail(); break;
 	case EMusubiServerMessageTag::NetOpened: if (V.NetOpened.IsSet()) FMusubiServerMessageNetOpened::Write(W, V.NetOpened.GetValue()); else W.Fail(); break;
 	case EMusubiServerMessageTag::NetPacket: if (V.NetPacket.IsSet()) FMusubiServerMessageNetPacket::Write(W, V.NetPacket.GetValue()); else W.Fail(); break;
@@ -4164,7 +4245,7 @@ void FMusubiServerMessage::Write(FMusubiPostcardWriter& W, const FMusubiServerMe
 void FMusubiServerMessage::Read(FMusubiPostcardReader& R, FMusubiServerMessage& Out)
 {
 	uint64 Idx = R.Varint();
-	if (Idx >= 44) { R.Fail(); return; }
+	if (Idx >= 45) { R.Fail(); return; }
 	Out.Tag = (EMusubiServerMessageTag)Idx;
 	switch (Out.Tag)
 	{
@@ -4196,6 +4277,7 @@ void FMusubiServerMessage::Read(FMusubiPostcardReader& R, FMusubiServerMessage& 
 	case EMusubiServerMessageTag::PartyList: { FMusubiServerMessagePartyList V0{}; FMusubiServerMessagePartyList::Read(R, V0); Out.PartyList = MoveTemp(V0); break; }
 	case EMusubiServerMessageTag::Match: { FMusubiServerMessageMatch V0{}; FMusubiServerMessageMatch::Read(R, V0); Out.Match = MoveTemp(V0); break; }
 	case EMusubiServerMessageTag::MatchHost: { FMusubiServerMessageMatchHost V0{}; FMusubiServerMessageMatchHost::Read(R, V0); Out.MatchHost = MoveTemp(V0); break; }
+	case EMusubiServerMessageTag::WorldJoined: { FMusubiServerMessageWorldJoined V0{}; FMusubiServerMessageWorldJoined::Read(R, V0); Out.WorldJoined = MoveTemp(V0); break; }
 	case EMusubiServerMessageTag::WorldDelta: { FMusubiServerMessageWorldDelta V0{}; FMusubiServerMessageWorldDelta::Read(R, V0); Out.WorldDelta = MoveTemp(V0); break; }
 	case EMusubiServerMessageTag::NetOpened: { FMusubiServerMessageNetOpened V0{}; FMusubiServerMessageNetOpened::Read(R, V0); Out.NetOpened = MoveTemp(V0); break; }
 	case EMusubiServerMessageTag::NetPacket: { FMusubiServerMessageNetPacket V0{}; FMusubiServerMessageNetPacket::Read(R, V0); Out.NetPacket = MoveTemp(V0); break; }

@@ -703,12 +703,12 @@ void UMusubiSimulatorSubsystem::LeaseCells(const TArray<FString>& InCells)
 	});
 }
 
-void UMusubiSimulatorSubsystem::Spawn(double X, double Y, const FMusubiJson& Components, bool bPersistent, bool bGlobal, bool bQueue, TOptional<uint64> DecayTicks, FMusubiSimReply OnReply)
+void UMusubiSimulatorSubsystem::Spawn(double X, double Y, const FMusubiJson& Components, bool bPersistent, bool bGlobal, bool bQueue, TOptional<uint64> DecayTicks, FMusubiSimReply OnReply, TOptional<FMusubiUuid> Owner)
 {
 	FMusubiSimCommand Cmd;
 	Cmd.Tag = EMusubiSimCommandTag::Spawn;
 	FMusubiSimCommandSpawn S;
-	S.x = X; S.y = Y; S.components = Components; S.persistent = bPersistent; S.global = bGlobal; S.queue = bQueue; S.decay_ticks = DecayTicks;
+	S.x = X; S.y = Y; S.components = Components; S.persistent = bPersistent; S.global = bGlobal; S.queue = bQueue; S.decay_ticks = DecayTicks; S.owner = Owner;
 	Cmd.Spawn = MoveTemp(S);
 	TWeakObjectPtr<UMusubiSimulatorSubsystem> Weak(this);
 	SendCommand(MoveTemp(Cmd), [Weak, OnReply](bool bOk, const TSharedPtr<FJsonObject>& R) {
@@ -722,9 +722,16 @@ void UMusubiSimulatorSubsystem::Spawn(double X, double Y, const FMusubiJson& Com
 	});
 }
 
-void UMusubiSimulatorSubsystem::SpawnEntity(double X, double Y, const FString& ComponentsJson, bool bPersistent, bool bGlobal)
+void UMusubiSimulatorSubsystem::SpawnEntity(double X, double Y, const FString& ComponentsJson, bool bPersistent, bool bGlobal, const FString& Owner)
 {
-	Spawn(X, Y, FMusubiJson::FromText(ComponentsJson), bPersistent, bGlobal, false, TOptional<uint64>());
+	TOptional<FMusubiUuid> Acc;
+	FMusubiUuid Parsed;
+	if (!Owner.IsEmpty())
+	{
+		if (FMusubiUuid::Parse(Owner, Parsed)) Acc = Parsed;
+		else UE_LOG(LogMusubiServer, Warning, TEXT("SpawnEntity: Owner '%s' is not a uuid, spawning unowned"), *Owner);
+	}
+	Spawn(X, Y, FMusubiJson::FromText(ComponentsJson), bPersistent, bGlobal, false, TOptional<uint64>(), nullptr, Acc);
 }
 
 void UMusubiSimulatorSubsystem::Despawn(const FMusubiUuid& Entity, FMusubiSimReply OnReply)

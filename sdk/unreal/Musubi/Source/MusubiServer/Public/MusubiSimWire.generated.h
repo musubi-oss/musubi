@@ -629,6 +629,7 @@ struct MUSUBISERVER_API FMusubiSimCommandSpawn
 	bool global = false;
 	bool queue = false;
 	TOptional<uint64> decay_ticks;
+	TOptional<FMusubiUuid> owner;
 
 	static TSharedPtr<FJsonValue> ToJson(const FMusubiSimCommandSpawn& V);
 	static bool FromJson(const TSharedPtr<FJsonValue>& J, FMusubiSimCommandSpawn& Out);
