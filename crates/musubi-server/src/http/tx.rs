@@ -78,8 +78,8 @@ async fn run(
     if r.ops.is_empty() || r.ops.len() > MAX_OPS {
         return Err(Error::InvalidArgument(format!("1..={MAX_OPS} ops required")).into());
     }
-    // grant limits are checked up front against the pool (the tx must not hold them); recorded
-    // after commit so a rolled-back tx does not eat the budget
+    // grant limits are booked up front against the pool (the tx must not hold them) and given
+    // back when the tx fails, so a rolled-back tx does not eat the budget
     let mut grants: Vec<(AccountId, &str, String, i64)> = Vec::new();
     for op in &r.ops {
         match op {
@@ -98,14 +98,34 @@ async fn run(
             _ => {}
         }
     }
+    let mut booked = Vec::with_capacity(grants.len());
     for (who, kind, key, amount) in &grants {
-        crate::grant_limits::check(&s.db, *who, kind, key, *amount).await?;
+        match crate::grant_limits::check(&s.db, *who, kind, key, *amount).await {
+            Ok(b) => booked.push(b),
+            Err(e) => {
+                for b in &booked {
+                    crate::grant_limits::release(&s.db, b).await?;
+                }
+                return Err(e.into());
+            }
+        }
     }
+    match apply(&s, r.ops).await {
+        Ok(results) => Ok(Json(json!({ "results": results }))),
+        Err(e) => {
+            for b in &booked {
+                crate::grant_limits::release(&s.db, b).await?;
+            }
+            Err(e)
+        }
+    }
+}
 
+async fn apply(s: &AppState, ops: Vec<Op>) -> Result<Vec<Value>, ApiError> {
     let mut tx = s.db.begin().await.map_err(Error::internal)?;
-    let mut results = Vec::with_capacity(r.ops.len());
+    let mut results = Vec::with_capacity(ops.len());
     let mut pending = Vec::new();
-    for op in r.ops {
+    for op in ops {
         let out = match op {
             Op::StorageWrite { owner_id, op } => {
                 let p = s
@@ -179,8 +199,5 @@ async fn run(
     for p in pending {
         s.storage.commit_pending(p);
     }
-    for (who, kind, key, amount) in &grants {
-        crate::grant_limits::record(&s.db, *who, kind, key, *amount).await?;
-    }
-    Ok(Json(json!({ "results": results })))
+    Ok(results)
 }

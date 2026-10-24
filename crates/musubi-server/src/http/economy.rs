@@ -421,9 +421,8 @@ async fn adjust(
     Json(r): Json<AdjustReq>,
 ) -> Result<Json<Value>, ApiError> {
     let who = account(&r.account_id)?;
-    crate::grant_limits::check(&s.db, who, "currency", &r.currency, r.delta).await?;
-    crate::grant_limits::record(&s.db, who, "currency", &r.currency, r.delta).await?;
-    let (entry, replayed) = s
+    let booked = crate::grant_limits::check(&s.db, who, "currency", &r.currency, r.delta).await?;
+    let adjusted = s
         .economy
         .adjust(
             who,
@@ -438,7 +437,17 @@ async fn adjust(
                 json!({})
             },
         )
-        .await?;
+        .await;
+    let (entry, replayed) = match adjusted {
+        Ok(v) => v,
+        Err(e) => {
+            crate::grant_limits::release(&s.db, &booked).await?;
+            return Err(e.into());
+        }
+    };
+    if replayed {
+        crate::grant_limits::release(&s.db, &booked).await?;
+    }
     Ok(Json(json!({ "entry": entry, "replayed": replayed })))
 }
 
@@ -556,12 +565,18 @@ async fn grant_item(
     Json(r): Json<GrantItemReq>,
 ) -> Result<Json<Value>, ApiError> {
     let who = account(&r.account_id)?;
-    crate::grant_limits::check(&s.db, who, "item", &r.item_id, r.quantity).await?;
-    let e = s
+    let booked = crate::grant_limits::check(&s.db, who, "item", &r.item_id, r.quantity).await?;
+    let e = match s
         .economy
         .grant_item(who, &r.item_id, r.quantity, r.instance)
-        .await?;
-    crate::grant_limits::record(&s.db, who, "item", &r.item_id, r.quantity).await?;
+        .await
+    {
+        Ok(e) => e,
+        Err(e) => {
+            crate::grant_limits::release(&s.db, &booked).await?;
+            return Err(e.into());
+        }
+    };
     Ok(Json(serde_json::to_value(e).map_err(Error::internal)?))
 }
 
@@ -743,12 +758,18 @@ async fn reward_grant(
     Json(r): Json<RewardGrantReq>,
 ) -> Result<Json<Value>, ApiError> {
     let who = account(&r.account_id)?;
-    crate::grant_limits::check(&s.db, who, "reward_table", &r.table_id, 1).await?;
-    let g = s
+    let booked = crate::grant_limits::check(&s.db, who, "reward_table", &r.table_id, 1).await?;
+    let g = match s
         .economy
         .grant_table_detailed(who, &r.table_id, &r.reference)
-        .await?;
-    crate::grant_limits::record(&s.db, who, "reward_table", &r.table_id, 1).await?;
+        .await
+    {
+        Ok(g) => g,
+        Err(e) => {
+            crate::grant_limits::release(&s.db, &booked).await?;
+            return Err(e.into());
+        }
+    };
     Ok(Json(json!({ "rewards": g.rewards, "mail_id": g.mail_id })))
 }
 
@@ -1896,8 +1917,10 @@ async fn iap_google_notifications(
     let Some(c) = &s.google_iap else {
         return Err(Error::NotFound("google iap is not configured".into()).into());
     };
+    use subtle::ConstantTimeEq;
     let expected = c.notifications_token();
-    if expected.is_empty() || q.token.as_deref() != Some(expected) {
+    let given = q.token.as_deref().unwrap_or("");
+    if expected.is_empty() || !bool::from(given.as_bytes().ct_eq(expected.as_bytes())) {
         return Err(Error::PermissionDenied("bad notifications token".into()).into());
     }
     use base64::Engine;
@@ -2004,6 +2027,21 @@ async fn iap_steam_init(
     };
     if r.quantity <= 0 || r.quantity > 100 || r.steam_id.is_empty() {
         return Err(Error::InvalidArgument("steam_id and quantity 1..=100".into()).into());
+    }
+    if r.steam_id.len() > 20 || !r.steam_id.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(Error::InvalidArgument("steam_id: up to 20 digits".into()).into());
+    }
+    let token_ok = |v: &str, max: usize| {
+        !v.is_empty()
+            && v.len() <= max
+            && v.chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+    };
+    if !token_ok(&r.language, 16) || !token_ok(&r.currency, 8) {
+        return Err(Error::InvalidArgument(
+            "language: 1..=16, currency: 1..=8 of [A-Za-z0-9_-]".into(),
+        )
+        .into());
     }
     let Some(product) = s.economy.steam_product(&r.store_item_id).await? else {
         return Err(Error::NotFound("store item is not sold on steam".into()).into());
@@ -2676,16 +2714,36 @@ async fn craft(
         ))
         .into());
     }
-    for o in &recipe.outputs {
-        let amount = o.amount * r.count;
-        if let Some(i) = &o.item_id {
-            crate::grant_limits::check(&s.db, me.account_id, "item", i, amount).await?;
+    let mut booked = Vec::new();
+    let db = s.db.clone();
+    let give_back = |booked: Vec<crate::grant_limits::Reservation>| async move {
+        for b in &booked {
+            crate::grant_limits::release(&db, b).await?;
         }
-        if let Some(c) = &o.currency {
-            crate::grant_limits::check(&s.db, me.account_id, "currency", c, amount).await?;
+        Ok::<_, Error>(())
+    };
+    for o in &recipe.outputs {
+        let Some(amount) = o.amount.checked_mul(r.count) else {
+            give_back(booked).await?;
+            return Err(Error::InvalidArgument("count: output amount overflows".into()).into());
+        };
+        let limited: Vec<(&str, &String)> = o
+            .item_id
+            .iter()
+            .map(|i| ("item", i))
+            .chain(o.currency.iter().map(|c| ("currency", c)))
+            .collect();
+        for (kind, key) in limited {
+            match crate::grant_limits::check(&s.db, me.account_id, kind, key, amount).await {
+                Ok(b) => booked.push(b),
+                Err(e) => {
+                    give_back(booked).await?;
+                    return Err(e.into());
+                }
+            }
         }
     }
-    let out = s
+    let out = match s
         .economy
         .craft(
             me.account_id,
@@ -2693,17 +2751,17 @@ async fn craft(
             r.count,
             r.idempotency_key.as_deref(),
         )
-        .await?;
-    if !out.replayed {
-        for o in &recipe.outputs {
-            let amount = o.amount * r.count;
-            if let Some(i) = &o.item_id {
-                crate::grant_limits::record(&s.db, me.account_id, "item", i, amount).await?;
-            }
-            if let Some(c) = &o.currency {
-                crate::grant_limits::record(&s.db, me.account_id, "currency", c, amount).await?;
-            }
+        .await
+    {
+        Ok(out) => out,
+        Err(e) => {
+            give_back(booked).await?;
+            return Err(e.into());
         }
+    };
+    if out.replayed {
+        give_back(booked).await?;
+    } else {
         s.events
             .emit(
                 "economy.crafted",

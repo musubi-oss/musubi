@@ -13,6 +13,7 @@ use dashmap::DashMap;
 use musubi_core::{AccountId, Error, Result};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use sqlx::PgPool;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -57,14 +58,13 @@ pub fn normalize(code: &str) -> String {
 const ALPHABET: &[u8] = b"23456789ABCDEFGHJKLMNPQRSTUVWXYZ";
 
 fn random_code(prefix: &str, len: usize) -> String {
+    use rand::RngCore;
     let mut out = String::with_capacity(prefix.len() + len);
     out.push_str(prefix);
-    let mut bytes = Vec::new();
-    while bytes.len() < len {
-        // v7 ids carry 62 random bits in their tail; the time prefix is skipped.
-        bytes.extend_from_slice(&Uuid::now_v7().as_bytes()[9..]);
-    }
-    for b in bytes.into_iter().take(len) {
+    let mut bytes = vec![0u8; len];
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    // 256 is a multiple of the 32-symbol alphabet, so the modulo is unbiased
+    for b in bytes {
         out.push(ALPHABET[(b % ALPHABET.len() as u8) as usize] as char);
     }
     out
@@ -175,6 +175,14 @@ async fn upsert_campaign(
         }
     }
     let per_account = b.per_account.unwrap_or(1).max(1);
+    if b.max_redemptions.is_some_and(|m| m < 1) {
+        return Err(Error::InvalidArgument("max_redemptions must be >= 1".into()).into());
+    }
+    if let (Some(a), Some(z)) = (b.starts_at, b.ends_at) {
+        if z <= a {
+            return Err(Error::InvalidArgument("ends_at must be after starts_at".into()).into());
+        }
+    }
     let c: Campaign = sqlx::query_as(&format!(
         "insert into musubi.code_campaigns (id, name, reward_table, key_group, per_account, max_redemptions, starts_at, ends_at, audience, enabled, metadata)
          values ($1, $2, $3, $4, $5, $6, to_timestamp($7), to_timestamp($8), $9, $10, $11)
@@ -568,9 +576,16 @@ fn attempts() -> &'static DashMap<Uuid, (Instant, u32)> {
 }
 
 const ATTEMPTS_PER_MINUTE: u32 = 10;
+/// Stale per-account counters are swept once the map grows past this, so it cannot grow with
+/// the number of accounts that ever redeemed.
+const ATTEMPTS_SWEEP_AT: usize = 10_000;
 
 fn note_attempt(acc: AccountId) -> Result<()> {
-    let mut e = attempts().entry(acc.0).or_insert((Instant::now(), 0));
+    let map = attempts();
+    if map.len() > ATTEMPTS_SWEEP_AT {
+        map.retain(|_, (t, _)| t.elapsed().as_secs() < 60);
+    }
+    let mut e = map.entry(acc.0).or_insert((Instant::now(), 0));
     if e.0.elapsed().as_secs() >= 60 {
         *e = (Instant::now(), 0);
     }
@@ -581,6 +596,120 @@ fn note_attempt(acc: AccountId) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+/// A redemption that passed every check and holds the code and campaign rows locked; the
+/// handler runs the audience check in between and then [`Pending::finish`]es it.
+struct Pending {
+    tx: sqlx::Transaction<'static, sqlx::Postgres>,
+    acc: AccountId,
+    code: String,
+    campaign: Campaign,
+}
+
+/// Lock the code row and its campaign row, then check activity, per-code uses, per-account
+/// and campaign-wide caps. Locking the campaign serialises concurrent redemptions of different
+/// codes of one campaign, so `per_account` / `max_redemptions` cannot be overshot.
+async fn begin_redeem(db: &PgPool, acc: AccountId, code: &str) -> Result<Pending> {
+    let mut tx = db.begin().await.map_err(Error::internal)?;
+    let row: Option<(String, Option<i64>, i64, bool)> = sqlx::query_as(
+        "select campaign_id, max_uses, uses, revoked from musubi.codes where code = $1 for update",
+    )
+    .bind(code)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(Error::internal)?;
+    let Some((campaign_id, max_uses, uses, revoked)) = row else {
+        return Err(Error::NotFound("unknown code".into()));
+    };
+    if revoked {
+        return Err(Error::NotFound("unknown code".into()));
+    }
+    let c: Campaign = sqlx::query_as(&format!(
+        "select {CAMPAIGN_COLS} from musubi.code_campaigns where id = $1 for update"
+    ))
+    .bind(&campaign_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(Error::internal)?
+    .ok_or_else(|| Error::NotFound(format!("campaign {campaign_id}")))?;
+    let now = OffsetDateTime::now_utc();
+    if !c.enabled || c.starts_at.is_some_and(|t| t > now) || c.ends_at.is_some_and(|t| t <= now) {
+        return Err(Error::Conflict("this code is not active".into()));
+    }
+    if max_uses.is_some_and(|m| uses >= m) {
+        return Err(Error::Conflict("this code has already been used".into()));
+    }
+    let (mine, total): (i64, i64) = sqlx::query_as(
+        "select count(*) filter (where account_id = $2), count(*) from musubi.code_redemptions where campaign_id = $1",
+    )
+    .bind(&campaign_id)
+    .bind(acc.0)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(Error::internal)?;
+    if mine >= c.per_account as i64 {
+        return Err(Error::Conflict("you already redeemed this campaign".into()));
+    }
+    if c.max_redemptions.is_some_and(|m| total >= m) {
+        return Err(Error::Conflict("this campaign is exhausted".into()));
+    }
+    Ok(Pending {
+        tx,
+        acc,
+        code: code.to_string(),
+        campaign: c,
+    })
+}
+
+impl Pending {
+    /// Claim a platform key (if the campaign hands them out), count the use, record the
+    /// redemption and commit. Returns the campaign, the redemption id and the claimed keys.
+    async fn finish(self) -> Result<(Campaign, Uuid, Vec<String>)> {
+        let Pending {
+            mut tx,
+            acc,
+            code,
+            campaign: c,
+        } = self;
+        let mut keys: Vec<String> = Vec::new();
+        if let Some(g) = &c.key_group {
+            let key: Option<(String,)> = sqlx::query_as(
+                "update musubi.platform_keys set claimed_by = $2, claimed_at = now()
+                 where id = (select id from musubi.platform_keys where group_id = $1 and claimed_by is null
+                             order by id limit 1 for update skip locked)
+                 returning key",
+            )
+            .bind(g)
+            .bind(acc.0)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(Error::internal)?;
+            match key {
+                Some((k,)) => keys.push(k),
+                None => return Err(Error::Conflict("no keys left in this campaign".into())),
+            }
+        }
+        sqlx::query("update musubi.codes set uses = uses + 1 where code = $1")
+            .bind(&code)
+            .execute(&mut *tx)
+            .await
+            .map_err(Error::internal)?;
+        let rid = Uuid::now_v7();
+        sqlx::query(
+            "insert into musubi.code_redemptions (id, code, campaign_id, account_id, keys) values ($1, $2, $3, $4, $5)",
+        )
+        .bind(rid)
+        .bind(&code)
+        .bind(&c.id)
+        .bind(acc.0)
+        .bind(&keys)
+        .execute(&mut *tx)
+        .await
+        .map_err(Error::internal)?;
+        tx.commit().await.map_err(Error::internal)?;
+        Ok((c, rid, keys))
+    }
 }
 
 #[derive(Deserialize)]
@@ -600,84 +729,15 @@ async fn redeem(
     if code.is_empty() {
         return Err(Error::InvalidArgument("code is required".into()).into());
     }
-    let mut tx = s.db.begin().await.map_err(Error::internal)?;
-    let row: Option<(String, Option<i64>, i64, bool)> = sqlx::query_as(
-        "select campaign_id, max_uses, uses, revoked from musubi.codes where code = $1 for update",
-    )
-    .bind(&code)
-    .fetch_optional(&mut *tx)
-    .await
-    .map_err(Error::internal)?;
-    let Some((campaign_id, max_uses, uses, revoked)) = row else {
-        return Err(Error::NotFound("unknown code".into()).into());
-    };
-    if revoked {
-        return Err(Error::NotFound("unknown code".into()).into());
-    }
-    let c = load_campaign(&s, &campaign_id).await?;
-    let now = OffsetDateTime::now_utc();
-    if !c.enabled || c.starts_at.is_some_and(|t| t > now) || c.ends_at.is_some_and(|t| t <= now) {
-        return Err(Error::Conflict("this code is not active".into()).into());
-    }
-    if max_uses.is_some_and(|m| uses >= m) {
-        return Err(Error::Conflict("this code has already been used".into()).into());
-    }
-    let (mine, total): (i64, i64) = sqlx::query_as(
-        "select count(*) filter (where account_id = $2), count(*) from musubi.code_redemptions where campaign_id = $1",
-    )
-    .bind(&campaign_id)
-    .bind(acc.0)
-    .fetch_one(&mut *tx)
-    .await
-    .map_err(Error::internal)?;
-    if mine >= c.per_account as i64 {
-        return Err(Error::Conflict("you already redeemed this campaign".into()).into());
-    }
-    if c.max_redemptions.is_some_and(|m| total >= m) {
-        return Err(Error::Conflict("this campaign is exhausted".into()).into());
-    }
-    if let Some(a) = &c.audience {
+    let pending = begin_redeem(&s.db, acc, &code).await?;
+    if let Some(a) = &pending.campaign.audience {
         let set = s.audiences.of(&s.db, &s.economy, acc).await?;
         if !set.contains(a) {
             return Err(Error::PermissionDenied("this code is not for your account".into()).into());
         }
     }
-    let mut keys: Vec<String> = Vec::new();
-    if let Some(g) = &c.key_group {
-        let key: Option<(String,)> = sqlx::query_as(
-            "update musubi.platform_keys set claimed_by = $2, claimed_at = now()
-             where id = (select id from musubi.platform_keys where group_id = $1 and claimed_by is null
-                         order by id limit 1 for update skip locked)
-             returning key",
-        )
-        .bind(g)
-        .bind(acc.0)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(Error::internal)?;
-        match key {
-            Some((k,)) => keys.push(k),
-            None => return Err(Error::Conflict("no keys left in this campaign".into()).into()),
-        }
-    }
-    sqlx::query("update musubi.codes set uses = uses + 1 where code = $1")
-        .bind(&code)
-        .execute(&mut *tx)
-        .await
-        .map_err(Error::internal)?;
-    let rid = Uuid::now_v7();
-    sqlx::query(
-        "insert into musubi.code_redemptions (id, code, campaign_id, account_id, keys) values ($1, $2, $3, $4, $5)",
-    )
-    .bind(rid)
-    .bind(&code)
-    .bind(&campaign_id)
-    .bind(acc.0)
-    .bind(&keys)
-    .execute(&mut *tx)
-    .await
-    .map_err(Error::internal)?;
-    tx.commit().await.map_err(Error::internal)?;
+    let (c, rid, keys) = pending.finish().await?;
+    let campaign_id = c.id.clone();
     let mut reward = json!([]);
     if let Some(t) = &c.reward_table {
         let reference = format!("code:{code}:{}", acc.0);
@@ -718,4 +778,134 @@ async fn my_redemptions(
     Ok(Json(
         json!({ "redemptions": rows.iter().map(|r| redemption_json(r, true)).collect::<Vec<_>>() }),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn pool() -> Option<PgPool> {
+        let url = std::env::var("MUSUBI_TEST_DATABASE_URL").ok()?;
+        let db = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(8)
+            .connect(&url)
+            .await
+            .unwrap();
+        crate::db::migrate(&db).await.unwrap();
+        Some(db)
+    }
+
+    async fn account(db: &PgPool) -> AccountId {
+        let id = Uuid::now_v7();
+        sqlx::query("insert into musubi.accounts (id, username) values ($1, $2)")
+            .bind(id)
+            .bind(format!("audit-{}", id.simple()))
+            .execute(db)
+            .await
+            .unwrap();
+        AccountId(id)
+    }
+
+    #[test]
+    fn codes_come_from_the_os_rng_and_the_alphabet() {
+        let codes: std::collections::HashSet<String> =
+            (0..500).map(|_| random_code("X-", 10)).collect();
+        assert_eq!(codes.len(), 500, "no collisions in 500 draws of 50 bits");
+        for c in &codes {
+            assert!(c.starts_with("X-") && c.len() == 12);
+            assert!(c[2..].bytes().all(|b| ALPHABET.contains(&b)), "{c}");
+        }
+        // the v7-tail generator reused a per-millisecond counter: codes drawn back to back
+        // shared their leading symbols; a CSPRNG must not
+        let a = random_code("", 32);
+        let b = random_code("", 32);
+        assert_ne!(&a[..3], &b[..3]);
+    }
+
+    #[test]
+    fn attempt_counters_are_swept_when_the_map_grows() {
+        let stale = Instant::now() - std::time::Duration::from_secs(120);
+        for _ in 0..=ATTEMPTS_SWEEP_AT {
+            attempts().insert(Uuid::now_v7(), (stale, 10));
+        }
+        assert!(attempts().len() > ATTEMPTS_SWEEP_AT);
+        note_attempt(AccountId(Uuid::now_v7())).unwrap();
+        assert!(attempts().len() <= 2, "stale counters are gone");
+    }
+
+    /// Ten accounts redeem ten different codes of a campaign capped at 3 redemptions at the
+    /// same time: exactly 3 succeed (without the campaign row lock all ten passed the check).
+    #[tokio::test]
+    async fn concurrent_redemptions_respect_the_campaign_cap() {
+        let Some(db) = pool().await else { return };
+        let camp = format!("audit{}", Uuid::now_v7().simple());
+        sqlx::query(
+            "insert into musubi.code_campaigns (id, name, reward_table, per_account, max_redemptions, enabled)
+             values ($1, 'audit', 'audit-no-such-table', 1, 3, true)",
+        )
+        .bind(&camp)
+        .execute(&db)
+        .await
+        .unwrap();
+        let mut codes = Vec::new();
+        for _ in 0..10 {
+            let code = random_code("AUD", 12);
+            sqlx::query(
+                "insert into musubi.codes (code, campaign_id, max_uses) values ($1, $2, 1)",
+            )
+            .bind(&code)
+            .bind(&camp)
+            .execute(&db)
+            .await
+            .unwrap();
+            codes.push(code);
+        }
+        let mut tasks = Vec::new();
+        for code in codes {
+            let db = db.clone();
+            let acc = account(&db).await;
+            tasks.push(tokio::spawn(async move {
+                let p = begin_redeem(&db, acc, &code).await?;
+                p.finish().await.map(|_| ())
+            }));
+        }
+        let mut ok = 0;
+        let mut full = 0;
+        for t in tasks {
+            match t.await.unwrap() {
+                Ok(()) => ok += 1,
+                Err(Error::Conflict(m)) if m == "this campaign is exhausted" => full += 1,
+                Err(e) => panic!("unexpected {e}"),
+            }
+        }
+        assert_eq!((ok, full), (3, 7));
+        // per-account cap and a second use of a one-shot code are refused too
+        let acc = account(&db).await;
+        sqlx::query("update musubi.code_campaigns set max_redemptions = null where id = $1")
+            .bind(&camp)
+            .execute(&db)
+            .await
+            .unwrap();
+        let code = random_code("AUD", 12);
+        sqlx::query("insert into musubi.codes (code, campaign_id, max_uses) values ($1, $2, 2)")
+            .bind(&code)
+            .bind(&camp)
+            .execute(&db)
+            .await
+            .unwrap();
+        begin_redeem(&db, acc, &code)
+            .await
+            .unwrap()
+            .finish()
+            .await
+            .unwrap();
+        assert!(matches!(
+            begin_redeem(&db, acc, &code).await,
+            Err(Error::Conflict(_))
+        ));
+        assert!(matches!(
+            begin_redeem(&db, acc, "NOPE").await,
+            Err(Error::NotFound(_))
+        ));
+    }
 }
