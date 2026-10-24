@@ -37,10 +37,36 @@ async fn search(
     let like = format!("%{}%", needle.replace('%', "\\%").replace('_', "\\_"));
     let lower = needle.to_lowercase();
 
-    let accounts = s
-        .accounts
-        .search_by(Some(needle), None, false, limit, None)
-        .await?;
+    let mut accounts = serde_json::to_value(
+        s.accounts
+            .search_by(Some(needle), None, false, limit, None)
+            .await?,
+    )
+    .map_err(musubi_core::Error::internal)?
+    .as_array()
+    .cloned()
+    .unwrap_or_default();
+    // `search_by` matches usernames and exact ids; operators paste id prefixes from logs.
+    if needle.len() >= 8 && needle.chars().all(|c| c.is_ascii_hexdigit() || c == '-') {
+        let by_id: Vec<(Uuid, String, Option<String>)> = sqlx::query_as(
+            "select id, username, display_name from musubi.accounts
+             where deleted_at is null and id::text like $1 order by created_at desc limit $2",
+        )
+        .bind(format!("{}%", lower))
+        .bind(limit)
+        .fetch_all(&s.db)
+        .await
+        .map_err(musubi_core::Error::internal)?;
+        for (id, username, display_name) in by_id {
+            if !accounts
+                .iter()
+                .any(|a| a.get("id").and_then(Value::as_str) == Some(&id.to_string()))
+            {
+                accounts
+                    .push(json!({ "id": id, "username": username, "display_name": display_name }));
+            }
+        }
+    }
 
     let worlds: Vec<(String, Option<Uuid>)> = sqlx::query_as(
         "select name, node_id from musubi.worlds where cluster_group = $1 and name ilike $2 order by name limit $3",
