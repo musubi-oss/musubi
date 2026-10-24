@@ -34,6 +34,7 @@ pub fn router() -> Router<AppState> {
         )
         .route("/v1/server/data_rights/run", post(server_run))
         .route("/v1/server/data_rights/{id}", get(server_one))
+        .route("/v1/server/data_rights/{id}/download", get(server_download))
         .route("/v1/server/data_rights/{id}/cancel", post(server_cancel))
 }
 
@@ -317,6 +318,27 @@ async fn my_download(
         Some((acc, _, _)) if acc != me.account_id.0 => {
             Err(Error::NotFound(format!("request {id}")).into())
         }
+        Some((_, st, Some(v))) if st == "done" => Ok(Json(v)),
+        Some((_, st, None)) if st == "done" => Err(Error::NotFound("export expired".into()).into()),
+        Some((_, st, _)) => Err(Error::Conflict(format!("export is {st}")).into()),
+        None => Err(Error::NotFound(format!("request {id}")).into()),
+    }
+}
+
+/// `GET /v1/server/data_rights/{id}/download` — the finished export of any account, for operators.
+async fn server_download(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Value>, ApiError> {
+    let row: Option<(Uuid, String, Option<Value>)> = sqlx::query_as(
+        "select account_id, status, result from musubi.data_rights_requests where id = $1 and kind = 'export'",
+    )
+    .bind(id)
+    .fetch_optional(&s.db)
+    .await
+    .map_err(Error::internal)?;
+    match row {
         Some((_, st, Some(v))) if st == "done" => Ok(Json(v)),
         Some((_, st, None)) if st == "done" => Err(Error::NotFound("export expired".into()).into()),
         Some((_, st, _)) => Err(Error::Conflict(format!("export is {st}")).into()),

@@ -1,0 +1,1 @@
+import{d as s,c as n,t,j as o}from"./index-Chxoe8Dn.js";const a={class:"json"},l=s({__name:"JsonView",props:{value:{}},setup(e){return(r,c)=>(o(),n("pre",a,t(JSON.stringify(e.value,null,2)),1))}});export{l as _};

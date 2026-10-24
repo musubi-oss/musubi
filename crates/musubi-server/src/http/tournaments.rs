@@ -17,6 +17,7 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/tournaments/{id}", get(get_one))
         .route("/v1/tournaments/{id}/join", post(join))
         .route("/v1/tournaments/{id}/records", get(records).post(write))
+        .route("/v1/server/tournaments/{id}/records", get(records_server))
         .route("/v1/tournaments/{id}/around/{owner}", get(around))
         .route("/v1/server/tournaments", get(list_server).post(create))
         .route("/v1/server/tournaments/{id}", delete(delete_one))
@@ -205,6 +206,28 @@ struct TournamentWrite {
 async fn records(
     State(s): State<AppState>,
     Bearer(_): Bearer,
+    Path(id): Path<String>,
+    Query(q): Query<RecordsQuery>,
+) -> Result<Json<RecordList>, ApiError> {
+    let owners = parse_ids(q.owner_ids.as_deref())?;
+    Ok(Json(
+        s.tournaments
+            .records(
+                &s.leaderboards,
+                &id,
+                &owners,
+                q.limit,
+                q.cursor.as_deref(),
+                q.expiry,
+            )
+            .await?,
+    ))
+}
+
+/// `GET /v1/server/tournaments/{id}/records` — the same record list for operators (console) under a server key.
+async fn records_server(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
     Path(id): Path<String>,
     Query(q): Query<RecordsQuery>,
 ) -> Result<Json<RecordList>, ApiError> {
