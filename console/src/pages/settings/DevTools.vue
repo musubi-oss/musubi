@@ -26,7 +26,16 @@ const demoManifest = () => ({
   })),
 })
 // One click of demo data for an empty node: 12 players with wallets, inventory and storage, removable as fixture "demo".
-function demo() { act(() => post('/v1/admin/dev/fixtures', { name: 'demo', reset: true, ...demoManifest() }), 'demo fixture applied — 12 players with wallets, inventory and storage') }
+async function demo() {
+  const quiet = async (p: string, body: any) => { try { await post(p, body) } catch { /* already exists */ } }
+  await Promise.all([
+    quiet('/v1/server/currencies', { code: 'gold', name: 'Gold', max_balance: null }),
+    quiet('/v1/server/currencies', { code: 'gems', name: 'Gems', max_balance: null }),
+    ...[['sword_basic', 'Basic sword', 'weapon', false], ['potion_small', 'Small potion', 'consumable', true], ['shield_wood', 'Wooden shield', 'armor', false]]
+      .map(([id, name, category, stackable]) => quiet('/v1/server/items', { id, name, category, stackable, max_stack: stackable ? 99 : 1, tradeable: true, unique: false, bind: null, properties: {}, slots: [] })),
+  ])
+  act(() => post('/v1/admin/dev/fixtures', { name: 'demo', reset: true, ...demoManifest() }), 'demo data loaded — 2 currencies, 3 items, 12 players with wallets, inventory and storage')
+}
 async function lock() { const e = lockEmail.value.trim(); if (!e) return; try { x.value.lock = await get(`/v1/admin/auth/locks/${encodeURIComponent(e)}`) } catch (er: any) { x.value.lock = { email: e, error: er.message } } }
 </script>
 <template>
