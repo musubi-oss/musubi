@@ -67,6 +67,8 @@ export const router = createRouter({
       { path: 'loadtests', component: () => import('./pages/cluster/LoadTests.vue') },
       { path: 'matches', component: () => import('./pages/cluster/Matches.vue') },
       { path: '', component: () => import('./pages/cluster/Overview.vue') },
+      { path: 'nodes', redirect: '/cluster' },
+      { path: 'reports', redirect: '/analytics/reports' },
       { path: ':page', component: () => import('./pages/Generic.vue'), props: (r) => ({ res: catalog.cluster.find((x) => x.id === r.params.page) ?? catalog.cluster[0] }) },
     ]},
     { path: '/social', component: () => import('./pages/social/Index.vue'), children: [
@@ -118,6 +120,8 @@ export const router = createRouter({
     { path: '/analytics', component: () => import('./pages/analytics/Index.vue'), children: [
       { path: '', component: () => import('./pages/analytics/Overview.vue') },
       { path: 'events', component: () => import('./pages/analytics/Events.vue') },
+      { path: 'overview', redirect: '/analytics' },
+      { path: 'crashes', redirect: '/players/crashes' },
       { path: ':page', component: () => import('./pages/Generic.vue'), props: (r) => ({ res: catalog.analytics.find((x) => x.id === r.params.page) ?? catalog.analytics[0] }) },
     ]},
     { path: '/settings', component: () => import('./pages/settings/Index.vue'), children: [

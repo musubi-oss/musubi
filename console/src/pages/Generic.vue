@@ -10,8 +10,10 @@ import Drawer from '../components/Drawer.vue'
 import JsonView from '../components/JsonView.vue'
 import Kv from '../components/Kv.vue'
 import { toast } from '../stores/toast'
+import { about } from '../about'
 const props = defineProps<{ res: Res }>()
 const router = useRouter(); const route = useRoute()
+const intro = computed(() => about[`${route.path.split('/')[1]}/${props.res.id}`] ?? '')
 const pending = ref<{ act: Act; row: any; text: string } | null>(null)
 const data = ref<any>(null); const rows = ref<any[]>([]); const err = ref(''); const off = ref(''); const busy = ref(false)
 const q = ref(String(route.query.q ?? '')); const cursor = ref<string | null>(null); const stack = ref<string[]>([])
@@ -36,6 +38,7 @@ async function load(c: string | null = null) {
     const list = Array.isArray(d) ? d : props.res.rowsKey ? d?.[props.res.rowsKey] : Object.values(d ?? {}).find(Array.isArray)
     rows.value = Array.isArray(list) ? list : []
     cursor.value = d?.next_cursor ?? d?.cursor ?? null
+    if (d && !Array.isArray(d) && d.enabled === false && !rows.value.length) off.value = `${props.res.title} is disabled in this node's config.`
   } catch (e: any) {
     // 400/404 with 'not enabled / not running / not configured' = the feature is off on this node, not a failure
     if ((e.status === 400 || e.status === 404) && /not (enabled|running|configured|available)/i.test(e.message ?? '')) off.value = e.message.replace(/^(invalid argument|not found): /, '')
@@ -99,6 +102,7 @@ onMounted(() => { if (props.res.custom !== 'zanshin') load() })
 <template>
   <div class="card">
     <h2>{{ res.title }} <small v-if="isList">({{ shown.length !== rows.length ? shown.length + ' of ' : '' }}{{ rows.length }}{{ cursor ? '+' : '' }})</small></h2>
+    <p class="about" v-if="intro">{{ intro }}</p>
     <div class="tools" v-if="isList && !off && res.custom !== 'zanshin'">
       <input class="in" v-model="q" placeholder="filter — any field, space = and" @keyup.enter="load()" /><button class="btn s" v-if="q" @click="q = ''" title="clear">×</button>
       <button class="btn" @click="load()" :disabled="busy">Refresh</button>
@@ -118,7 +122,7 @@ onMounted(() => { if (props.res.custom !== 'zanshin') load() })
       </div>
     </template>
     <template v-else-if="isList && !off">
-      <DataTable :cols="cols" :rows="shown" :loading="busy" pick @pick="pick" :empty="q ? 'Nothing matches the filter' : 'No Data'">
+      <DataTable :cols="cols" :rows="shown" :loading="busy" pick @pick="pick" :empty="q ? 'Nothing matches the filter' : `No ${res.title.toLowerCase()} yet` + (res.template ? ' — Create one above' : ' — rows appear here as the game creates them')">
         <template #actions="{ row }" v-if="res.actions || res.link">
           <span style="display:flex;gap:6px;justify-content:flex-end">
             <button v-if="res.link && res.link(row)" class="btn s" @click="router.push(res.link(row)!)">Open</button>
