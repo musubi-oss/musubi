@@ -14,6 +14,10 @@ import { Route as LoginRouteImport } from './routes/login'
 import { Route as AppIndexRouteImport } from './routes/_app/index'
 import { Route as AppSectionIndexRouteImport } from './routes/_app/$section/index'
 import { Route as AppClusterIndexRouteImport } from './routes/_app/cluster/index'
+import { Route as AppEconomyCodesRouteImport } from './routes/_app/economy/codes'
+import { Route as AppEconomyFraudRouteImport } from './routes/_app/economy/fraud'
+import { Route as AppEconomyInventory_opsRouteImport } from './routes/_app/economy/inventory_ops'
+import { Route as AppEconomyQuestsRouteImport } from './routes/_app/economy/quests'
 import { Route as AppPlayersAccessRouteImport } from './routes/_app/players/access'
 import { Route as AppPlayersAuth_providersRouteImport } from './routes/_app/players/auth_providers'
 import { Route as AppPlayersCrashesRouteImport } from './routes/_app/players/crashes'
@@ -29,6 +33,7 @@ import { Route as AppSocialSessionsRouteImport } from './routes/_app/social/sess
 import { Route as AppSocialStatsRouteImport } from './routes/_app/social/stats'
 import { Route as AppSectionPageIndexRouteImport } from './routes/_app/$section/$page/index'
 import { Route as AppSectionPageIdRouteImport } from './routes/_app/$section/$page/$id'
+import { Route as AppEconomyCodesIdRouteImport } from './routes/_app/economy/codes/$id'
 import { Route as AppLiveopsAudiencesNameRouteImport } from './routes/_app/liveops/audiences/$name'
 import { Route as AppLiveopsChangesetsIdRouteImport } from './routes/_app/liveops/changesets/$id'
 import { Route as AppLiveopsConfigsNameRouteImport } from './routes/_app/liveops/configs/$name'
@@ -66,6 +71,26 @@ const AppSectionIndexRoute = AppSectionIndexRouteImport.update({
 const AppClusterIndexRoute = AppClusterIndexRouteImport.update({
   id: '/cluster/',
   path: '/cluster/',
+  getParentRoute: () => AppRoute,
+} as any)
+const AppEconomyCodesRoute = AppEconomyCodesRouteImport.update({
+  id: '/economy/codes',
+  path: '/economy/codes',
+  getParentRoute: () => AppRoute,
+} as any)
+const AppEconomyFraudRoute = AppEconomyFraudRouteImport.update({
+  id: '/economy/fraud',
+  path: '/economy/fraud',
+  getParentRoute: () => AppRoute,
+} as any)
+const AppEconomyInventory_opsRoute = AppEconomyInventory_opsRouteImport.update({
+  id: '/economy/inventory_ops',
+  path: '/economy/inventory_ops',
+  getParentRoute: () => AppRoute,
+} as any)
+const AppEconomyQuestsRoute = AppEconomyQuestsRouteImport.update({
+  id: '/economy/quests',
+  path: '/economy/quests',
   getParentRoute: () => AppRoute,
 } as any)
 const AppPlayersAccessRoute = AppPlayersAccessRouteImport.update({
@@ -144,6 +169,11 @@ const AppSectionPageIdRoute = AppSectionPageIdRouteImport.update({
   path: '/$section/$page/$id',
   getParentRoute: () => AppRoute,
 } as any)
+const AppEconomyCodesIdRoute = AppEconomyCodesIdRouteImport.update({
+  id: '/$id',
+  path: '/$id',
+  getParentRoute: () => AppEconomyCodesRoute,
+} as any)
 const AppLiveopsAudiencesNameRoute = AppLiveopsAudiencesNameRouteImport.update({
   id: '/liveops/audiences/$name',
   path: '/liveops/audiences/$name',
@@ -219,6 +249,10 @@ const AppWorldWorldsWEntitiesIdRoute =
 export interface FileRoutesByFullPath {
   '/': typeof AppIndexRoute
   '/login': typeof LoginRoute
+  '/economy/codes': typeof AppEconomyCodesRouteWithChildren
+  '/economy/fraud': typeof AppEconomyFraudRoute
+  '/economy/inventory_ops': typeof AppEconomyInventory_opsRoute
+  '/economy/quests': typeof AppEconomyQuestsRoute
   '/players/access': typeof AppPlayersAccessRoute
   '/players/auth_providers': typeof AppPlayersAuth_providersRoute
   '/players/crashes': typeof AppPlayersCrashesRoute
@@ -235,6 +269,7 @@ export interface FileRoutesByFullPath {
   '/$section/': typeof AppSectionIndexRoute
   '/cluster/': typeof AppClusterIndexRoute
   '/$section/$page/$id': typeof AppSectionPageIdRoute
+  '/economy/codes/$id': typeof AppEconomyCodesIdRoute
   '/liveops/audiences/$name': typeof AppLiveopsAudiencesNameRoute
   '/liveops/changesets/$id': typeof AppLiveopsChangesetsIdRoute
   '/liveops/configs/$name': typeof AppLiveopsConfigsNameRoute
@@ -254,6 +289,10 @@ export interface FileRoutesByFullPath {
 export interface FileRoutesByTo {
   '/login': typeof LoginRoute
   '/': typeof AppIndexRoute
+  '/economy/codes': typeof AppEconomyCodesRouteWithChildren
+  '/economy/fraud': typeof AppEconomyFraudRoute
+  '/economy/inventory_ops': typeof AppEconomyInventory_opsRoute
+  '/economy/quests': typeof AppEconomyQuestsRoute
   '/players/access': typeof AppPlayersAccessRoute
   '/players/auth_providers': typeof AppPlayersAuth_providersRoute
   '/players/crashes': typeof AppPlayersCrashesRoute
@@ -270,6 +309,7 @@ export interface FileRoutesByTo {
   '/$section': typeof AppSectionIndexRoute
   '/cluster': typeof AppClusterIndexRoute
   '/$section/$page/$id': typeof AppSectionPageIdRoute
+  '/economy/codes/$id': typeof AppEconomyCodesIdRoute
   '/liveops/audiences/$name': typeof AppLiveopsAudiencesNameRoute
   '/liveops/changesets/$id': typeof AppLiveopsChangesetsIdRoute
   '/liveops/configs/$name': typeof AppLiveopsConfigsNameRoute
@@ -291,6 +331,10 @@ export interface FileRoutesById {
   '/_app': typeof AppRouteWithChildren
   '/login': typeof LoginRoute
   '/_app/': typeof AppIndexRoute
+  '/_app/economy/codes': typeof AppEconomyCodesRouteWithChildren
+  '/_app/economy/fraud': typeof AppEconomyFraudRoute
+  '/_app/economy/inventory_ops': typeof AppEconomyInventory_opsRoute
+  '/_app/economy/quests': typeof AppEconomyQuestsRoute
   '/_app/players/access': typeof AppPlayersAccessRoute
   '/_app/players/auth_providers': typeof AppPlayersAuth_providersRoute
   '/_app/players/crashes': typeof AppPlayersCrashesRoute
@@ -307,6 +351,7 @@ export interface FileRoutesById {
   '/_app/$section/': typeof AppSectionIndexRoute
   '/_app/cluster/': typeof AppClusterIndexRoute
   '/_app/$section/$page/$id': typeof AppSectionPageIdRoute
+  '/_app/economy/codes/$id': typeof AppEconomyCodesIdRoute
   '/_app/liveops/audiences/$name': typeof AppLiveopsAudiencesNameRoute
   '/_app/liveops/changesets/$id': typeof AppLiveopsChangesetsIdRoute
   '/_app/liveops/configs/$name': typeof AppLiveopsConfigsNameRoute
@@ -328,6 +373,10 @@ export interface FileRouteTypes {
   fullPaths:
     | '/'
     | '/login'
+    | '/economy/codes'
+    | '/economy/fraud'
+    | '/economy/inventory_ops'
+    | '/economy/quests'
     | '/players/access'
     | '/players/auth_providers'
     | '/players/crashes'
@@ -344,6 +393,7 @@ export interface FileRouteTypes {
     | '/$section/'
     | '/cluster/'
     | '/$section/$page/$id'
+    | '/economy/codes/$id'
     | '/liveops/audiences/$name'
     | '/liveops/changesets/$id'
     | '/liveops/configs/$name'
@@ -363,6 +413,10 @@ export interface FileRouteTypes {
   to:
     | '/login'
     | '/'
+    | '/economy/codes'
+    | '/economy/fraud'
+    | '/economy/inventory_ops'
+    | '/economy/quests'
     | '/players/access'
     | '/players/auth_providers'
     | '/players/crashes'
@@ -379,6 +433,7 @@ export interface FileRouteTypes {
     | '/$section'
     | '/cluster'
     | '/$section/$page/$id'
+    | '/economy/codes/$id'
     | '/liveops/audiences/$name'
     | '/liveops/changesets/$id'
     | '/liveops/configs/$name'
@@ -399,6 +454,10 @@ export interface FileRouteTypes {
     | '/_app'
     | '/login'
     | '/_app/'
+    | '/_app/economy/codes'
+    | '/_app/economy/fraud'
+    | '/_app/economy/inventory_ops'
+    | '/_app/economy/quests'
     | '/_app/players/access'
     | '/_app/players/auth_providers'
     | '/_app/players/crashes'
@@ -415,6 +474,7 @@ export interface FileRouteTypes {
     | '/_app/$section/'
     | '/_app/cluster/'
     | '/_app/$section/$page/$id'
+    | '/_app/economy/codes/$id'
     | '/_app/liveops/audiences/$name'
     | '/_app/liveops/changesets/$id'
     | '/_app/liveops/configs/$name'
@@ -472,6 +532,34 @@ declare module '@tanstack/react-router' {
       path: '/cluster'
       fullPath: '/cluster/'
       preLoaderRoute: typeof AppClusterIndexRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/economy/codes': {
+      id: '/_app/economy/codes'
+      path: '/economy/codes'
+      fullPath: '/economy/codes'
+      preLoaderRoute: typeof AppEconomyCodesRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/economy/fraud': {
+      id: '/_app/economy/fraud'
+      path: '/economy/fraud'
+      fullPath: '/economy/fraud'
+      preLoaderRoute: typeof AppEconomyFraudRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/economy/inventory_ops': {
+      id: '/_app/economy/inventory_ops'
+      path: '/economy/inventory_ops'
+      fullPath: '/economy/inventory_ops'
+      preLoaderRoute: typeof AppEconomyInventory_opsRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/economy/quests': {
+      id: '/_app/economy/quests'
+      path: '/economy/quests'
+      fullPath: '/economy/quests'
+      preLoaderRoute: typeof AppEconomyQuestsRouteImport
       parentRoute: typeof AppRoute
     }
     '/_app/players/access': {
@@ -579,6 +667,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AppSectionPageIdRouteImport
       parentRoute: typeof AppRoute
     }
+    '/_app/economy/codes/$id': {
+      id: '/_app/economy/codes/$id'
+      path: '/$id'
+      fullPath: '/economy/codes/$id'
+      preLoaderRoute: typeof AppEconomyCodesIdRouteImport
+      parentRoute: typeof AppEconomyCodesRoute
+    }
     '/_app/liveops/audiences/$name': {
       id: '/_app/liveops/audiences/$name'
       path: '/liveops/audiences/$name'
@@ -680,8 +775,24 @@ declare module '@tanstack/react-router' {
   }
 }
 
+interface AppEconomyCodesRouteChildren {
+  AppEconomyCodesIdRoute: typeof AppEconomyCodesIdRoute
+}
+
+const AppEconomyCodesRouteChildren: AppEconomyCodesRouteChildren = {
+  AppEconomyCodesIdRoute: AppEconomyCodesIdRoute,
+}
+
+const AppEconomyCodesRouteWithChildren = AppEconomyCodesRoute._addFileChildren(
+  AppEconomyCodesRouteChildren,
+)
+
 interface AppRouteChildren {
   AppIndexRoute: typeof AppIndexRoute
+  AppEconomyCodesRoute: typeof AppEconomyCodesRouteWithChildren
+  AppEconomyFraudRoute: typeof AppEconomyFraudRoute
+  AppEconomyInventory_opsRoute: typeof AppEconomyInventory_opsRoute
+  AppEconomyQuestsRoute: typeof AppEconomyQuestsRoute
   AppPlayersAccessRoute: typeof AppPlayersAccessRoute
   AppPlayersAuth_providersRoute: typeof AppPlayersAuth_providersRoute
   AppPlayersCrashesRoute: typeof AppPlayersCrashesRoute
@@ -717,6 +828,10 @@ interface AppRouteChildren {
 
 const AppRouteChildren: AppRouteChildren = {
   AppIndexRoute: AppIndexRoute,
+  AppEconomyCodesRoute: AppEconomyCodesRouteWithChildren,
+  AppEconomyFraudRoute: AppEconomyFraudRoute,
+  AppEconomyInventory_opsRoute: AppEconomyInventory_opsRoute,
+  AppEconomyQuestsRoute: AppEconomyQuestsRoute,
   AppPlayersAccessRoute: AppPlayersAccessRoute,
   AppPlayersAuth_providersRoute: AppPlayersAuth_providersRoute,
   AppPlayersCrashesRoute: AppPlayersCrashesRoute,
