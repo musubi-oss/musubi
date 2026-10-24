@@ -452,6 +452,28 @@ struct BuyShieldReq {
     hours: i64,
 }
 
+/// `(shield seconds, wallet cost)` for buying `hours` of shield. All arithmetic is checked: an
+/// unchecked `hours * 3_600` / `per_hour * hours` wraps in release builds, which would turn a
+/// huge `hours` into a negative "cost" and credit the wallet instead of debiting it.
+fn shield_purchase(
+    rules: &Rules,
+    price: &crate::async_mm::ShieldPrice,
+    hours: i64,
+) -> Result<(i64, i64), Error> {
+    let max_hours = rules.shield_max_secs / 3_600;
+    let bad = || Error::InvalidArgument(format!("hours must be 1..={max_hours}"));
+    if hours <= 0 || hours > max_hours {
+        return Err(bad());
+    }
+    let secs = hours.checked_mul(3_600).ok_or_else(bad)?;
+    let cost = price
+        .per_hour
+        .checked_mul(hours)
+        .filter(|c| *c > 0)
+        .ok_or_else(|| Error::InvalidArgument("shield price overflows".into()))?;
+    Ok((secs, cost))
+}
+
 /// Buy shield time with the queue's `shield_price` currency (wallet debit, ledger reason
 /// `async_shield`).
 async fn buy_shield(
@@ -465,17 +487,10 @@ async fn buy_shield(
         .shield_price
         .clone()
         .ok_or_else(|| Error::PermissionDenied("shields are not for sale in this queue".into()))?;
-    if r.hours <= 0 || r.hours * 3_600 > rules.shield_max_secs {
-        return Err(Error::InvalidArgument(format!(
-            "hours must be 1..={}",
-            rules.shield_max_secs / 3_600
-        ))
-        .into());
-    }
+    let (secs, cost) = shield_purchase(&rules, &price, r.hours)?;
     if !s.async_mm.open_by(&queue, me.account_id).await?.is_empty() {
         return Err(Error::Conflict("resolve your open attack first".into()).into());
     }
-    let cost = price.per_hour * r.hours;
     let (entry, _) = s
         .economy
         .adjust(
@@ -490,9 +505,47 @@ async fn buy_shield(
         .await?;
     let sh = s
         .async_mm
-        .grant_shield(&rules, &queue, me.account_id, r.hours * 3_600, "bought")
+        .grant_shield(&rules, &queue, me.account_id, secs, "bought")
         .await?;
     Ok(Json(
         json!({ "shield": sh, "cost": cost, "currency": price.currency, "ledger": entry }),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::async_mm::ShieldPrice;
+
+    fn price(per_hour: i64) -> ShieldPrice {
+        ShieldPrice {
+            currency: "gold".into(),
+            per_hour,
+        }
+    }
+
+    #[test]
+    fn shield_purchase_is_checked() {
+        let rules = Rules {
+            shield_max_secs: 7 * 86_400,
+            ..Rules::default()
+        };
+        assert_eq!(shield_purchase(&rules, &price(10), 2).unwrap(), (7_200, 20));
+        assert_eq!(
+            shield_purchase(&rules, &price(10), 168).unwrap(),
+            (604_800, 1_680)
+        );
+        assert!(shield_purchase(&rules, &price(10), 0).is_err());
+        assert!(shield_purchase(&rules, &price(10), -5).is_err());
+        assert!(shield_purchase(&rules, &price(10), 169).is_err());
+        // values that used to wrap into a negative cost (= a wallet credit)
+        assert!(shield_purchase(&rules, &price(10), i64::MAX / 3_600 + 1).is_err());
+        assert!(shield_purchase(&rules, &price(10), i64::MAX).is_err());
+        let huge = Rules {
+            shield_max_secs: i64::MAX,
+            ..Rules::default()
+        };
+        assert!(shield_purchase(&huge, &price(i64::MAX), 2).is_err());
+        assert!(shield_purchase(&huge, &price(10), i64::MAX / 3_600).is_ok());
+    }
 }

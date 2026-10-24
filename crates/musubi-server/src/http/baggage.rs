@@ -132,6 +132,13 @@ async fn apply(
         }
     }
     let mut tx = s.db.begin().await.map_err(Error::internal)?;
+    // `for update` below only locks rows that exist; serialise first writes to a family too so
+    // concurrent PUTs cannot add up past the per-scope / total budgets
+    sqlx::query("select pg_advisory_xact_lock(hashtext($1))")
+        .bind(format!("baggage:{family}"))
+        .execute(&mut *tx)
+        .await
+        .map_err(Error::internal)?;
     let current: Vec<Row> = sqlx::query_as(
         "select family, scope, key, value, set_by, updated_at from musubi.session_baggage
          where family = $1 for update",

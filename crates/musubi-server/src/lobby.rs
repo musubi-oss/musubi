@@ -254,11 +254,30 @@ fn team_ok(team: i32, team_count: i32) -> Result<()> {
 }
 
 fn gen_code() -> String {
-    // the tail of a v7 uuid is random; 6 symbols of a 32-letter alphabet = 30 bits
-    Uuid::now_v7().as_bytes()[10..16]
-        .iter()
-        .map(|b| CODE_ALPHABET[(*b as usize) % CODE_ALPHABET.len()] as char)
+    use rand::Rng;
+    let mut rng = rand::thread_rng();
+    (0..6)
+        .map(|_| CODE_ALPHABET[rng.gen_range(0..CODE_ALPHABET.len())] as char)
         .collect()
+}
+
+fn normalize_code(code: &str) -> String {
+    code.trim().to_ascii_uppercase()
+}
+
+fn ct_eq(a: &str, b: &str) -> bool {
+    a.len() == b.len() && a.bytes().zip(b.bytes()).fold(0u8, |x, (p, q)| x | (p ^ q)) == 0
+}
+
+/// `lobby_members_account_idx` is the last line of defence for "one lobby per account" when two
+/// requests race past the check above: report it as a conflict, not as a server error.
+fn member_insert_err(e: sqlx::Error) -> Error {
+    match e {
+        sqlx::Error::Database(d) if d.is_unique_violation() => {
+            Error::Conflict("already in a lobby".into())
+        }
+        e => Error::internal(e),
+    }
 }
 
 #[derive(Clone)]
@@ -390,7 +409,7 @@ impl LobbyService {
                and ($5::uuid is null or l.id < $5)
              order by l.id desc limit $6"
         ))
-        .bind(q.name.as_deref().map(|s| s.replace(['%', '_'], "")))
+        .bind(q.name.as_deref().map(|s| s.replace(['%', '_', '\\'], "")))
         .bind(q.region.as_deref())
         .bind(metadata)
         .bind(has_slots)
@@ -487,7 +506,7 @@ impl LobbyService {
             .bind(req.team)
             .execute(&mut *tx)
             .await
-            .map_err(Error::internal)?;
+            .map_err(member_insert_err)?;
         tx.commit().await.map_err(Error::internal)?;
         self.get(&id.to_string(), Some(me)).await
     }
@@ -498,7 +517,7 @@ impl LobbyService {
             (Some(id), _) => parse_id(id)?,
             (None, Some(code)) => {
                 sqlx::query_scalar::<_, Uuid>("select id from musubi.lobbies where code = $1")
-                    .bind(code.trim().to_ascii_uppercase())
+                    .bind(normalize_code(code))
                     .fetch_optional(&mut *tx)
                     .await
                     .map_err(Error::internal)?
@@ -510,11 +529,17 @@ impl LobbyService {
         if row.11 != "waiting" {
             return Err(Error::Conflict("lobby already started".into()));
         }
-        // private lobbies are entered by code only
-        if row.3 == "private" && req.code.is_none() {
-            return Err(Error::PermissionDenied(
-                "private lobby: join by code".into(),
-            ));
+        // private lobbies are entered by code only — also when the caller knows the id
+        if row.3 == "private" {
+            let ok = match (req.code.as_deref(), row.4.as_deref()) {
+                (Some(c), Some(expected)) => ct_eq(&normalize_code(c), expected),
+                _ => false,
+            };
+            if !ok {
+                return Err(Error::PermissionDenied(
+                    "private lobby: join by code".into(),
+                ));
+            }
         }
         if let Some(hash) = &row.5 {
             let ok = match req.password.as_deref() {
@@ -561,7 +586,7 @@ impl LobbyService {
             .bind(team)
             .execute(&mut *tx)
             .await
-            .map_err(Error::internal)?;
+            .map_err(member_insert_err)?;
         Self::touch(&mut tx, id).await?;
         tx.commit().await.map_err(Error::internal)?;
         let others: Vec<AccountId> = members.iter().map(|m| m.account_id).collect();
@@ -1318,6 +1343,8 @@ enum Bind {
 }
 
 const MEMBERS: &str = "(select count(*) from musubi.lobby_members m where m.lobby_id = l.id)";
+/// Deep offset paging is O(offset) on the server; clients page with `next_cursor`.
+pub const MAX_SEARCH_OFFSET: i64 = 10_000;
 
 /// (text expression, numeric expression) for a key.
 fn key_exprs(key: &str) -> Result<(String, String)> {
@@ -1373,7 +1400,7 @@ impl LobbyService {
             ));
         }
         let limit = req.limit.unwrap_or(50).clamp(1, 100);
-        let offset = req.offset.unwrap_or(0).max(0);
+        let offset = req.offset.unwrap_or(0).clamp(0, MAX_SEARCH_OFFSET);
         let mut sql = format!(
             "select {LOBBY_COLS} from musubi.lobbies l where l.visibility = 'public' and l.state = 'waiting'"
         );
@@ -1485,7 +1512,7 @@ impl LobbyService {
         }
         let rows = q.fetch_all(&self.db).await.map_err(|e| {
             tracing::debug!(error = %e, sql, "lobby search failed");
-            Error::InvalidArgument(format!("search failed: {e}"))
+            Error::InvalidArgument("search failed: unsupported filter or sort expression".into())
         })?;
         let next_cursor = (rows.len() as i64 == limit).then(|| (offset + limit).to_string());
         Ok(LobbyPage {
@@ -1530,5 +1557,23 @@ impl LobbyService {
         )
         .await;
         Ok(lobby)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn codes_are_six_symbols_of_the_alphabet() {
+        for _ in 0..100 {
+            let c = gen_code();
+            assert_eq!(c.len(), 6);
+            assert!(c.bytes().all(|b| CODE_ALPHABET.contains(&b)), "{c}");
+        }
+        assert_eq!(normalize_code(" ab2c3d \n"), "AB2C3D");
+        assert!(ct_eq("ABCDEF", "ABCDEF"));
+        assert!(!ct_eq("ABCDEF", "ABCDEG"));
+        assert!(!ct_eq("ABCDE", "ABCDEF"));
     }
 }

@@ -74,6 +74,21 @@ const SELECT: &str = "select g.id, g.fleet_id, f.name as fleet, f.region, g.stat
     left join lateral (select avg(score)::float8 as avg, count(*) as votes from musubi.server_ratings sr where sr.key = g.address || ':' || g.port) r on true \
     where ";
 
+/// Deep offset paging is O(offset); the browser shows at most this far.
+const MAX_OFFSET: i64 = 10_000;
+
+/// Escape a user string for use inside a `like … escape '\\'` pattern.
+fn like_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if matches!(c, '\\' | '%' | '_') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
 fn key_of(r: &Row) -> String {
     format!("{}:{}", r.address, r.port)
 }
@@ -164,7 +179,8 @@ async fn list(
     }
     if let Some(t) = q.q.clone() {
         qb.push(" and coalesce(g.labels->>'name', f.name) ilike ")
-            .push_bind(format!("%{}%", t.replace('%', "\\%")));
+            .push_bind(format!("%{}%", like_escape(&t)))
+            .push(" escape '\\'");
     }
     if let Some(n) = q.min_free_slots {
         qb.push(" and g.capacity - g.players >= ").push_bind(n);
@@ -192,7 +208,8 @@ async fn list(
     qb.push(format!(" order by {order}, g.id"));
     qb.push(" limit ")
         .push_bind(q.limit.unwrap_or(50).clamp(1, 200));
-    qb.push(" offset ").push_bind(q.offset.unwrap_or(0).max(0));
+    qb.push(" offset ")
+        .push_bind(q.offset.unwrap_or(0).clamp(0, MAX_OFFSET));
     let rows: Vec<Row> = qb
         .build_query_as()
         .fetch_all(&s.db)
@@ -491,4 +508,16 @@ async fn rate(
         "key": key, "rating": { "avg": avg, "votes": votes },
         "tags": tags.iter().map(|(t, n)| json!({ "tag": t, "votes": n })).collect::<Vec<_>>(),
     })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::like_escape;
+
+    #[test]
+    fn like_escape_neutralises_wildcards_and_escape_char() {
+        assert_eq!(like_escape("dust"), "dust");
+        assert_eq!(like_escape("50%_off"), "50\\%\\_off");
+        assert_eq!(like_escape("tail\\"), "tail\\\\");
+    }
 }

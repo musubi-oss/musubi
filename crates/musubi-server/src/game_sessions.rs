@@ -19,10 +19,15 @@ const CODE_ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 const MAX_DATA_BYTES: usize = 16 * 1024;
 
 fn gen_code() -> String {
-    Uuid::now_v7().as_bytes()[10..16]
-        .iter()
-        .map(|b| CODE_ALPHABET[(*b as usize) % CODE_ALPHABET.len()] as char)
+    use rand::Rng;
+    let mut rng = rand::thread_rng();
+    (0..6)
+        .map(|_| CODE_ALPHABET[rng.gen_range(0..CODE_ALPHABET.len())] as char)
         .collect()
+}
+
+fn ct_eq(a: &str, b: &str) -> bool {
+    a.len() == b.len() && a.bytes().zip(b.bytes()).fold(0u8, |x, (p, q)| x | (p ^ q)) == 0
 }
 
 fn gen_token() -> String {
@@ -707,9 +712,10 @@ impl GameSessionService {
             match s.join_policy.as_str() {
                 "open" => {}
                 "invite" => {
-                    let ok = code
-                        .map(normalize_code)
-                        .is_some_and(|c| Some(c) == s.join_code);
+                    let ok = match (code.map(normalize_code), s.join_code.as_deref()) {
+                        (Some(c), Some(expected)) => ct_eq(&c, expected),
+                        _ => false,
+                    };
                     if !ok {
                         return Err(Error::PermissionDenied(
                             "session is invite-only: a valid code or invitation is required".into(),
@@ -889,7 +895,10 @@ impl GameSessionService {
             ));
         }
         let limit = req.limit.unwrap_or(50).clamp(1, 100);
-        let offset = req.offset.unwrap_or(0).max(0);
+        let offset = req
+            .offset
+            .unwrap_or(0)
+            .clamp(0, crate::lobby::MAX_SEARCH_OFFSET);
         let mut sql = format!("select {} from musubi.game_sessions s where true", cols());
         if public_only {
             sql.push_str(" and s.state = 'active' and s.join_policy = 'open'");
@@ -1010,7 +1019,7 @@ impl GameSessionService {
         }
         let rows = q.fetch_all(&self.db).await.map_err(|e| {
             tracing::debug!(error = %e, sql, "session search failed");
-            Error::InvalidArgument(format!("search failed: {e}"))
+            Error::InvalidArgument("search failed: unsupported filter or sort expression".into())
         })?;
         let next_cursor = (rows.len() as i64 == limit).then(|| (offset + limit).to_string());
         Ok(SessionPage {

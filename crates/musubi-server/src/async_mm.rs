@@ -513,25 +513,61 @@ impl AsyncMatchService {
                 )));
             }
         }
-        let open = self.open_by(queue, me).await?;
-        if open.len() as i64 >= rules.max_open {
+        // The per-attacker budgets (max_open, attacks_per_day, cooldown) are counted and the
+        // attack inserted under one advisory lock per (queue, attacker): without it N concurrent
+        // requests all pass the checks and the attacker gets N times the budget.
+        let mut tx = self.db.begin().await.map_err(Error::internal)?;
+        sqlx::query("select pg_advisory_xact_lock(hashtext($1))")
+            .bind(format!("async_mm:{queue}:{}", me.0))
+            .execute(&mut *tx)
+            .await
+            .map_err(Error::internal)?;
+        let open: i64 = sqlx::query_scalar(
+            "select count(*) from musubi.async_mm_attacks
+             where queue_id = $1 and attacker = $2 and state = 'open'",
+        )
+        .bind(queue)
+        .bind(me.0)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(Error::internal)?;
+        if open >= rules.max_open {
             return Err(Error::Conflict(format!(
-                "{} open attack(s) already; resolve them first",
-                open.len()
+                "{open} open attack(s) already; resolve them first"
             )));
         }
-        if rules.attacks_per_day > 0
-            && self.attacks_today(queue, me).await? >= rules.attacks_per_day
-        {
-            return Err(Error::ResourceExhausted(format!(
-                "attack limit {} per day reached",
-                rules.attacks_per_day
-            )));
+        if rules.attacks_per_day > 0 {
+            let today: i64 = sqlx::query_scalar(
+                "select count(*) from musubi.async_mm_attacks
+                 where queue_id = $1 and attacker = $2 and created_at > now() - interval '1 day'",
+            )
+            .bind(queue)
+            .bind(me.0)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(Error::internal)?;
+            if today >= rules.attacks_per_day {
+                return Err(Error::ResourceExhausted(format!(
+                    "attack limit {} per day reached",
+                    rules.attacks_per_day
+                )));
+            }
         }
         if !revenge {
-            if let Some(last) = self.last_against(queue, me, defender).await? {
-                let since = OffsetDateTime::now_utc() - last.created_at;
-                if last.state == "open" {
+            let last: Option<(String, OffsetDateTime)> = sqlx::query_as(
+                "select state, created_at from musubi.async_mm_attacks
+                 where queue_id = $1 and attacker = $2 and defender = $3
+                 order by created_at desc limit 1",
+            )
+            .bind(queue)
+            .bind(me.0)
+            .bind(defender.0)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(Error::internal)?;
+            if let Some((state, created_at)) = last {
+                let since = OffsetDateTime::now_utc() - created_at;
+                if state == "open" {
                     return Err(Error::Conflict(
                         "you already have an open attack on them".into(),
                     ));
@@ -545,7 +581,14 @@ impl AsyncMatchService {
             }
         }
         if rules.attack_breaks_shield {
-            self.drop_shield(queue, me).await?;
+            sqlx::query(
+                "delete from musubi.async_mm_shields where account_id = $1 and queue_id = $2",
+            )
+            .bind(me.0)
+            .bind(queue)
+            .execute(&mut *tx)
+            .await
+            .map_err(Error::internal)?;
         }
         let id = Uuid::now_v7();
         let sql = format!(
@@ -561,7 +604,7 @@ impl AsyncMatchService {
             .bind(revenge_of)
             .bind(data)
             .bind(rules.attack_ttl_secs as f64)
-            .fetch_one(&self.db)
+            .fetch_one(&mut *tx)
             .await
             .map_err(|e| match e {
                 sqlx::Error::Database(d) if d.is_unique_violation() => {
@@ -569,6 +612,7 @@ impl AsyncMatchService {
                 }
                 e => Error::internal(e),
             })?;
+        tx.commit().await.map_err(Error::internal)?;
         Ok(attack_row(r))
     }
 

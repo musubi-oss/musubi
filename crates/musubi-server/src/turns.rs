@@ -479,6 +479,7 @@ impl TurnService {
     ) -> Result<TurnMatch> {
         let (min, max, vis, turn_secs, action, max_skips) = Self::validate_create(&req)?;
         let mut invite = req.invite.clone();
+        invite.sort();
         invite.dedup();
         if invite.contains(&me) || invite.len() != req.invite.len() {
             return Err(Error::InvalidArgument(
@@ -1165,7 +1166,12 @@ impl TurnService {
         let mut timed_out = 0;
         for (id,) in due {
             let mut tx = self.db.begin().await.map_err(Error::internal)?;
-            let mut m = self.lock(&mut tx, id).await?;
+            let mut m = match self.lock(&mut tx, id).await {
+                Ok(m) => m,
+                // deleted between the scan and the lock: not a reason to abort the whole sweep
+                Err(Error::NotFound(_)) => continue,
+                Err(e) => return Err(e),
+            };
             if m.state != "active" || m.deadline_at.is_none_or(|d| d > now) {
                 continue;
             }

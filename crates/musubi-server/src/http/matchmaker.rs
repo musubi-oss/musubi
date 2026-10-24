@@ -246,7 +246,11 @@ async fn simulate(
     let parties: Vec<(usize, f64)> = r
         .party_sizes
         .iter()
-        .filter_map(|(k, v)| k.parse::<usize>().ok().map(|n| (n.max(1), v.max(0.0))))
+        .filter_map(|(k, v)| {
+            k.parse::<usize>()
+                .ok()
+                .map(|n| (n.clamp(1, cfg.max_count.max(1)), v.max(0.0)))
+        })
         .collect();
     let party_total: f64 = parties.iter().map(|p| p.1).sum();
     let pick = |rng: &mut rand::rngs::StdRng, items: &[(f64,)], total: f64| -> usize {
