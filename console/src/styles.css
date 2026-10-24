@@ -90,3 +90,6 @@ kbd{font-family:var(--mono);font-size:11px;border:1px solid var(--line2);border-
   .login .card{width:min(420px,94vw)}.pager{flex-wrap:wrap;justify-content:center}
   table{font-size:12.5px}th,td{padding:7px 8px}pre.json{max-height:260px}.toasts{left:12px;right:12px;bottom:12px}
 }
+
+/* cross-links by field (refs.ts): same colour as links, underline on hover only */
+.ref{color:var(--blue2);text-decoration:none}.ref:hover{text-decoration:underline}td .ref.cell{overflow:hidden;text-overflow:ellipsis;display:inline-block;max-width:100%;vertical-align:bottom}

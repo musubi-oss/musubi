@@ -4,7 +4,8 @@
 // mono cells copy their value on click of the small copy glyph. Page size is remembered per browser.
 import { ref, computed, watch } from 'vue'
 import { toast } from '../stores/toast'
-export interface Col { key: string; label?: string; mono?: boolean; dim?: boolean; fmt?: (row: any) => string; width?: string; sort?: boolean; num?: boolean }
+import { refFor } from '../refs'
+export interface Col { key: string; label?: string; mono?: boolean; dim?: boolean; fmt?: (row: any) => string; width?: string; sort?: boolean; num?: boolean; ref?: boolean }
 const props = withDefaults(defineProps<{ cols: Col[]; rows: any[]; empty?: string; pick?: boolean; loading?: boolean; pageSize?: number; id?: string }>(), { pageSize: 0 })
 const emit = defineEmits<{ pick: [row: any] }>()
 const SIZES = [25, 50, 100, 500]
@@ -85,7 +86,8 @@ function setSize(e: Event) { size.value = Number((e.target as HTMLSelectElement)
     <tbody>
       <tr v-for="(r, i) in shown" :key="i" :class="{ row: pick }" @click="pick && emit('pick', r)">
         <td v-for="c in cols" :key="c.key" :class="{ m: c.mono, dim: c.dim, cpc: copyable(c, r) }" :title="title(c, r)">
-          <span class="cell">{{ show(c, r) }}</span><button v-if="copyable(c, r)" class="cp" title="copy" @click.stop="copy(c, r)"></button>
+          <router-link v-if="c.ref !== false && refFor(c.key, at(r, c.key), r)" class="cell ref" :to="refFor(c.key, at(r, c.key), r)!" @click.stop>{{ show(c, r) }}</router-link>
+          <span v-else class="cell">{{ show(c, r) }}</span><button v-if="copyable(c, r)" class="cp" title="copy" @click.stop="copy(c, r)"></button>
         </td>
         <td v-if="$slots.actions" @click.stop><slot name="actions" :row="r" /></td>
       </tr>

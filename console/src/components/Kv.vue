@@ -1,10 +1,10 @@
 <script setup lang="ts">
-defineProps<{ k: string; v?: unknown; mono?: boolean; copy?: boolean }>()
+defineProps<{ k: string; v?: unknown; mono?: boolean; copy?: boolean; to?: string | null }>()
 function cp(v: unknown) { navigator.clipboard?.writeText(String(v ?? '')) }
 function show(v: unknown) { if (v === null || v === undefined || v === '') return '—'; if (typeof v === 'object') return JSON.stringify(v); return String(v) }
 </script>
 <template>
   <div class="kv"><div class="k">{{ k }}</div>
-    <div class="v" :class="{ m: mono }"><slot>{{ show(v) }}</slot><button v-if="copy && v" class="cp" title="copy" @click="cp(v)"></button></div>
+    <div class="v" :class="{ m: mono }"><slot><router-link v-if="to" class="ref" :to="to">{{ show(v) }}</router-link><template v-else>{{ show(v) }}</template></slot><button v-if="copy && v" class="cp" title="copy" @click="cp(v)"></button></div>
   </div>
 </template>
