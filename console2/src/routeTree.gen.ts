@@ -31,6 +31,15 @@ import { Route as AppPlayersData_rightsRouteImport } from './routes/_app/players
 import { Route as AppPlayersReportsRouteImport } from './routes/_app/players/reports'
 import { Route as AppServersBuildsRouteImport } from './routes/_app/servers/builds'
 import { Route as AppServersEdgeRouteImport } from './routes/_app/servers/edge'
+import { Route as AppSettingsConfigRouteImport } from './routes/_app/settings/config'
+import { Route as AppSettingsDeletionsRouteImport } from './routes/_app/settings/deletions'
+import { Route as AppSettingsDevtoolsRouteImport } from './routes/_app/settings/devtools'
+import { Route as AppSettingsEnvironmentsRouteImport } from './routes/_app/settings/environments'
+import { Route as AppSettingsLegalRouteImport } from './routes/_app/settings/legal'
+import { Route as AppSettingsOauthRouteImport } from './routes/_app/settings/oauth'
+import { Route as AppSettingsOperatorsRouteImport } from './routes/_app/settings/operators'
+import { Route as AppSettingsSanctionsRouteImport } from './routes/_app/settings/sanctions'
+import { Route as AppSettingsSecretsRouteImport } from './routes/_app/settings/secrets'
 import { Route as AppSocialChat_filtersRouteImport } from './routes/_app/social/chat_filters'
 import { Route as AppSocialMatchesRouteImport } from './routes/_app/social/matches'
 import { Route as AppSocialMatchmakerRouteImport } from './routes/_app/social/matchmaker'
@@ -172,6 +181,51 @@ const AppServersBuildsRoute = AppServersBuildsRouteImport.update({
 const AppServersEdgeRoute = AppServersEdgeRouteImport.update({
   id: '/servers/edge',
   path: '/servers/edge',
+  getParentRoute: () => AppRoute,
+} as any)
+const AppSettingsConfigRoute = AppSettingsConfigRouteImport.update({
+  id: '/settings/config',
+  path: '/settings/config',
+  getParentRoute: () => AppRoute,
+} as any)
+const AppSettingsDeletionsRoute = AppSettingsDeletionsRouteImport.update({
+  id: '/settings/deletions',
+  path: '/settings/deletions',
+  getParentRoute: () => AppRoute,
+} as any)
+const AppSettingsDevtoolsRoute = AppSettingsDevtoolsRouteImport.update({
+  id: '/settings/devtools',
+  path: '/settings/devtools',
+  getParentRoute: () => AppRoute,
+} as any)
+const AppSettingsEnvironmentsRoute = AppSettingsEnvironmentsRouteImport.update({
+  id: '/settings/environments',
+  path: '/settings/environments',
+  getParentRoute: () => AppRoute,
+} as any)
+const AppSettingsLegalRoute = AppSettingsLegalRouteImport.update({
+  id: '/settings/legal',
+  path: '/settings/legal',
+  getParentRoute: () => AppRoute,
+} as any)
+const AppSettingsOauthRoute = AppSettingsOauthRouteImport.update({
+  id: '/settings/oauth',
+  path: '/settings/oauth',
+  getParentRoute: () => AppRoute,
+} as any)
+const AppSettingsOperatorsRoute = AppSettingsOperatorsRouteImport.update({
+  id: '/settings/operators',
+  path: '/settings/operators',
+  getParentRoute: () => AppRoute,
+} as any)
+const AppSettingsSanctionsRoute = AppSettingsSanctionsRouteImport.update({
+  id: '/settings/sanctions',
+  path: '/settings/sanctions',
+  getParentRoute: () => AppRoute,
+} as any)
+const AppSettingsSecretsRoute = AppSettingsSecretsRouteImport.update({
+  id: '/settings/secrets',
+  path: '/settings/secrets',
   getParentRoute: () => AppRoute,
 } as any)
 const AppSocialChat_filtersRoute = AppSocialChat_filtersRouteImport.update({
@@ -351,6 +405,15 @@ export interface FileRoutesByFullPath {
   '/players/reports': typeof AppPlayersReportsRoute
   '/servers/builds': typeof AppServersBuildsRoute
   '/servers/edge': typeof AppServersEdgeRoute
+  '/settings/config': typeof AppSettingsConfigRoute
+  '/settings/deletions': typeof AppSettingsDeletionsRoute
+  '/settings/devtools': typeof AppSettingsDevtoolsRoute
+  '/settings/environments': typeof AppSettingsEnvironmentsRoute
+  '/settings/legal': typeof AppSettingsLegalRoute
+  '/settings/oauth': typeof AppSettingsOauthRoute
+  '/settings/operators': typeof AppSettingsOperatorsRoute
+  '/settings/sanctions': typeof AppSettingsSanctionsRoute
+  '/settings/secrets': typeof AppSettingsSecretsRoute
   '/social/chat_filters': typeof AppSocialChat_filtersRoute
   '/social/matches': typeof AppSocialMatchesRoute
   '/social/matchmaker': typeof AppSocialMatchmakerRoute
@@ -405,6 +468,15 @@ export interface FileRoutesByTo {
   '/players/reports': typeof AppPlayersReportsRoute
   '/servers/builds': typeof AppServersBuildsRoute
   '/servers/edge': typeof AppServersEdgeRoute
+  '/settings/config': typeof AppSettingsConfigRoute
+  '/settings/deletions': typeof AppSettingsDeletionsRoute
+  '/settings/devtools': typeof AppSettingsDevtoolsRoute
+  '/settings/environments': typeof AppSettingsEnvironmentsRoute
+  '/settings/legal': typeof AppSettingsLegalRoute
+  '/settings/oauth': typeof AppSettingsOauthRoute
+  '/settings/operators': typeof AppSettingsOperatorsRoute
+  '/settings/sanctions': typeof AppSettingsSanctionsRoute
+  '/settings/secrets': typeof AppSettingsSecretsRoute
   '/social/chat_filters': typeof AppSocialChat_filtersRoute
   '/social/matches': typeof AppSocialMatchesRoute
   '/social/matchmaker': typeof AppSocialMatchmakerRoute
@@ -461,6 +533,15 @@ export interface FileRoutesById {
   '/_app/players/reports': typeof AppPlayersReportsRoute
   '/_app/servers/builds': typeof AppServersBuildsRoute
   '/_app/servers/edge': typeof AppServersEdgeRoute
+  '/_app/settings/config': typeof AppSettingsConfigRoute
+  '/_app/settings/deletions': typeof AppSettingsDeletionsRoute
+  '/_app/settings/devtools': typeof AppSettingsDevtoolsRoute
+  '/_app/settings/environments': typeof AppSettingsEnvironmentsRoute
+  '/_app/settings/legal': typeof AppSettingsLegalRoute
+  '/_app/settings/oauth': typeof AppSettingsOauthRoute
+  '/_app/settings/operators': typeof AppSettingsOperatorsRoute
+  '/_app/settings/sanctions': typeof AppSettingsSanctionsRoute
+  '/_app/settings/secrets': typeof AppSettingsSecretsRoute
   '/_app/social/chat_filters': typeof AppSocialChat_filtersRoute
   '/_app/social/matches': typeof AppSocialMatchesRoute
   '/_app/social/matchmaker': typeof AppSocialMatchmakerRoute
@@ -517,6 +598,15 @@ export interface FileRouteTypes {
     | '/players/reports'
     | '/servers/builds'
     | '/servers/edge'
+    | '/settings/config'
+    | '/settings/deletions'
+    | '/settings/devtools'
+    | '/settings/environments'
+    | '/settings/legal'
+    | '/settings/oauth'
+    | '/settings/operators'
+    | '/settings/sanctions'
+    | '/settings/secrets'
     | '/social/chat_filters'
     | '/social/matches'
     | '/social/matchmaker'
@@ -571,6 +661,15 @@ export interface FileRouteTypes {
     | '/players/reports'
     | '/servers/builds'
     | '/servers/edge'
+    | '/settings/config'
+    | '/settings/deletions'
+    | '/settings/devtools'
+    | '/settings/environments'
+    | '/settings/legal'
+    | '/settings/oauth'
+    | '/settings/operators'
+    | '/settings/sanctions'
+    | '/settings/secrets'
     | '/social/chat_filters'
     | '/social/matches'
     | '/social/matchmaker'
@@ -626,6 +725,15 @@ export interface FileRouteTypes {
     | '/_app/players/reports'
     | '/_app/servers/builds'
     | '/_app/servers/edge'
+    | '/_app/settings/config'
+    | '/_app/settings/deletions'
+    | '/_app/settings/devtools'
+    | '/_app/settings/environments'
+    | '/_app/settings/legal'
+    | '/_app/settings/oauth'
+    | '/_app/settings/operators'
+    | '/_app/settings/sanctions'
+    | '/_app/settings/secrets'
     | '/_app/social/chat_filters'
     | '/_app/social/matches'
     | '/_app/social/matchmaker'
@@ -821,6 +929,69 @@ declare module '@tanstack/react-router' {
       path: '/servers/edge'
       fullPath: '/servers/edge'
       preLoaderRoute: typeof AppServersEdgeRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/settings/config': {
+      id: '/_app/settings/config'
+      path: '/settings/config'
+      fullPath: '/settings/config'
+      preLoaderRoute: typeof AppSettingsConfigRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/settings/deletions': {
+      id: '/_app/settings/deletions'
+      path: '/settings/deletions'
+      fullPath: '/settings/deletions'
+      preLoaderRoute: typeof AppSettingsDeletionsRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/settings/devtools': {
+      id: '/_app/settings/devtools'
+      path: '/settings/devtools'
+      fullPath: '/settings/devtools'
+      preLoaderRoute: typeof AppSettingsDevtoolsRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/settings/environments': {
+      id: '/_app/settings/environments'
+      path: '/settings/environments'
+      fullPath: '/settings/environments'
+      preLoaderRoute: typeof AppSettingsEnvironmentsRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/settings/legal': {
+      id: '/_app/settings/legal'
+      path: '/settings/legal'
+      fullPath: '/settings/legal'
+      preLoaderRoute: typeof AppSettingsLegalRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/settings/oauth': {
+      id: '/_app/settings/oauth'
+      path: '/settings/oauth'
+      fullPath: '/settings/oauth'
+      preLoaderRoute: typeof AppSettingsOauthRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/settings/operators': {
+      id: '/_app/settings/operators'
+      path: '/settings/operators'
+      fullPath: '/settings/operators'
+      preLoaderRoute: typeof AppSettingsOperatorsRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/settings/sanctions': {
+      id: '/_app/settings/sanctions'
+      path: '/settings/sanctions'
+      fullPath: '/settings/sanctions'
+      preLoaderRoute: typeof AppSettingsSanctionsRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/settings/secrets': {
+      id: '/_app/settings/secrets'
+      path: '/settings/secrets'
+      fullPath: '/settings/secrets'
+      preLoaderRoute: typeof AppSettingsSecretsRouteImport
       parentRoute: typeof AppRoute
     }
     '/_app/social/chat_filters': {
@@ -1073,6 +1244,15 @@ interface AppRouteChildren {
   AppPlayersReportsRoute: typeof AppPlayersReportsRoute
   AppServersBuildsRoute: typeof AppServersBuildsRoute
   AppServersEdgeRoute: typeof AppServersEdgeRoute
+  AppSettingsConfigRoute: typeof AppSettingsConfigRoute
+  AppSettingsDeletionsRoute: typeof AppSettingsDeletionsRoute
+  AppSettingsDevtoolsRoute: typeof AppSettingsDevtoolsRoute
+  AppSettingsEnvironmentsRoute: typeof AppSettingsEnvironmentsRoute
+  AppSettingsLegalRoute: typeof AppSettingsLegalRoute
+  AppSettingsOauthRoute: typeof AppSettingsOauthRoute
+  AppSettingsOperatorsRoute: typeof AppSettingsOperatorsRoute
+  AppSettingsSanctionsRoute: typeof AppSettingsSanctionsRoute
+  AppSettingsSecretsRoute: typeof AppSettingsSecretsRoute
   AppSocialChat_filtersRoute: typeof AppSocialChat_filtersRoute
   AppSocialMatchesRoute: typeof AppSocialMatchesRoute
   AppSocialMatchmakerRoute: typeof AppSocialMatchmakerRoute
@@ -1126,6 +1306,15 @@ const AppRouteChildren: AppRouteChildren = {
   AppPlayersReportsRoute: AppPlayersReportsRoute,
   AppServersBuildsRoute: AppServersBuildsRoute,
   AppServersEdgeRoute: AppServersEdgeRoute,
+  AppSettingsConfigRoute: AppSettingsConfigRoute,
+  AppSettingsDeletionsRoute: AppSettingsDeletionsRoute,
+  AppSettingsDevtoolsRoute: AppSettingsDevtoolsRoute,
+  AppSettingsEnvironmentsRoute: AppSettingsEnvironmentsRoute,
+  AppSettingsLegalRoute: AppSettingsLegalRoute,
+  AppSettingsOauthRoute: AppSettingsOauthRoute,
+  AppSettingsOperatorsRoute: AppSettingsOperatorsRoute,
+  AppSettingsSanctionsRoute: AppSettingsSanctionsRoute,
+  AppSettingsSecretsRoute: AppSettingsSecretsRoute,
   AppSocialChat_filtersRoute: AppSocialChat_filtersRoute,
   AppSocialMatchesRoute: AppSocialMatchesRoute,
   AppSocialMatchmakerRoute: AppSocialMatchmakerRoute,
