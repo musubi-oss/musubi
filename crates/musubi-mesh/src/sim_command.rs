@@ -31,6 +31,9 @@ pub enum SimCommand {
         /// Despawn after this many ticks without a write, interaction or handover.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         decay_ticks: Option<u64>,
+        /// Account whose avatar this is: only its sessions may relay/input on it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        owner: Option<uuid::Uuid>,
     },
     /// The simulator finished its tick `tick`; renews its leases.
     TickDone {
@@ -221,6 +224,7 @@ mod sim_command_wire {
                     global: false,
                     queue: false,
                     decay_ticks: None,
+                    owner: None,
                 },
                 json!({"op": "spawn", "x": 1.5, "y": 2.0, "components": {"hp": 7}}),
             ),

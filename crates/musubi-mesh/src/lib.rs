@@ -256,6 +256,10 @@ pub struct Entity {
     /// and it is reachable through the hierarchy queries rather than the spatial scan.
     #[serde(default)]
     pub contained: bool,
+    /// Account this entity is the avatar of: only its sessions may open an engine relay on it or
+    /// send it inputs (`None` = unowned, anyone may).
+    #[serde(default)]
+    pub owner: Option<Uuid>,
     /// Handover attempts since the last success; drives the backoff after an Ack timeout.
     #[serde(default)]
     pub handover_attempts: u32,
@@ -1312,6 +1316,7 @@ impl World {
             transit: None,
             attached_to: None,
             contained: false,
+            owner: None,
             handover_attempts: 0,
             handover_retry_tick: 0,
             decay_ticks: None,
@@ -1323,6 +1328,17 @@ impl World {
         self.entities.insert(id, e);
         self.record_pos(id, pos);
         id
+    }
+
+    /// Set or clear the owning account (see `Entity::owner`).
+    pub fn set_owner(&mut self, id: EntityId, owner: Option<Uuid>) -> bool {
+        match self.entities.get_mut(&id) {
+            Some(e) => {
+                e.owner = owner;
+                true
+            }
+            None => false,
+        }
     }
 
     fn record_pos(&mut self, id: EntityId, pos: Pos) {

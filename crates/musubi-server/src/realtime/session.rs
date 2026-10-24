@@ -1463,6 +1463,7 @@ async fn world_dispatch(ctx: &Ctx<'_>, world: &str, cmd: WorldCmd) -> Option<Ser
     let env = WorldCmdEnv {
         world: world.to_string(),
         session_id: ctx.presence.session_id,
+        account: Some(*ctx.presence.account_id.as_uuid()),
         cmd,
     };
     let home = match ctx.worlds.home_of(world).await {

@@ -406,6 +406,11 @@ Module `MusubiNet` (runtime, all tiers: the driver uses only classic `UNetDriver
   `net_open{world, entity}` → `net_opened{world, entity, conn, server?, max_packet}` | `error`;
   `net_packet{world, entity, conn, data: bytes}` up, `net_packet{conn, data}` down; `net_close{world, entity,
   conn, reason}` up, `net_close{conn, reason}` down; `net_rehome{world, entity, conn, server?}` down.
+  **Ownership:** an entity spawned with `owner: <account id>` (REST `spawn`, sim `spawn`, `SpawnEntity`'s
+  `Owner`) is that account's avatar — `net_open` and `world_input` from any other account's session are
+  refused with `permission_denied` (also on the shard hosting the cell when the world is split); an entity
+  without `owner` takes anyone (props, NPCs, shared vehicles). The owner is visible on the entity
+  (`GET …/entities/{id}` → `owner`). Set it for every player avatar in production.
   Node ↔ simulator (sim stream): events `net_packet{conn, session, entity, data}` and
   `net_close{conn, session, entity, reason}`; commands `net_packet{conn, session, data}` and
   `net_close{conn, session, entity, reason}`. `data` is a byte array (raw in postcard, numbers in JSON);

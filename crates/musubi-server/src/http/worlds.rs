@@ -390,6 +390,9 @@ struct SpawnReq {
     /// Despawn after this many ticks without a write, interaction or handover (litter).
     #[serde(default)]
     decay_ticks: Option<u64>,
+    /// Account whose avatar this is: only its sessions may open a relay on it or send inputs.
+    #[serde(default)]
+    owner: Option<Uuid>,
 }
 
 #[derive(Deserialize)]
@@ -678,6 +681,7 @@ async fn spawn(
                 global: r.global,
                 decay_ticks: r.decay_ticks,
                 queue: r.queue,
+                owner: r.owner,
             },
         )?;
         Ok(match out {
@@ -1231,6 +1235,7 @@ async fn stream_command(s: &AppState, w: &str, sim: Uuid, uri: &OriginalUri, cmd
                 global,
                 queue,
                 decay_ticks,
+                owner,
             } => {
                 let pos = Pos { x, y, z: 0.0 };
                 let at_home = match s.worlds.cell_of_any(w, pos).await {
@@ -1251,6 +1256,7 @@ async fn stream_command(s: &AppState, w: &str, sim: Uuid, uri: &OriginalUri, cmd
                         global,
                         decay_ticks,
                         queue,
+                        owner,
                     },
                 )? {
                     SpawnOutcome::Spawned(e) => {

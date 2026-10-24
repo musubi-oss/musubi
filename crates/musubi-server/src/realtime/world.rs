@@ -326,6 +326,7 @@ struct Queued {
     persistent: bool,
     global: bool,
     decay_ticks: Option<u64>,
+    owner: Option<Uuid>,
     enqueued_tick: u64,
     /// (position, eta) last told to the simulator, to report only changes.
     reported: (usize, Option<u64>),
@@ -399,6 +400,8 @@ pub struct SpawnSpec {
     pub decay_ticks: Option<u64>,
     /// Wait in the cell's admission queue instead of failing on `soft_cap`.
     pub queue: bool,
+    /// Account whose avatar this is (`Entity::owner`).
+    pub owner: Option<Uuid>,
 }
 
 /// Contact pairs not seen for this long are forgotten.
@@ -466,6 +469,8 @@ pub enum WorldMutation {
         decay_ticks: Option<u64>,
         #[serde(default)]
         global: bool,
+        #[serde(default)]
+        owner: Option<Uuid>,
     },
     Despawn {
         id: Uuid,
@@ -521,11 +526,13 @@ fn replay(
                 components,
                 decay_ticks,
                 global,
+                owner,
             } => {
                 if world.get(*id).is_none() {
                     world.spawn_with_id(*id, *pos, comps(components), true);
                     world.set_decay(*id, *decay_ticks);
                     world.set_global(*id, *global);
+                    world.set_owner(*id, *owner);
                     src.insert(*id, node);
                 }
             }
@@ -737,6 +744,8 @@ const NET_MAX_CONNS_PER_ENTITY: usize = 4;
 pub struct WorldCmdEnv {
     pub world: String,
     pub session_id: SessionId,
+    /// Account behind the session; `None` for replayed subscriptions (never checked for them).
+    pub account: Option<Uuid>,
     pub cmd: WorldCmd,
 }
 
@@ -2440,6 +2449,7 @@ impl WorldRegistry {
                 .map(|(sid, cmd)| WorldCmdEnv {
                     world: name.to_string(),
                     session_id: *sid,
+                    account: None,
                     cmd: cmd.clone(),
                 })
                 .collect()
@@ -2461,7 +2471,7 @@ impl WorldRegistry {
         }
         if let WorldCmd::NetOpen { entity } = &env.cmd {
             return Some(
-                self.net_open(&env.world, env.session_id, entity)
+                self.net_open(&env.world, env.session_id, env.account, entity)
                     .unwrap_or_else(|e| ServerMessage::error(&e)),
             );
         }
@@ -2477,6 +2487,7 @@ impl WorldRegistry {
                     self.net_route(
                         &env.world,
                         env.session_id,
+                        env.account,
                         &entity,
                         conn,
                         false,
@@ -2497,6 +2508,7 @@ impl WorldRegistry {
             } => self.net_route(
                 &env.world,
                 env.session_id,
+                env.account,
                 &entity,
                 conn,
                 true,
@@ -2530,16 +2542,26 @@ impl WorldRegistry {
             ),
             WorldCmd::Unsubscribe => self.unsubscribe(&env.world, env.session_id),
             WorldCmd::Input { entity, input } => {
-                match self.input(&env.world, env.session_id, &entity, input.clone()) {
+                match self.input(
+                    &env.world,
+                    env.session_id,
+                    env.account,
+                    &entity,
+                    input.clone(),
+                ) {
                     Err(Error::NotFound(_)) if self.is_split(&env.world) => {
                         match parse_entity(&entity) {
                             Ok(id) => {
-                                let ev = SimEvent::<WorldEntity>::Input {
+                                let mut ev = SimEvent::<WorldEntity>::Input {
                                     entity: id,
                                     session: json!(env.session_id),
                                     input,
                                 }
                                 .to_value();
+                                // the hosting shard knows the entity's owner; we do not
+                                if let Some(acc) = env.account {
+                                    ev["account"] = json!(acc);
+                                }
                                 fanout.world_input(&env.world, id, ev);
                                 Ok(())
                             }
@@ -3222,6 +3244,7 @@ impl WorldRegistry {
             global: false,
             decay_ticks: None,
             queue: false,
+            owner: None,
         };
         match self.spawn_or_queue(name, sim, spec)? {
             SpawnOutcome::Spawned(e) => Ok(e),
@@ -3243,6 +3266,7 @@ impl WorldRegistry {
             global,
             decay_ticks,
             queue,
+            owner,
         } = spec;
         let comps = components_from_json(&components);
         let w = self.get(name)?;
@@ -3295,6 +3319,7 @@ impl WorldRegistry {
                 persistent,
                 global,
                 decay_ticks,
+                owner,
                 enqueued_tick: tick,
                 reported: (position, eta_ticks),
             });
@@ -3316,7 +3341,7 @@ impl WorldRegistry {
                 eta_ticks,
             });
         }
-        let id = spawn_entity(st, pos, comps, persistent, global, decay_ticks);
+        let id = spawn_entity(st, pos, comps, persistent, global, decay_ticks, owner);
         Ok(SpawnOutcome::Spawned(to_wire(st.world.get(id).unwrap())))
     }
 
@@ -3568,7 +3593,7 @@ impl WorldRegistry {
         if st.world.owner(e.cell) != Some(sim) {
             return Err(Error::PermissionDenied("not the owner".into()));
         }
-        let (persistent, pos, decay_ticks, components) = (
+        let (persistent, pos, decay_ticks, components, owner) = (
             e.persistent,
             e.pos,
             e.decay_ticks,
@@ -3578,6 +3603,7 @@ impl WorldRegistry {
                     .map(|(k, c)| (k.clone(), c.value.to_json()))
                     .collect(),
             ),
+            e.owner,
         );
         st.world.set_global(id, global);
         if persistent {
@@ -3594,6 +3620,7 @@ impl WorldRegistry {
                     components,
                     decay_ticks,
                     global,
+                    owner,
                 },
             });
         }
@@ -4184,6 +4211,7 @@ impl WorldRegistry {
                     pos: entity.pos,
                     decay_ticks: entity.decay_ticks,
                     global: entity.global,
+                    owner: entity.owner,
                     components: Value::Object(
                         entity
                             .components
@@ -4847,12 +4875,20 @@ impl WorldRegistry {
     }
 
     /// Input forwarded from another node; dropped unless the entity lives here.
-    pub fn accept_remote_input(&self, name: &str, id: EntityId, input: Value) {
+    pub fn accept_remote_input(&self, name: &str, id: EntityId, mut input: Value) {
         let Some(w) = self.worlds.get(name) else {
             return;
         };
         let mut st = w.lock();
         let st = &mut *st;
+        let account = input
+            .as_object_mut()
+            .and_then(|o| o.remove("account"))
+            .and_then(|a| serde_json::from_value::<Uuid>(a).ok());
+        if Self::check_owner(st, id, account).is_err() {
+            tracing::debug!(world = name, %id, "remote input on another account's entity dropped");
+            return;
+        }
         if input["type"] == "net_packet" || input["type"] == "net_close" {
             if let (Some(conn), Ok(sid)) = (
                 input["conn"].as_u64(),
@@ -5218,11 +5254,19 @@ impl WorldRegistry {
     }
 
     /// Route a player input to the entity's current owner (buffered while in transit).
-    pub fn input(&self, name: &str, sid: SessionId, entity: &str, input: Value) -> Result<()> {
+    pub fn input(
+        &self,
+        name: &str,
+        sid: SessionId,
+        account: Option<Uuid>,
+        entity: &str,
+        input: Value,
+    ) -> Result<()> {
         let id = parse_entity(entity)?;
         let w = self.get(name)?;
         let mut st = w.lock();
         let st = &mut *st;
+        Self::check_owner(st, id, account)?;
         let ev = SimEvent::<WorldEntity>::Input {
             entity: id,
             session: json!(sid),
@@ -5237,13 +5281,36 @@ impl WorldRegistry {
 
     // ----- engine packet relay (`net_*`) -----
 
+    /// An owned entity (`Entity::owner`) takes relays and inputs only from sessions of that
+    /// account; `account == None` is a replayed subscription or a bus hop that already checked.
+    fn check_owner(st: &WorldState, id: EntityId, account: Option<Uuid>) -> Result<()> {
+        if let (Some(e), Some(acc)) = (st.world.get(id), account) {
+            if let Some(owner) = e.owner {
+                if owner != acc {
+                    metrics::counter!("musubi_world_owner_denied_total").increment(1);
+                    return Err(Error::PermissionDenied(format!(
+                        "entity {id} belongs to another account"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// `net_open`: a relay id on `entity` for this session. The owner is informational (`None`
     /// while the entity is in transit or lives on another shard); packets are routed per packet.
-    pub fn net_open(&self, name: &str, sid: SessionId, entity: &str) -> Result<ServerMessage> {
+    pub fn net_open(
+        &self,
+        name: &str,
+        sid: SessionId,
+        account: Option<Uuid>,
+        entity: &str,
+    ) -> Result<ServerMessage> {
         let id = parse_entity(entity)?;
         let w = self.get(name)?;
         let mut st = w.lock();
         let st = &mut *st;
+        Self::check_owner(st, id, account)?;
         let server = st
             .world
             .get(id)
@@ -5278,6 +5345,7 @@ impl WorldRegistry {
         &self,
         name: &str,
         sid: SessionId,
+        account: Option<Uuid>,
         entity: &str,
         conn: u64,
         closing: bool,
@@ -5288,9 +5356,13 @@ impl WorldRegistry {
         let w = self.get(name)?;
         let mut st = w.lock();
         let st = &mut *st;
+        Self::check_owner(st, id, account)?;
         net_learn(st, id, conn, sid, closing);
         tracing::debug!(world = name, %id, conn, closing, "net_route");
-        let ev = ev(id).to_value();
+        let mut ev = ev(id).to_value();
+        if let Some(acc) = account {
+            ev["account"] = json!(acc);
+        }
         match st.world.route_input(id, ev.clone()) {
             Ok(Some(sim)) => {
                 tracing::debug!(%id, conn, %sim, "net_route: to owner");
@@ -6399,10 +6471,12 @@ fn spawn_entity(
     persistent: bool,
     global: bool,
     decay_ticks: Option<u64>,
+    owner: Option<Uuid>,
 ) -> EntityId {
     let id = st.world.spawn(pos, comps.clone(), persistent);
     st.world.set_decay(id, decay_ticks);
     st.world.set_global(id, global);
+    st.world.set_owner(id, owner);
     if persistent {
         st.journal.push(WorldOp {
             tick: st.world.tick,
@@ -6421,6 +6495,7 @@ fn spawn_entity(
                 ),
                 decay_ticks,
                 global,
+                owner,
             },
         });
     }
@@ -6511,6 +6586,7 @@ fn drain_admission(st: &mut WorldState) {
             let id = st.world.spawn(e.pos, e.components.clone(), e.persistent);
             st.world.set_decay(id, e.decay_ticks);
             st.world.set_global(id, e.global);
+            st.world.set_owner(id, e.owner);
             if e.persistent {
                 st.journal.push(WorldOp {
                     tick,
@@ -6529,6 +6605,7 @@ fn drain_admission(st: &mut WorldState) {
                         ),
                         decay_ticks: e.decay_ticks,
                         global: e.global,
+                        owner: e.owner,
                     },
                 });
             }

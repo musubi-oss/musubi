@@ -22659,3 +22659,134 @@ async fn sim_stream_speaks_cbor_when_asked() {
         "cbor REST view carries raw bytes: {doc:?}"
     );
 }
+
+/// An entity spawned with `owner` is one account's avatar: another account's `net_open` and
+/// `world_input` on it are refused (`permission_denied`), the owner's go through; an unowned
+/// entity still takes anyone.
+#[tokio::test]
+async fn owned_entity_refuses_other_accounts() {
+    let Some((addr, router)) = start().await else {
+        return;
+    };
+    let world = format!("ws-{}", uuid::Uuid::now_v7().simple());
+    let (st, _) = http_json(
+        &router,
+        "POST",
+        "/v1/server/worlds",
+        None,
+        true,
+        Some(json!({"name": world, "config": {"cell_size": 100.0}})),
+    )
+    .await;
+    assert_eq!(st, 200);
+    let sim = uuid::Uuid::now_v7();
+    let (st, r) = http_json(
+        &router,
+        "POST",
+        &format!("/v1/server/worlds/{world}/lease"),
+        None,
+        true,
+        Some(json!({"sim": sim, "cells": [{"x": 0, "y": 0}]})),
+    )
+    .await;
+    assert_eq!(st, 200, "{r}");
+    let (ta, owner) = token(&router).await;
+    let (tb, _) = token(&router).await;
+    let spawn = |owner: Option<&str>| {
+        let (router, world) = (router.clone(), world.clone());
+        let owner = owner.map(str::to_string);
+        async move {
+            let (st, e) = http_json(
+                &router,
+                "POST",
+                &format!("/v1/server/worlds/{world}/spawn"),
+                None,
+                true,
+                Some(json!({"sim": sim, "x": 10.0, "y": 10.0, "components": {}, "owner": owner})),
+            )
+            .await;
+            assert_eq!(st, 200, "{e}");
+            e["id"].as_str().unwrap().to_string()
+        }
+    };
+    let avatar = spawn(Some(&owner)).await;
+    let crate_ = spawn(None).await;
+    let f = "json";
+    let mut a = connect(&addr, &ta, f).await;
+    let mut b = connect(&addr, &tb, f).await;
+    // another account: relay and input refused
+    send(
+        &mut b,
+        f,
+        Some("1"),
+        ClientMessage::NetOpen {
+            world: world.clone(),
+            entity: avatar.clone(),
+        },
+    )
+    .await;
+    match recv(&mut b).await.msg {
+        ServerMessage::Error { code, message } => {
+            assert_eq!(code, musubi_core::Code::PermissionDenied, "{message}");
+            assert!(message.contains("another account"), "{message}");
+        }
+        m => panic!("expected permission_denied, got {m:?}"),
+    }
+    send(
+        &mut b,
+        f,
+        Some("2"),
+        ClientMessage::WorldInput {
+            world: world.clone(),
+            entity: avatar.clone(),
+            input: json!({"move": [1, 0]}),
+        },
+    )
+    .await;
+    match recv(&mut b).await.msg {
+        ServerMessage::Error { code, .. } => assert_eq!(code, musubi_core::Code::PermissionDenied),
+        m => panic!("expected permission_denied, got {m:?}"),
+    }
+    // the unowned entity takes anyone
+    send(
+        &mut b,
+        f,
+        Some("3"),
+        ClientMessage::NetOpen {
+            world: world.clone(),
+            entity: crate_.clone(),
+        },
+    )
+    .await;
+    assert!(
+        matches!(recv(&mut b).await.msg, ServerMessage::NetOpened { .. }),
+        "unowned entity must accept any account"
+    );
+    // the owner goes through
+    send(
+        &mut a,
+        f,
+        Some("4"),
+        ClientMessage::NetOpen {
+            world: world.clone(),
+            entity: avatar.clone(),
+        },
+    )
+    .await;
+    match recv(&mut a).await.msg {
+        ServerMessage::NetOpened { entity, .. } => assert_eq!(entity, avatar),
+        m => panic!("owner refused: {m:?}"),
+    }
+    // the owner is visible on the entity for the simulator and the console
+    let (st, e) = http_json(
+        &router,
+        "GET",
+        &format!("/v1/server/worlds/{world}/entities/{avatar}"),
+        None,
+        true,
+        None,
+    )
+    .await;
+    assert_eq!(st, 200, "{e}");
+    assert_eq!(e["owner"].as_str(), Some(owner.as_str()), "{e}");
+}

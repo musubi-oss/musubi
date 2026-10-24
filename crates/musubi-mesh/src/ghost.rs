@@ -247,6 +247,7 @@ impl GhostCache {
                 contained: false,
                 transit: None,
                 attached_to: None,
+                owner: None,
                 handover_attempts: 0,
                 handover_retry_tick: 0,
                 decay_ticks: None,
