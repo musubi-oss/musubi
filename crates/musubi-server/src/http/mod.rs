@@ -185,11 +185,7 @@ impl ProjectDispatch {
             .map(|h| h.split(':').next().unwrap_or(h).to_ascii_lowercase())
             .unwrap_or_default();
         for (pattern, name) in self.by_host.iter() {
-            let hit = match pattern.strip_prefix("*.") {
-                Some(suffix) => host.ends_with(suffix) && host.len() > suffix.len(),
-                None => *pattern == host,
-            };
-            if hit {
+            if host_matches(pattern, &host) {
                 if let Some(r) = self.by_name.get(name) {
                     return Ok(r.clone());
                 }
@@ -585,4 +581,36 @@ async fn openapi(State(s): State<AppState>) -> Json<serde_json::Value> {
 /// Public keys of the managed JWT signing keys (RFC 7517), for verifying access tokens elsewhere.
 async fn jwks(State(s): State<AppState>) -> Json<serde_json::Value> {
     Json(s.auth.signer().jwks())
+}
+
+/// `*.example.com` matches sub-domains on a label boundary only (`a.example.com`, not
+/// `evilexample.com` and not the apex); anything else is an exact, lower-cased match.
+fn host_matches(pattern: &str, host: &str) -> bool {
+    match pattern.strip_prefix("*.") {
+        Some(suffix) => host
+            .strip_suffix(suffix)
+            .is_some_and(|rest| rest.ends_with('.')),
+        None => pattern == host,
+    }
+}
+
+#[cfg(test)]
+mod host_match_tests {
+    use super::host_matches;
+
+    #[test]
+    fn wildcard_requires_a_label_boundary() {
+        assert!(host_matches("*.example.com", "a.example.com"));
+        assert!(host_matches("*.example.com", "x.y.example.com"));
+        assert!(!host_matches("*.example.com", "evilexample.com"));
+        assert!(!host_matches("*.example.com", "example.com"));
+        assert!(!host_matches("*.example.com", "example.com.evil.net"));
+    }
+
+    #[test]
+    fn plain_pattern_is_exact() {
+        assert!(host_matches("play.example.com", "play.example.com"));
+        assert!(!host_matches("play.example.com", "x.play.example.com"));
+        assert!(!host_matches("example.com", "evilexample.com"));
+    }
 }

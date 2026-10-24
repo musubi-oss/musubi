@@ -4,6 +4,8 @@
 //! stores a new config version only when the content changed; a manual `sync` is available too.
 
 use std::collections::HashMap;
+use std::net::IpAddr;
+use std::sync::LazyLock;
 use std::time::Duration;
 
 use axum::extract::{Path, State};
@@ -23,6 +25,7 @@ const FETCH_TIMEOUT: Duration = Duration::from_secs(15);
 const MIN_INTERVAL: i32 = 30;
 const MAX_INTERVAL: i32 = 86_400;
 const MAX_HEADERS: usize = 8;
+const MAX_REDIRECTS: usize = 5;
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -189,11 +192,12 @@ async fn put(
 ) -> Result<Json<Value>, ApiError> {
     crate::http::configs::check_name(&name)?;
     let url = b.url.trim().to_string();
-    if url.len() > 2048 || !(url.starts_with("https://") || url.starts_with("http://")) {
-        return Err(
-            Error::InvalidArgument("url must be http(s), at most 2048 chars".into()).into(),
-        );
+    if url.len() > 2048 {
+        return Err(Error::InvalidArgument("url must be at most 2048 chars".into()).into());
     }
+    check_egress_url(&url)
+        .await
+        .map_err(|e| Error::InvalidArgument(format!("url: {e}")))?;
     let format = b
         .format
         .map(|f| f.trim().to_ascii_lowercase())
@@ -344,46 +348,154 @@ struct Outcome {
     error: Option<String>,
 }
 
+static FETCH_CLIENT: LazyLock<std::result::Result<reqwest::Client, String>> =
+    LazyLock::new(|| egress_client(FETCH_TIMEOUT).map_err(|e| e.to_string()));
+
+/// Outbound client for operator-configured URLs: no automatic redirects (the caller decides what
+/// may be re-sent to the next hop), bounded connect and total time.
+pub(crate) fn egress_client(timeout: Duration) -> reqwest::Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(timeout)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+}
+
+/// Validates an operator-supplied outbound URL: `http(s)` only, no embedded credentials, and the
+/// host must not resolve to a link-local (cloud metadata), unspecified, multicast or broadcast
+/// address. Loopback and RFC 1918 ranges stay allowed on purpose: sibling environments and
+/// self-hosted sheets commonly live there and the caller already holds the server key.
+pub(crate) async fn check_egress_url(raw: &str) -> std::result::Result<reqwest::Url, String> {
+    let url = reqwest::Url::parse(raw).map_err(|e| e.to_string())?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err("must be http(s)".into());
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err("must not embed credentials".into());
+    }
+    let host = url.host_str().ok_or("has no host")?;
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    let addrs: Vec<IpAddr> = match bare.parse::<IpAddr>() {
+        Ok(ip) => vec![ip],
+        Err(_) => {
+            let port = url.port_or_known_default().unwrap_or(80);
+            tokio::net::lookup_host((bare, port))
+                .await
+                .map_err(|e| format!("dns: {e}"))?
+                .map(|a| a.ip())
+                .collect()
+        }
+    };
+    if addrs.is_empty() {
+        return Err("host does not resolve".into());
+    }
+    if let Some(ip) = addrs.iter().find(|ip| ip_is_forbidden(**ip)) {
+        return Err(format!("host resolves to a forbidden address {ip}"));
+    }
+    Ok(url)
+}
+
+fn ip_is_forbidden(ip: IpAddr) -> bool {
+    let ip = match ip {
+        IpAddr::V6(v6) => v6
+            .to_ipv4_mapped()
+            .map(IpAddr::V4)
+            .unwrap_or(IpAddr::V6(v6)),
+        v4 => v4,
+    };
+    match ip {
+        IpAddr::V4(v4) => {
+            v4.is_unspecified()
+                || v4.is_link_local()
+                || v4.is_multicast()
+                || v4.is_broadcast()
+                || v4.octets()[0] == 0
+        }
+        IpAddr::V6(v6) => v6.is_unspecified() || v6.is_unicast_link_local() || v6.is_multicast(),
+    }
+}
+
+pub(crate) fn same_origin(a: &reqwest::Url, b: &reqwest::Url) -> bool {
+    a.scheme() == b.scheme()
+        && a.host_str() == b.host_str()
+        && a.port_or_known_default() == b.port_or_known_default()
+}
+
 async fn fetch(
     url: &str,
     headers: &Value,
     etag: Option<&str>,
 ) -> std::result::Result<Option<(String, Option<String>)>, String> {
-    let client = reqwest::Client::builder()
-        .timeout(FETCH_TIMEOUT)
-        .redirect(reqwest::redirect::Policy::limited(5))
-        .build()
-        .map_err(|e| e.to_string())?;
-    let mut req = client.get(url);
-    if let Some(m) = headers.as_object() {
-        for (k, v) in m {
-            if let Some(v) = v.as_str() {
-                req = req.header(k.as_str(), v);
+    let client = FETCH_CLIENT.as_ref().map_err(|e| format!("fetch: {e}"))?;
+    let origin = check_egress_url(url)
+        .await
+        .map_err(|e| format!("fetch: url {e}"))?;
+    let mut target = origin.clone();
+    for _ in 0..=MAX_REDIRECTS {
+        let mut req = client.get(target.clone());
+        // Operator-configured headers usually carry a token: they go to the configured origin
+        // only, never to wherever a redirect points.
+        if same_origin(&origin, &target) {
+            if let Some(m) = headers.as_object() {
+                for (k, v) in m {
+                    if let Some(v) = v.as_str() {
+                        req = req.header(k.as_str(), v);
+                    }
+                }
             }
         }
+        if let Some(e) = etag {
+            req = req.header("If-None-Match", e);
+        }
+        let mut resp = req
+            .send()
+            .await
+            .map_err(|e| format!("fetch: {}", e.without_url()))?;
+        if resp.status() == reqwest::StatusCode::NOT_MODIFIED {
+            return Ok(None);
+        }
+        if resp.status().is_redirection() {
+            let loc = resp
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|v| v.to_str().ok())
+                .ok_or_else(|| {
+                    format!("fetch: HTTP {} without Location", resp.status().as_u16())
+                })?;
+            let next = target
+                .join(loc)
+                .map_err(|e| format!("fetch: redirect: {e}"))?;
+            target = check_egress_url(next.as_str())
+                .await
+                .map_err(|e| format!("fetch: redirect url {e}"))?;
+            continue;
+        }
+        if !resp.status().is_success() {
+            return Err(format!("fetch: HTTP {}", resp.status().as_u16()));
+        }
+        if resp.content_length().is_some_and(|n| n > MAX_BODY as u64) {
+            return Err("fetch: body exceeds 4 MiB".into());
+        }
+        let new_etag = resp
+            .headers()
+            .get(reqwest::header::ETAG)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        let mut body = Vec::new();
+        while let Some(chunk) = resp
+            .chunk()
+            .await
+            .map_err(|e| format!("fetch: {}", e.without_url()))?
+        {
+            if body.len() + chunk.len() > MAX_BODY {
+                return Err("fetch: body exceeds 4 MiB".into());
+            }
+            body.extend_from_slice(&chunk);
+        }
+        let text = String::from_utf8(body).map_err(|_| "fetch: body is not UTF-8".to_string())?;
+        return Ok(Some((text, new_etag)));
     }
-    if let Some(e) = etag {
-        req = req.header("If-None-Match", e);
-    }
-    let resp = req.send().await.map_err(|e| format!("fetch: {e}"))?;
-    if resp.status() == reqwest::StatusCode::NOT_MODIFIED {
-        return Ok(None);
-    }
-    if !resp.status().is_success() {
-        return Err(format!("fetch: HTTP {}", resp.status().as_u16()));
-    }
-    let new_etag = resp
-        .headers()
-        .get(reqwest::header::ETAG)
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_string);
-    let bytes = resp.bytes().await.map_err(|e| format!("fetch: {e}"))?;
-    if bytes.len() > MAX_BODY {
-        return Err(format!("fetch: body {} bytes exceeds 4 MiB", bytes.len()));
-    }
-    let text =
-        String::from_utf8(bytes.to_vec()).map_err(|_| "fetch: body is not UTF-8".to_string())?;
-    Ok(Some((text, new_etag)))
+    Err(format!("fetch: more than {MAX_REDIRECTS} redirects"))
 }
 
 async fn record(
@@ -606,4 +718,73 @@ pub fn spawn_worker(state: AppState, held: impl Fn() -> bool + Send + 'static) {
             sweep(&state).await;
         }
     });
+}
+
+#[cfg(test)]
+mod egress_tests {
+    use super::*;
+
+    #[test]
+    fn forbidden_ranges() {
+        for ip in [
+            "0.0.0.0",
+            "169.254.169.254",
+            "224.0.0.1",
+            "255.255.255.255",
+            "::",
+            "fe80::1",
+            "ff02::1",
+            "::ffff:169.254.169.254",
+        ] {
+            assert!(ip_is_forbidden(ip.parse().unwrap()), "{ip}");
+        }
+        for ip in [
+            "127.0.0.1",
+            "10.0.0.5",
+            "192.168.1.2",
+            "8.8.8.8",
+            "::1",
+            "2001:db8::1",
+        ] {
+            assert!(!ip_is_forbidden(ip.parse().unwrap()), "{ip}");
+        }
+    }
+
+    #[tokio::test]
+    async fn url_guard() {
+        assert!(check_egress_url("ftp://example.com/x").await.is_err());
+        assert!(check_egress_url("http://user:pw@127.0.0.1/x")
+            .await
+            .is_err());
+        assert!(check_egress_url("http://169.254.169.254/latest/meta-data")
+            .await
+            .is_err());
+        assert!(check_egress_url("http://[fe80::1]:8080/").await.is_err());
+        assert!(check_egress_url("file:///etc/passwd").await.is_err());
+        assert!(check_egress_url("http://127.0.0.1:8080/sheet.csv")
+            .await
+            .is_ok());
+        assert!(check_egress_url("https://[::1]/x").await.is_ok());
+    }
+
+    #[test]
+    fn origin_comparison() {
+        let u = |s: &str| reqwest::Url::parse(s).unwrap();
+        assert!(same_origin(
+            &u("https://a.example/x"),
+            &u("https://a.example:443/y")
+        ));
+        assert!(!same_origin(
+            &u("https://a.example/x"),
+            &u("http://a.example/x")
+        ));
+        assert!(!same_origin(
+            &u("https://a.example/x"),
+            &u("https://b.example/x")
+        ));
+        assert!(!same_origin(
+            &u("https://a.example/x"),
+            &u("https://a.example:8443/x")
+        ));
+    }
 }

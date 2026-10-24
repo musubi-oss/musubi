@@ -63,6 +63,9 @@ fn serve(path: &str) -> Response {
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, mime)
         .header(header::CACHE_CONTROL, cache)
+        .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff")
+        .header(header::X_FRAME_OPTIONS, "DENY")
+        .header(header::REFERRER_POLICY, "same-origin")
         .body(Body::from(body))
         .unwrap()
 }

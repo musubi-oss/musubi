@@ -378,12 +378,12 @@ impl GeoIp {
         let res = req
             .send()
             .await
-            .map_err(|e| Error::Internal(format!("geoip download: {e}")))?;
+            .map_err(|e| Error::Internal(format!("geoip download: {}", e.without_url())))?;
         let status = res.status();
         let body = res
             .bytes()
             .await
-            .map_err(|e| Error::Internal(format!("geoip download body: {e}")))?;
+            .map_err(|e| Error::Internal(format!("geoip download body: {}", e.without_url())))?;
         if !status.is_success() {
             return Err(Error::Internal(format!(
                 "geoip download: HTTP {status} {}",
@@ -504,6 +504,10 @@ impl GeoIp {
     }
 }
 
+/// Largest `.mmdb` accepted from an archive (GeoIP2 City is ~120 MiB): a tar header is attacker
+/// data once the download is MITMed or the mirror misbehaves, so it must not size an allocation.
+const MAX_MMDB_BYTES: u64 = 512 << 20;
+
 /// The `.mmdb` member of a MaxMind `tar.gz` (or the bytes themselves when already a database).
 fn extract_mmdb(body: &[u8]) -> Result<Vec<u8>> {
     use std::io::Read;
@@ -518,6 +522,13 @@ fn extract_mmdb(body: &[u8]) -> Result<Vec<u8>> {
                 .and_then(|p| p.extension().map(|x| x == "mmdb"))
                 .unwrap_or(false);
             if is_mmdb {
+                if e.size() > MAX_MMDB_BYTES {
+                    return Err(Error::Internal(format!(
+                        "geoip download: .mmdb member is {} bytes, limit {}",
+                        e.size(),
+                        MAX_MMDB_BYTES
+                    )));
+                }
                 let mut out = Vec::with_capacity(e.size() as usize);
                 e.read_to_end(&mut out).map_err(Error::internal)?;
                 return Ok(out);

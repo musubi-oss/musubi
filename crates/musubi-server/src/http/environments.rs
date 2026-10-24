@@ -108,9 +108,12 @@ async fn put_one(
         return Err(Error::InvalidArgument("that is this environment".into()).into());
     }
     let url = b.url.trim().trim_end_matches('/').to_string();
-    if !(url.starts_with("http://") || url.starts_with("https://")) {
-        return Err(Error::InvalidArgument("url must be http(s)".into()).into());
+    if url.len() > 2048 {
+        return Err(Error::InvalidArgument("url must be at most 2048 chars".into()).into());
     }
+    crate::http::config_sources::check_egress_url(&url)
+        .await
+        .map_err(|e| Error::InvalidArgument(format!("url: {e}")))?;
     let existing = load(&s, &name).await.ok();
     let key = match (b.admin_key, existing) {
         (Some(k), _) if !k.is_empty() => k,
@@ -147,11 +150,18 @@ async fn delete_one(
     Ok(Json(json!({ "removed": n > 0 })))
 }
 
-fn client() -> reqwest::Client {
-    reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(60))
-        .build()
-        .unwrap_or_default()
+/// Redirects are not followed: `x-musubi-server-key` is the admin key of the target environment
+/// and must never be re-sent to wherever a (mis)configured or compromised peer points.
+fn client() -> std::result::Result<reqwest::Client, ApiError> {
+    static CLIENT: std::sync::LazyLock<std::result::Result<reqwest::Client, String>> =
+        std::sync::LazyLock::new(|| {
+            crate::http::config_sources::egress_client(std::time::Duration::from_secs(60))
+                .map_err(|e| e.to_string())
+        });
+    CLIENT
+        .as_ref()
+        .cloned()
+        .map_err(|e| Error::Internal(format!("http client: {e}")).into())
 }
 
 /// `GET /v1/admin/environments/{name}/status` — health and latest content version over there.
@@ -161,7 +171,7 @@ async fn status(
     Path(name): Path<String>,
 ) -> std::result::Result<Json<Value>, ApiError> {
     let e = load(&s, &name).await?;
-    let c = client();
+    let c = client()?;
     let health = match c.get(format!("{}/healthz", e.url)).send().await {
         Ok(r) => json!({ "ok": r.status().is_success(), "status": r.status().as_u16() }),
         Err(err) => json!({ "ok": false, "error": err.to_string() }),
@@ -238,7 +248,7 @@ async fn promote(
     } else {
         b.note.clone()
     };
-    let res = client()
+    let res = client()?
         .post(format!("{}/v1/admin/content/import", e.url))
         .header("x-musubi-server-key", &e.admin_key)
         .json(&json!({

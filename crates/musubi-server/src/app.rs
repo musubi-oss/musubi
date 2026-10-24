@@ -1381,10 +1381,7 @@ async fn start_listeners(state: &AppState, base: Option<&Config>) -> anyhow::Res
     if let Some(listen) = own("udp", state.cfg.udp.listen, base.and_then(|b| b.udp.listen)) {
         let secret = match &state.cfg.udp.secret {
             Some(hex) => {
-                let bytes = (0..hex.len())
-                    .step_by(2)
-                    .map(|i| u8::from_str_radix(hex.get(i..i + 2).unwrap_or("zz"), 16))
-                    .collect::<Result<Vec<u8>, _>>()
+                let bytes = hex::decode(hex)
                     .ok()
                     .filter(|b| b.len() == 32)
                     .ok_or_else(|| anyhow::anyhow!("udp.secret must be 32 bytes of hex"))?;
