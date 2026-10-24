@@ -14,6 +14,19 @@ use musubi_core::{Error, Result};
 use serde::{Deserialize, Serialize};
 
 const JWKS_TTL: Duration = Duration::from_secs(3600);
+const JWKS_MIN_REFRESH: Duration = Duration::from_secs(60);
+/// Signature algorithms accepted on provider id tokens (RFC 7518 asymmetric families only).
+const ID_TOKEN_ALGS: &[jsonwebtoken::Algorithm] = &[
+    jsonwebtoken::Algorithm::RS256,
+    jsonwebtoken::Algorithm::RS384,
+    jsonwebtoken::Algorithm::RS512,
+    jsonwebtoken::Algorithm::PS256,
+    jsonwebtoken::Algorithm::PS384,
+    jsonwebtoken::Algorithm::PS512,
+    jsonwebtoken::Algorithm::ES256,
+    jsonwebtoken::Algorithm::ES384,
+    jsonwebtoken::Algorithm::EdDSA,
+];
 
 pub struct Social {
     http: reqwest::Client,
@@ -149,12 +162,12 @@ impl Social {
             ])
             .send()
             .await
-            .map_err(|e| Error::Internal(format!("steam api: {e}")))?
+            .map_err(|e| Error::Internal(format!("steam api: {}", e.without_url())))?
             .error_for_status()
-            .map_err(|e| Error::Internal(format!("steam api: {e}")))?
+            .map_err(|e| Error::Internal(format!("steam api: {}", e.without_url())))?
             .json()
             .await
-            .map_err(|e| Error::Internal(format!("steam api: {e}")))?;
+            .map_err(|e| Error::Internal(format!("steam api: {}", e.without_url())))?;
         let Some(p) = resp.response.params else {
             return Err(Error::Unauthenticated(format!(
                 "steam rejected the ticket: {}",
@@ -252,12 +265,12 @@ impl Social {
             ])
             .send()
             .await
-            .map_err(|e| Error::Internal(format!("steam api: {e}")))?
+            .map_err(|e| Error::Internal(format!("steam api: {}", e.without_url())))?
             .error_for_status()
-            .map_err(|e| Error::Internal(format!("steam api: {e}")))?
+            .map_err(|e| Error::Internal(format!("steam api: {}", e.without_url())))?
             .json()
             .await
-            .map_err(|e| Error::Internal(format!("steam api: {e}")))?;
+            .map_err(|e| Error::Internal(format!("steam api: {}", e.without_url())))?;
         let a = &v["appownership"];
         if a.is_null() {
             return Err(Error::Internal(format!("steam api: unexpected answer {v}")));
@@ -443,10 +456,10 @@ impl Social {
             .query(&[("input_token", token), ("access_token", app_token.as_str())])
             .send()
             .await
-            .map_err(|e| Error::Internal(format!("facebook api: {e}")))?
+            .map_err(|e| Error::Internal(format!("facebook api: {}", e.without_url())))?
             .json()
             .await
-            .map_err(|e| Error::Internal(format!("facebook api: {e}")))?;
+            .map_err(|e| Error::Internal(format!("facebook api: {}", e.without_url())))?;
         if let Some(e) = resp.error.or(resp.data.error) {
             return Err(Error::Unauthenticated(format!(
                 "facebook rejected the token: {e}"
@@ -608,6 +621,13 @@ impl Social {
             .ok_or_else(|| Error::Unauthenticated("unknown signing key".into()))?;
         let key =
             DecodingKey::from_jwk(jwk).map_err(|e| Error::Unauthenticated(format!("jwk: {e}")))?;
+        // only asymmetric signatures: an HS* token would be verified with the public JWK bytes
+        if !ID_TOKEN_ALGS.contains(&header.alg) {
+            return Err(Error::Unauthenticated(format!(
+                "id token: algorithm {:?} is not allowed",
+                header.alg
+            )));
+        }
         let mut v = Validation::new(header.alg);
         v.set_issuer(&issuers);
         if c.client_ids.is_empty() {
@@ -655,10 +675,13 @@ impl Social {
     }
 
     async fn jwks(&self, url: &str, refresh: bool) -> Result<JwkSet> {
-        if !refresh {
+        {
+            // an unknown `kid` forces a refresh, but at most once per JWKS_MIN_REFRESH per URL so
+            // forged tokens cannot make the node hammer the provider
+            let max_age = if refresh { JWKS_MIN_REFRESH } else { JWKS_TTL };
             let cache = self.jwks.lock().unwrap();
             if let Some((at, set)) = cache.get(url) {
-                if at.elapsed() < JWKS_TTL {
+                if at.elapsed() < max_age {
                     return Ok(set.clone());
                 }
             }

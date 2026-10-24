@@ -283,12 +283,11 @@ pub fn b64url(bytes: &[u8]) -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
 }
 
+/// 256 random bits (state, nonce, PKCE verifier halves) from the OS CSPRNG.
 fn random_token() -> String {
-    let a = Uuid::now_v7().as_u128();
-    let b: u128 = rand::random();
-    let mut bytes = Vec::with_capacity(32);
-    bytes.extend_from_slice(&a.to_be_bytes());
-    bytes.extend_from_slice(&b.to_be_bytes());
+    use rand::RngCore;
+    let mut bytes = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut bytes);
     b64url(&bytes)
 }
 
@@ -300,7 +299,26 @@ fn enc(s: &str) -> String {
     url_escape(s)
 }
 
-fn url_escape(s: &str) -> String {
+/// `return_url` may only point under one of the configured prefixes: equal to it, or continuing
+/// with a path/query/fragment separator (so `https://game.example` does not admit
+/// `https://game.example.evil.tld`).
+pub(crate) fn return_url_allowed(url: &str, allowed: &[String]) -> bool {
+    allowed.iter().any(|p| {
+        let p = p.as_str();
+        if p.is_empty() || !url.starts_with(p) {
+            return false;
+        }
+        p.ends_with(['/', '?', '#'])
+            || url[p.len()..]
+                .chars()
+                .next()
+                .is_none_or(|c| matches!(c, '/' | '?' | '#'))
+    })
+}
+
+/// RFC 3986 unreserved characters pass, everything else is `%XX`-encoded (shared by the
+/// authorize-URL builder and the callback fragment).
+pub(crate) fn url_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len() * 3);
     for b in s.bytes() {
         match b {
@@ -555,7 +573,10 @@ impl AuthProviderService {
         .execute(&self.db)
         .await
         .map_err(Error::internal)?;
-        self.discovery.lock().unwrap().remove(&p.issuer);
+        self.discovery
+            .lock()
+            .unwrap()
+            .remove(p.issuer.trim_end_matches('/'));
         self.get(name).await
     }
 
@@ -645,12 +666,7 @@ impl AuthProviderService {
             }
             opts.callback_url.clone()
         };
-        if !opts.return_url.is_empty()
-            && !p
-                .return_urls
-                .iter()
-                .any(|u| opts.return_url.starts_with(u.as_str()))
-        {
+        if !opts.return_url.is_empty() && !return_url_allowed(&opts.return_url, &p.return_urls) {
             return Err(Error::InvalidArgument(
                 "return_url is not allowed for this provider".into(),
             ));
@@ -1123,13 +1139,16 @@ fn form_tokens(body: &str) -> std::result::Result<TokenResponse, ()> {
 }
 
 pub(crate) fn percent_decode(s: &str) -> String {
+    fn hex(b: u8) -> Option<u8> {
+        (b as char).to_digit(16).map(|d| d as u8)
+    }
     let b = s.as_bytes();
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
     while i < b.len() {
         if b[i] == b'%' && i + 2 < b.len() {
-            if let Ok(h) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
-                out.push(h);
+            if let (Some(hi), Some(lo)) = (hex(b[i + 1]), hex(b[i + 2])) {
+                out.push(hi << 4 | lo);
                 i += 3;
                 continue;
             }
@@ -1183,6 +1202,64 @@ mod tests {
         assert_eq!(e.avatar_url.as_deref(), Some("https://x/a.png"));
         assert!(e.username.is_none());
         assert!(map_claims(&ClaimsMap::default(), &json!({"name": "x"})).is_err());
+    }
+
+    #[test]
+    fn return_url_prefix_cannot_be_extended_into_another_host() {
+        let allowed = vec![
+            "https://game.example".to_string(),
+            "myapp://cb/".to_string(),
+        ];
+        assert!(return_url_allowed("https://game.example", &allowed));
+        assert!(return_url_allowed(
+            "https://game.example/done?x=1",
+            &allowed
+        ));
+        assert!(return_url_allowed("https://game.example#frag", &allowed));
+        assert!(return_url_allowed("myapp://cb/login", &allowed));
+        assert!(!return_url_allowed(
+            "https://game.example.evil.tld/",
+            &allowed
+        ));
+        assert!(!return_url_allowed(
+            "https://game.example@evil.tld/",
+            &allowed
+        ));
+        assert!(!return_url_allowed(
+            "https://evil.tld/https://game.example",
+            &allowed
+        ));
+        assert!(!return_url_allowed("https://game.example/", &[]));
+        assert!(!return_url_allowed(
+            "https://game.example/",
+            &[String::new()]
+        ));
+    }
+
+    #[test]
+    fn percent_decode_survives_multibyte_input() {
+        assert_eq!(percent_decode("a%20b%2Fc"), "a b/c");
+        assert_eq!(percent_decode("%aé"), "%aé");
+        assert_eq!(percent_decode("%zz%"), "%zz%");
+        assert_eq!(percent_decode("é%C3%A9"), "éé");
+        assert_eq!(
+            form_tokens("access_token=t%C3%A9&x=%aé")
+                .unwrap()
+                .access_token
+                .as_deref(),
+            Some("té")
+        );
+    }
+
+    #[test]
+    fn random_tokens_are_unique_and_url_safe() {
+        let a = random_token();
+        let b = random_token();
+        assert_ne!(a, b);
+        assert_eq!(a.len(), 43);
+        assert!(a
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_'));
     }
 
     #[test]

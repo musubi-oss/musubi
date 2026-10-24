@@ -196,6 +196,15 @@ pub(crate) fn hash(secret: &str) -> String {
     hex::encode(Sha256::digest(secret.as_bytes()))
 }
 
+/// 256 bits from the OS CSPRNG as 64 hex chars — server keys, e-mail tokens and other bearer
+/// secrets that are stored hashed.
+pub(crate) fn random_secret() -> String {
+    use rand::RngCore;
+    let mut b = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut b);
+    hex::encode(b)
+}
+
 impl ServerKeys {
     pub async fn load(&self, db: &PgPool) -> Result<usize> {
         #[allow(clippy::type_complexity)]
@@ -292,14 +301,7 @@ impl ServerKeys {
         if name.is_empty() || name.len() > 64 {
             return Err(Error::InvalidArgument("name 1..=64 chars".into()));
         }
-        // 256 bits from two v7 uuids (74 random bits each) plus the clock, whitened through sha256
-        let seed = format!(
-            "{}{}{:?}",
-            Uuid::now_v7().simple(),
-            Uuid::now_v7().simple(),
-            std::time::SystemTime::now()
-        );
-        let secret = format!("msk_{}", hash(&seed));
+        let secret = format!("msk_{}", random_secret());
         let id = Uuid::now_v7();
         sqlx::query(
             "insert into musubi.server_keys (id, name, role, hash, expires_at, subject, scopes) values ($1, $2, $3, $4, $5, $6, $7)",
@@ -406,5 +408,19 @@ impl ServerKeys {
                 }
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn random_secret_is_256_bits_of_hex_and_unique() {
+        let a = random_secret();
+        let b = random_secret();
+        assert_eq!(a.len(), 64);
+        assert!(a.bytes().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(a, b);
     }
 }

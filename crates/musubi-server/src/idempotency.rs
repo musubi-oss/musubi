@@ -20,6 +20,16 @@ fn key_of(req: &Request) -> Option<String> {
     (!k.is_empty() && k.len() <= 128).then(|| k.to_string())
 }
 
+/// The credential the request was made with; `None` for anonymous calls.
+fn caller_of(headers: &axum::http::HeaderMap) -> Option<&str> {
+    headers
+        .get("authorization")
+        .or_else(|| headers.get("x-musubi-server-key"))
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+}
+
 pub async fn replay(State(s): State<AppState>, req: Request, next: Next) -> Response {
     let mutating = matches!(
         *req.method(),
@@ -28,12 +38,11 @@ pub async fn replay(State(s): State<AppState>, req: Request, next: Next) -> Resp
     let Some(key) = key_of(&req).filter(|_| mutating) else {
         return next.run(req).await;
     };
-    let caller = req
-        .headers()
-        .get("authorization")
-        .or_else(|| req.headers().get("x-musubi-server-key"))
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
+    // Anonymous requests (logins, registrations, password resets) share no identity: a stored
+    // response under a guessable key would be replayed to any other client, so they always run.
+    let Some(caller) = caller_of(req.headers()) else {
+        return next.run(req).await;
+    };
     let hash = crate::keys::hash(&format!(
         "{caller}\n{}\n{}\n{key}",
         req.method(),
@@ -109,4 +118,38 @@ pub async fn replay(State(s): State<AppState>, req: Request, next: Next) -> Resp
     .execute(&s.db)
     .await;
     Response::from_parts(parts, Body::from(bytes))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::HeaderMap;
+
+    #[test]
+    fn anonymous_requests_have_no_idempotency_caller() {
+        let mut h = HeaderMap::new();
+        assert!(caller_of(&h).is_none());
+        h.insert("authorization", "   ".parse().unwrap());
+        assert!(caller_of(&h).is_none());
+        h.insert("authorization", "Bearer abc".parse().unwrap());
+        assert_eq!(caller_of(&h), Some("Bearer abc"));
+        let mut k = HeaderMap::new();
+        k.insert("x-musubi-server-key", "msk_x".parse().unwrap());
+        assert_eq!(caller_of(&k), Some("msk_x"));
+    }
+
+    #[test]
+    fn key_is_trimmed_and_capped() {
+        let req = |v: &str| {
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/x")
+                .header("idempotency-key", v)
+                .body(Body::empty())
+                .unwrap()
+        };
+        assert_eq!(key_of(&req(" k1 ")).as_deref(), Some("k1"));
+        assert!(key_of(&req("")).is_none());
+        assert!(key_of(&req(&"a".repeat(129))).is_none());
+    }
 }

@@ -326,12 +326,7 @@ async fn mint_token(
     email: &str,
     ttl_secs: i64,
 ) -> Result<String, ApiError> {
-    let raw = crate::keys::hash(&format!(
-        "{}{}{:?}",
-        uuid::Uuid::now_v7().simple(),
-        uuid::Uuid::now_v7().simple(),
-        std::time::SystemTime::now()
-    ));
+    let raw = crate::keys::random_secret();
     sqlx::query(
         "insert into musubi.email_tokens (token_hash, account_id, kind, email, expires_at)
          values ($1, $2, $3, $4, now() + make_interval(secs => $5))",
@@ -956,12 +951,19 @@ async fn token_scope(
 async fn server_token(
     State(s): State<AppState>,
     ServerKey: ServerKey,
+    axum::Extension(caller): axum::Extension<crate::keys::Caller>,
     Path(id): Path<uuid::Uuid>,
     Json(b): Json<ScopeBody>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     crate::scopes::validate(&b.scopes)?;
     if b.scopes.is_empty() {
         return Err(Error::InvalidArgument("scopes required".into()).into());
+    }
+    // a key limited to some areas must not hand out player tokens beyond them
+    if !crate::scopes::within(&b.scopes, &caller.scopes) {
+        return Err(
+            Error::PermissionDenied("requested scopes exceed the server key's own".into()).into(),
+        );
     }
     let exists: Option<(Option<String>,)> =
         sqlx::query_as("select username from musubi.accounts where id = $1 and deleted_at is null")

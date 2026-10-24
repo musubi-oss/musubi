@@ -92,7 +92,15 @@ async fn delete_account(
     State(s): State<AppState>,
     Bearer(me): Bearer,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    super::admin::kick_everywhere(&s, me.account_id).await;
     s.accounts.delete(me.account_id).await?;
+    s.events
+        .emit(
+            "account.deleted",
+            Some(me.account_id),
+            json!({ "by": "self" }),
+        )
+        .await;
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -450,6 +458,13 @@ async fn merge(
         .auth
         .verify_access(&r.access_token)
         .map_err(|_| musubi_core::Error::Unauthenticated("invalid access_token".into()))?;
+    // a down-scoped token (handed to a bot, overlay or partner) proves no ownership
+    if !other.scopes.is_empty() {
+        return Err(musubi_core::Error::PermissionDenied(
+            "a full session token of the other account is required".into(),
+        )
+        .into());
+    }
     if other.account_id == me.account_id {
         return Err(musubi_core::Error::InvalidArgument(
             "cannot merge an account into itself".into(),

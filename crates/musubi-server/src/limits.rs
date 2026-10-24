@@ -45,6 +45,9 @@ pub struct RateLimiter {
     overrides: DashMap<Uuid, AccountLimit>,
     cfg: LimitsConfig,
     buckets: DashMap<String, Bucket>,
+    /// Unix seconds of the last idle-bucket sweep; sweeps are rate-limited themselves so a flood
+    /// of distinct keys cannot turn every `check` into a full-map scan.
+    last_sweep: std::sync::atomic::AtomicU64,
     /// Tokens consumed locally since the last gossip flush, per `scope:key`.
     pending: DashMap<String, u64>,
 }
@@ -55,6 +58,7 @@ pub const GOSSIP_EVERY: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Above this many live buckets a sweep drops the ones idle for a minute.
 const SWEEP_AT: usize = 100_000;
+const SWEEP_EVERY_SECS: u64 = 10;
 
 impl RateLimiter {
     pub fn new(cfg: &LimitsConfig) -> Self {
@@ -62,6 +66,7 @@ impl RateLimiter {
             overrides: DashMap::new(),
             cfg: cfg.clone(),
             buckets: DashMap::new(),
+            last_sweep: std::sync::atomic::AtomicU64::new(0),
             pending: DashMap::new(),
         }
     }
@@ -106,11 +111,26 @@ impl RateLimiter {
             Err((1.0 - b.tokens) / per_sec)
         };
         drop(b);
-        if self.buckets.len() > SWEEP_AT {
+        if self.buckets.len() > SWEEP_AT && self.claim_sweep() {
             self.buckets
                 .retain(|_, b| now.duration_since(b.updated).as_secs() < 60);
         }
         r
+    }
+
+    /// True for at most one caller per [`SWEEP_EVERY_SECS`].
+    fn claim_sweep(&self) -> bool {
+        use std::sync::atomic::Ordering;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let last = self.last_sweep.load(Ordering::Relaxed);
+        now.saturating_sub(last) >= SWEEP_EVERY_SECS
+            && self
+                .last_sweep
+                .compare_exchange(last, now, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
     }
 
     /// Drain the locally consumed counts for gossiping to peers.
@@ -487,6 +507,21 @@ mod cluster_tests {
         b.apply_remote(&usage);
         let t = b.buckets.get(&format!("http:{}", id.0)).unwrap().tokens;
         assert!((-10.0..0.0).contains(&t), "{t}");
+    }
+
+    #[test]
+    fn idle_sweep_runs_at_most_once_per_interval() {
+        let b = RateLimiter::new(&cfg());
+        assert!(b.claim_sweep(), "first sweep is allowed");
+        assert!(
+            !b.claim_sweep(),
+            "a second sweep inside the interval is skipped"
+        );
+        b.last_sweep.store(0, std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            b.claim_sweep(),
+            "allowed again once the interval has passed"
+        );
     }
 
     #[test]

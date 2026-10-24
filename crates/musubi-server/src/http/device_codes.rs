@@ -17,7 +17,6 @@ use axum::{Json, Router};
 use musubi_core::{AccountId, Error};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -37,19 +36,12 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/server/device_codes/{id}", delete(remove))
 }
 
-fn hex(b: &[u8]) -> String {
-    b.iter().map(|x| format!("{x:02x}")).collect()
-}
-
 fn hash(code: &str) -> String {
-    hex(&Sha256::digest(code.as_bytes()))
+    crate::keys::hash(code)
 }
 
 fn gen_device_code() -> String {
-    use rand::RngCore;
-    let mut b = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut b);
-    hex(&b)
+    crate::keys::random_secret()
 }
 
 fn gen_user_code() -> String {
@@ -343,8 +335,11 @@ async fn token(
 async fn info(
     Bearer(_me): Bearer,
     State(s): State<AppState>,
+    ip: super::ClientIp,
     Path(code): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
+    // RFC 8628 §5.1: user codes are short, so lookups and decisions are rate-limited like logins
+    s.limits.auth_ip(&ip.0)?;
     let code = normalize(&code)?;
     let row: Option<Row> = sqlx::query_as(&format!(
         "select {COLS} from musubi.device_codes where user_code = $1 and status in ('pending', 'approved')"
@@ -398,16 +393,20 @@ async fn decide(s: &AppState, me: AccountId, code: &str, approve: bool) -> Resul
 async fn approve(
     Bearer(me): Bearer,
     State(s): State<AppState>,
+    ip: super::ClientIp,
     Json(r): Json<CodeReq>,
 ) -> Result<Json<Value>, ApiError> {
+    s.limits.auth_ip(&ip.0)?;
     Ok(Json(decide(&s, me.account_id, &r.user_code, true).await?))
 }
 
 async fn deny(
     Bearer(me): Bearer,
     State(s): State<AppState>,
+    ip: super::ClientIp,
     Json(r): Json<CodeReq>,
 ) -> Result<Json<Value>, ApiError> {
+    s.limits.auth_ip(&ip.0)?;
     Ok(Json(decide(&s, me.account_id, &r.user_code, false).await?))
 }
 

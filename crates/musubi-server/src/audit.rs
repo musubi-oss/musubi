@@ -19,11 +19,24 @@ use crate::app::AppState;
 use crate::http::{ApiError, ServerKey};
 
 const MAX_BODY: usize = 64 * 1024;
+/// `X-Musubi-Actor` is free text from the console; longer or non-printable values fall back to
+/// the key name so the audit log cannot be stuffed or forged with control characters.
+const MAX_ACTOR: usize = 128;
 
 /// Operator and server-key mutations are audited; the simulator data-plane of a world
 /// (`/v1/server/worlds/{w}/spawn|apply|lease|...`, hundreds of calls a second per world) is
 /// game state, not an operator action, and would only flood the log and the pool. Creating and
 /// deleting worlds stays audited.
+/// `X-Musubi-Actor` when it is present, printable and within [`MAX_ACTOR`].
+fn actor_header(headers: &axum::http::HeaderMap) -> Option<String> {
+    headers
+        .get("x-musubi-actor")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|a| !a.is_empty() && a.len() <= MAX_ACTOR && !a.chars().any(char::is_control))
+        .map(str::to_string)
+}
+
 fn audited(method: &Method, path: &str) -> bool {
     if !matches!(
         *method,
@@ -134,21 +147,15 @@ pub async fn record(State(s): State<AppState>, req: Request, next: Next) -> Resp
         .get::<MatchedPath>()
         .map(|p| p.as_str().to_string())
         .unwrap_or_else(|| path.clone());
-    let actor = req
-        .headers()
-        .get("x-musubi-actor")
-        .and_then(|v| v.to_str().ok())
-        .filter(|a| !a.is_empty())
-        .map(str::to_string)
-        .unwrap_or_else(|| {
-            // issued keys are audited under their name; the config key stays `server-key`
-            req.headers()
-                .get("x-musubi-server-key")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|k| s.keys.lookup(k))
-                .map(|c| format!("key:{}", c.name))
-                .unwrap_or_else(|| "server-key".to_string())
-        });
+    let actor = actor_header(req.headers()).unwrap_or_else(|| {
+        // issued keys are audited under their name; the config key stays `server-key`
+        req.headers()
+            .get("x-musubi-server-key")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|k| s.keys.lookup(k))
+            .map(|c| format!("key:{}", c.name))
+            .unwrap_or_else(|| "server-key".to_string())
+    });
     let ip = {
         let h = |n: &str| {
             req.headers()
@@ -263,6 +270,20 @@ pub async fn list(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn actor_header_is_bounded_and_printable() {
+        let h = |v: &str| {
+            let mut m = axum::http::HeaderMap::new();
+            m.insert("x-musubi-actor", v.parse().unwrap());
+            actor_header(&m)
+        };
+        assert_eq!(h(" ops@example ").as_deref(), Some("ops@example"));
+        assert!(h("").is_none());
+        assert!(h(&"a".repeat(MAX_ACTOR + 1)).is_none());
+        assert!(h("line\tbreak").is_none());
+        assert!(actor_header(&axum::http::HeaderMap::new()).is_none());
+    }
 
     #[test]
     fn simulator_data_plane_is_not_audited() {

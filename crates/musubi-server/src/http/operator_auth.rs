@@ -95,8 +95,12 @@ struct LoginBody {
 
 async fn login(
     State(s): State<AppState>,
+    ip: crate::http::ClientIp,
     Json(b): Json<LoginBody>,
 ) -> Result<Json<Value>, ApiError> {
+    // per-IP budget on top of the per-account lockout: spraying one password over many operator
+    // e-mails (or locking every operator out on purpose) costs the same as player logins
+    s.limits.auth_ip(&ip.0)?;
     let email = b.email.trim().to_ascii_lowercase();
     let bad = || Error::Unauthenticated("wrong e-mail or password".into());
     let row: Option<OpRow> = sqlx::query_as(&format!(
