@@ -27,7 +27,7 @@ export function Kv({
   return (
     <div className="flex items-baseline gap-3 border-b border-border/50 py-1.5 text-sm">
       <dt className="w-32 shrink-0 text-muted-foreground">{k}</dt>
-      <dd className={cn('min-w-0 flex-1 break-all', mono && 'font-mono text-xs', empty && 'text-muted-foreground')}>
+      <dd className={cn('min-w-0 flex-1 overflow-hidden break-all', mono && 'font-mono text-xs', empty && 'text-muted-foreground')}>
         {node ? (
           (v as ReactNode)
         ) : to && !empty ? (

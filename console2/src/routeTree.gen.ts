@@ -14,10 +14,18 @@ import { Route as LoginRouteImport } from './routes/login'
 import { Route as AppIndexRouteImport } from './routes/_app/index'
 import { Route as AppSectionIndexRouteImport } from './routes/_app/$section/index'
 import { Route as AppClusterIndexRouteImport } from './routes/_app/cluster/index'
+import { Route as AppPlayersAccessRouteImport } from './routes/_app/players/access'
+import { Route as AppPlayersAuth_providersRouteImport } from './routes/_app/players/auth_providers'
+import { Route as AppPlayersCrashesRouteImport } from './routes/_app/players/crashes'
+import { Route as AppPlayersData_rightsRouteImport } from './routes/_app/players/data_rights'
+import { Route as AppPlayersReportsRouteImport } from './routes/_app/players/reports'
+import { Route as AppServersBuildsRouteImport } from './routes/_app/servers/builds'
+import { Route as AppServersEdgeRouteImport } from './routes/_app/servers/edge'
 import { Route as AppSectionPageIndexRouteImport } from './routes/_app/$section/$page/index'
 import { Route as AppSectionPageIdRouteImport } from './routes/_app/$section/$page/$id'
 import { Route as AppPlayersAccountsIdRouteImport } from './routes/_app/players/accounts/$id'
 import { Route as AppServersFleetsIdRouteImport } from './routes/_app/servers/fleets/$id'
+import { Route as AppServersServersIdRouteImport } from './routes/_app/servers/servers/$id'
 import { Route as AppWorldWorldsWIndexRouteImport } from './routes/_app/world/worlds/$w/index'
 import { Route as AppWorldWorldsWEntitiesIdRouteImport } from './routes/_app/world/worlds/$w/entities/$id'
 
@@ -45,6 +53,42 @@ const AppClusterIndexRoute = AppClusterIndexRouteImport.update({
   path: '/cluster/',
   getParentRoute: () => AppRoute,
 } as any)
+const AppPlayersAccessRoute = AppPlayersAccessRouteImport.update({
+  id: '/players/access',
+  path: '/players/access',
+  getParentRoute: () => AppRoute,
+} as any)
+const AppPlayersAuth_providersRoute =
+  AppPlayersAuth_providersRouteImport.update({
+    id: '/players/auth_providers',
+    path: '/players/auth_providers',
+    getParentRoute: () => AppRoute,
+  } as any)
+const AppPlayersCrashesRoute = AppPlayersCrashesRouteImport.update({
+  id: '/players/crashes',
+  path: '/players/crashes',
+  getParentRoute: () => AppRoute,
+} as any)
+const AppPlayersData_rightsRoute = AppPlayersData_rightsRouteImport.update({
+  id: '/players/data_rights',
+  path: '/players/data_rights',
+  getParentRoute: () => AppRoute,
+} as any)
+const AppPlayersReportsRoute = AppPlayersReportsRouteImport.update({
+  id: '/players/reports',
+  path: '/players/reports',
+  getParentRoute: () => AppRoute,
+} as any)
+const AppServersBuildsRoute = AppServersBuildsRouteImport.update({
+  id: '/servers/builds',
+  path: '/servers/builds',
+  getParentRoute: () => AppRoute,
+} as any)
+const AppServersEdgeRoute = AppServersEdgeRouteImport.update({
+  id: '/servers/edge',
+  path: '/servers/edge',
+  getParentRoute: () => AppRoute,
+} as any)
 const AppSectionPageIndexRoute = AppSectionPageIndexRouteImport.update({
   id: '/$section/$page/',
   path: '/$section/$page/',
@@ -65,6 +109,11 @@ const AppServersFleetsIdRoute = AppServersFleetsIdRouteImport.update({
   path: '/servers/fleets/$id',
   getParentRoute: () => AppRoute,
 } as any)
+const AppServersServersIdRoute = AppServersServersIdRouteImport.update({
+  id: '/servers/servers/$id',
+  path: '/servers/servers/$id',
+  getParentRoute: () => AppRoute,
+} as any)
 const AppWorldWorldsWIndexRoute = AppWorldWorldsWIndexRouteImport.update({
   id: '/world/worlds/$w/',
   path: '/world/worlds/$w/',
@@ -80,11 +129,19 @@ const AppWorldWorldsWEntitiesIdRoute =
 export interface FileRoutesByFullPath {
   '/': typeof AppIndexRoute
   '/login': typeof LoginRoute
+  '/players/access': typeof AppPlayersAccessRoute
+  '/players/auth_providers': typeof AppPlayersAuth_providersRoute
+  '/players/crashes': typeof AppPlayersCrashesRoute
+  '/players/data_rights': typeof AppPlayersData_rightsRoute
+  '/players/reports': typeof AppPlayersReportsRoute
+  '/servers/builds': typeof AppServersBuildsRoute
+  '/servers/edge': typeof AppServersEdgeRoute
   '/$section/': typeof AppSectionIndexRoute
   '/cluster/': typeof AppClusterIndexRoute
   '/$section/$page/$id': typeof AppSectionPageIdRoute
   '/players/accounts/$id': typeof AppPlayersAccountsIdRoute
   '/servers/fleets/$id': typeof AppServersFleetsIdRoute
+  '/servers/servers/$id': typeof AppServersServersIdRoute
   '/$section/$page/': typeof AppSectionPageIndexRoute
   '/world/worlds/$w/': typeof AppWorldWorldsWIndexRoute
   '/world/worlds/$w/entities/$id': typeof AppWorldWorldsWEntitiesIdRoute
@@ -92,11 +149,19 @@ export interface FileRoutesByFullPath {
 export interface FileRoutesByTo {
   '/login': typeof LoginRoute
   '/': typeof AppIndexRoute
+  '/players/access': typeof AppPlayersAccessRoute
+  '/players/auth_providers': typeof AppPlayersAuth_providersRoute
+  '/players/crashes': typeof AppPlayersCrashesRoute
+  '/players/data_rights': typeof AppPlayersData_rightsRoute
+  '/players/reports': typeof AppPlayersReportsRoute
+  '/servers/builds': typeof AppServersBuildsRoute
+  '/servers/edge': typeof AppServersEdgeRoute
   '/$section': typeof AppSectionIndexRoute
   '/cluster': typeof AppClusterIndexRoute
   '/$section/$page/$id': typeof AppSectionPageIdRoute
   '/players/accounts/$id': typeof AppPlayersAccountsIdRoute
   '/servers/fleets/$id': typeof AppServersFleetsIdRoute
+  '/servers/servers/$id': typeof AppServersServersIdRoute
   '/$section/$page': typeof AppSectionPageIndexRoute
   '/world/worlds/$w': typeof AppWorldWorldsWIndexRoute
   '/world/worlds/$w/entities/$id': typeof AppWorldWorldsWEntitiesIdRoute
@@ -106,11 +171,19 @@ export interface FileRoutesById {
   '/_app': typeof AppRouteWithChildren
   '/login': typeof LoginRoute
   '/_app/': typeof AppIndexRoute
+  '/_app/players/access': typeof AppPlayersAccessRoute
+  '/_app/players/auth_providers': typeof AppPlayersAuth_providersRoute
+  '/_app/players/crashes': typeof AppPlayersCrashesRoute
+  '/_app/players/data_rights': typeof AppPlayersData_rightsRoute
+  '/_app/players/reports': typeof AppPlayersReportsRoute
+  '/_app/servers/builds': typeof AppServersBuildsRoute
+  '/_app/servers/edge': typeof AppServersEdgeRoute
   '/_app/$section/': typeof AppSectionIndexRoute
   '/_app/cluster/': typeof AppClusterIndexRoute
   '/_app/$section/$page/$id': typeof AppSectionPageIdRoute
   '/_app/players/accounts/$id': typeof AppPlayersAccountsIdRoute
   '/_app/servers/fleets/$id': typeof AppServersFleetsIdRoute
+  '/_app/servers/servers/$id': typeof AppServersServersIdRoute
   '/_app/$section/$page/': typeof AppSectionPageIndexRoute
   '/_app/world/worlds/$w/': typeof AppWorldWorldsWIndexRoute
   '/_app/world/worlds/$w/entities/$id': typeof AppWorldWorldsWEntitiesIdRoute
@@ -120,11 +193,19 @@ export interface FileRouteTypes {
   fullPaths:
     | '/'
     | '/login'
+    | '/players/access'
+    | '/players/auth_providers'
+    | '/players/crashes'
+    | '/players/data_rights'
+    | '/players/reports'
+    | '/servers/builds'
+    | '/servers/edge'
     | '/$section/'
     | '/cluster/'
     | '/$section/$page/$id'
     | '/players/accounts/$id'
     | '/servers/fleets/$id'
+    | '/servers/servers/$id'
     | '/$section/$page/'
     | '/world/worlds/$w/'
     | '/world/worlds/$w/entities/$id'
@@ -132,11 +213,19 @@ export interface FileRouteTypes {
   to:
     | '/login'
     | '/'
+    | '/players/access'
+    | '/players/auth_providers'
+    | '/players/crashes'
+    | '/players/data_rights'
+    | '/players/reports'
+    | '/servers/builds'
+    | '/servers/edge'
     | '/$section'
     | '/cluster'
     | '/$section/$page/$id'
     | '/players/accounts/$id'
     | '/servers/fleets/$id'
+    | '/servers/servers/$id'
     | '/$section/$page'
     | '/world/worlds/$w'
     | '/world/worlds/$w/entities/$id'
@@ -145,11 +234,19 @@ export interface FileRouteTypes {
     | '/_app'
     | '/login'
     | '/_app/'
+    | '/_app/players/access'
+    | '/_app/players/auth_providers'
+    | '/_app/players/crashes'
+    | '/_app/players/data_rights'
+    | '/_app/players/reports'
+    | '/_app/servers/builds'
+    | '/_app/servers/edge'
     | '/_app/$section/'
     | '/_app/cluster/'
     | '/_app/$section/$page/$id'
     | '/_app/players/accounts/$id'
     | '/_app/servers/fleets/$id'
+    | '/_app/servers/servers/$id'
     | '/_app/$section/$page/'
     | '/_app/world/worlds/$w/'
     | '/_app/world/worlds/$w/entities/$id'
@@ -197,6 +294,55 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AppClusterIndexRouteImport
       parentRoute: typeof AppRoute
     }
+    '/_app/players/access': {
+      id: '/_app/players/access'
+      path: '/players/access'
+      fullPath: '/players/access'
+      preLoaderRoute: typeof AppPlayersAccessRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/players/auth_providers': {
+      id: '/_app/players/auth_providers'
+      path: '/players/auth_providers'
+      fullPath: '/players/auth_providers'
+      preLoaderRoute: typeof AppPlayersAuth_providersRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/players/crashes': {
+      id: '/_app/players/crashes'
+      path: '/players/crashes'
+      fullPath: '/players/crashes'
+      preLoaderRoute: typeof AppPlayersCrashesRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/players/data_rights': {
+      id: '/_app/players/data_rights'
+      path: '/players/data_rights'
+      fullPath: '/players/data_rights'
+      preLoaderRoute: typeof AppPlayersData_rightsRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/players/reports': {
+      id: '/_app/players/reports'
+      path: '/players/reports'
+      fullPath: '/players/reports'
+      preLoaderRoute: typeof AppPlayersReportsRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/servers/builds': {
+      id: '/_app/servers/builds'
+      path: '/servers/builds'
+      fullPath: '/servers/builds'
+      preLoaderRoute: typeof AppServersBuildsRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/servers/edge': {
+      id: '/_app/servers/edge'
+      path: '/servers/edge'
+      fullPath: '/servers/edge'
+      preLoaderRoute: typeof AppServersEdgeRouteImport
+      parentRoute: typeof AppRoute
+    }
     '/_app/$section/$page/': {
       id: '/_app/$section/$page/'
       path: '/$section/$page'
@@ -225,6 +371,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AppServersFleetsIdRouteImport
       parentRoute: typeof AppRoute
     }
+    '/_app/servers/servers/$id': {
+      id: '/_app/servers/servers/$id'
+      path: '/servers/servers/$id'
+      fullPath: '/servers/servers/$id'
+      preLoaderRoute: typeof AppServersServersIdRouteImport
+      parentRoute: typeof AppRoute
+    }
     '/_app/world/worlds/$w/': {
       id: '/_app/world/worlds/$w/'
       path: '/world/worlds/$w'
@@ -244,11 +397,19 @@ declare module '@tanstack/react-router' {
 
 interface AppRouteChildren {
   AppIndexRoute: typeof AppIndexRoute
+  AppPlayersAccessRoute: typeof AppPlayersAccessRoute
+  AppPlayersAuth_providersRoute: typeof AppPlayersAuth_providersRoute
+  AppPlayersCrashesRoute: typeof AppPlayersCrashesRoute
+  AppPlayersData_rightsRoute: typeof AppPlayersData_rightsRoute
+  AppPlayersReportsRoute: typeof AppPlayersReportsRoute
+  AppServersBuildsRoute: typeof AppServersBuildsRoute
+  AppServersEdgeRoute: typeof AppServersEdgeRoute
   AppSectionIndexRoute: typeof AppSectionIndexRoute
   AppClusterIndexRoute: typeof AppClusterIndexRoute
   AppSectionPageIdRoute: typeof AppSectionPageIdRoute
   AppPlayersAccountsIdRoute: typeof AppPlayersAccountsIdRoute
   AppServersFleetsIdRoute: typeof AppServersFleetsIdRoute
+  AppServersServersIdRoute: typeof AppServersServersIdRoute
   AppSectionPageIndexRoute: typeof AppSectionPageIndexRoute
   AppWorldWorldsWIndexRoute: typeof AppWorldWorldsWIndexRoute
   AppWorldWorldsWEntitiesIdRoute: typeof AppWorldWorldsWEntitiesIdRoute
@@ -256,11 +417,19 @@ interface AppRouteChildren {
 
 const AppRouteChildren: AppRouteChildren = {
   AppIndexRoute: AppIndexRoute,
+  AppPlayersAccessRoute: AppPlayersAccessRoute,
+  AppPlayersAuth_providersRoute: AppPlayersAuth_providersRoute,
+  AppPlayersCrashesRoute: AppPlayersCrashesRoute,
+  AppPlayersData_rightsRoute: AppPlayersData_rightsRoute,
+  AppPlayersReportsRoute: AppPlayersReportsRoute,
+  AppServersBuildsRoute: AppServersBuildsRoute,
+  AppServersEdgeRoute: AppServersEdgeRoute,
   AppSectionIndexRoute: AppSectionIndexRoute,
   AppClusterIndexRoute: AppClusterIndexRoute,
   AppSectionPageIdRoute: AppSectionPageIdRoute,
   AppPlayersAccountsIdRoute: AppPlayersAccountsIdRoute,
   AppServersFleetsIdRoute: AppServersFleetsIdRoute,
+  AppServersServersIdRoute: AppServersServersIdRoute,
   AppSectionPageIndexRoute: AppSectionPageIndexRoute,
   AppWorldWorldsWIndexRoute: AppWorldWorldsWIndexRoute,
   AppWorldWorldsWEntitiesIdRoute: AppWorldWorldsWEntitiesIdRoute,

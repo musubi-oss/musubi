@@ -93,11 +93,15 @@ function ListPage() {
         <>
           <div className="flex flex-wrap items-center gap-2">
             <Input value={search.q ?? ''} onChange={(e) => set({ q: e.target.value })} placeholder="Filter rows…" className="w-full sm:w-64" aria-label="Filter rows" />
-            {(res.filters ?? []).map((f) => (
+            {(res.filters ?? []).map((f) => f.options ? (
               <Select key={f.key} value={filters[f.key] || 'all'} onValueChange={(v) => { setStack([]); set({ [f.key]: v === (f.def ?? '') || v === 'all' ? undefined : v, cursor: undefined }) }}>
                 <SelectTrigger size="sm" className="w-40" aria-label={f.label ?? f.key}><SelectValue placeholder={f.label ?? f.key} /></SelectTrigger>
                 <SelectContent>{!f.options.includes('all') && <SelectItem value="all">{f.label ?? f.key}: all</SelectItem>}{f.options.map((o) => <SelectItem key={o} value={o}>{o}</SelectItem>)}</SelectContent>
               </Select>
+            ) : (
+              <Input key={f.key} className="w-56" defaultValue={filters[f.key]} placeholder={f.label ?? f.key.replace(/_/g, ' ')} aria-label={f.label ?? f.key}
+                onKeyDown={(e) => { if (e.key === 'Enter') { setStack([]); set({ [f.key]: (e.target as HTMLInputElement).value || undefined, cursor: undefined }) } }}
+                onBlur={(e) => { if ((e.target.value || '') !== (filters[f.key] || '')) { setStack([]); set({ [f.key]: e.target.value || undefined, cursor: undefined }) } }} />
             ))}
             <span className="ml-auto text-xs text-muted-foreground">{list.isPending ? '' : `${shown.length}${q ? ` of ${rows.length}` : ''} rows`}</span>
           </div>
