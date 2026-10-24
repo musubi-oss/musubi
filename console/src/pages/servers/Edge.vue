@@ -5,8 +5,8 @@ import Kv from '../../components/Kv.vue'
 import JsonView from '../../components/JsonView.vue'
 import DataTable from '../../components/DataTable.vue'
 import { toast } from '../../stores/toast'
-const st = ref<any>(null); const err = ref(''); const ip = ref(''); const secs = ref(300)
-async function load() { err.value = ''; try { st.value = await get('/v1/server/edge') } catch (e: any) { err.value = e.status === 404 ? 'UDP edge proxy is not running on this node ([edge] enabled = false)' : e.message } }
+const st = ref<any>(null); const err = ref(''); const off = ref(''); const ip = ref(''); const secs = ref(300)
+async function load() { err.value = ''; off.value = ''; try { st.value = await get('/v1/server/edge') } catch (e: any) { if (e.status === 404) off.value = 'The UDP edge proxy is not running on this node — set [edge] enabled = true in the node config to terminate game traffic here.'; else err.value = e.message } }
 async function block() { try { await post('/v1/server/edge/block', { ip: ip.value, secs: secs.value }); toast.show('blocked'); ip.value = ''; load() } catch (e: any) { toast.err(e) } }
 async function unblock(a: string) { try { await post('/v1/server/edge/unblock', { ip: a }); toast.show('unblocked'); load() } catch (e: any) { toast.err(e) } }
 onMounted(load)
@@ -15,6 +15,7 @@ onMounted(load)
   <div class="card">
     <h2>Edge proxy</h2>
     <p class="err" v-if="err">{{ err }}</p>
+    <div class="empty off" v-if="off"><b>Not configured on this node.</b> {{ off }} <router-link to="/settings/config">node config →</router-link></div>
     <template v-if="st">
       <div class="grid">
         <div><Kv k="Listen" :v="st.listen" mono /><Kv k="Sessions" :v="st.sessions" /><Kv k="Forwarded / dropped" :v="`${st.forwarded} / ${st.dropped}`" /></div>

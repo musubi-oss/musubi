@@ -13,7 +13,7 @@ import { toast } from '../stores/toast'
 const props = defineProps<{ res: Res }>()
 const router = useRouter(); const route = useRoute()
 const pending = ref<{ act: Act; row: any; text: string } | null>(null)
-const data = ref<any>(null); const rows = ref<any[]>([]); const err = ref(''); const busy = ref(false)
+const data = ref<any>(null); const rows = ref<any[]>([]); const err = ref(''); const off = ref(''); const busy = ref(false)
 const q = ref(String(route.query.q ?? '')); const cursor = ref<string | null>(null); const stack = ref<string[]>([])
 const open = ref<any>(null); const edit = ref(''); const raw = ref(false); const creating = ref(false); const text = ref('')
 const cols = computed<Col[]>(() => {
@@ -29,14 +29,19 @@ watch(q, (v) => { router.replace({ query: { ...route.query, q: v || undefined } 
 watch(() => props.res.id, () => { q.value = ''; stack.value = []; load() })
 const isList = computed(() => Array.isArray(rows.value) && (rows.value.length > 0 || props.res.rowsKey !== undefined || Array.isArray(data.value)))
 async function load(c: string | null = null) {
-  busy.value = true; err.value = ''
+  busy.value = true; err.value = ''; off.value = ''
   try {
     const d = await get(props.res.list + qs({ q: q.value, cursor: c, limit: 50 }))
     data.value = d
     const list = Array.isArray(d) ? d : props.res.rowsKey ? d?.[props.res.rowsKey] : Object.values(d ?? {}).find(Array.isArray)
     rows.value = Array.isArray(list) ? list : []
     cursor.value = d?.next_cursor ?? d?.cursor ?? null
-  } catch (e: any) { err.value = e.message; rows.value = []; data.value = null }
+  } catch (e: any) {
+    // 400/404 with 'not enabled / not running / not configured' = the feature is off on this node, not a failure
+    if ((e.status === 400 || e.status === 404) && /not (enabled|running|configured|available)/i.test(e.message ?? '')) off.value = e.message.replace(/^(invalid argument|not found): /, '')
+    else err.value = e.message
+    rows.value = []; data.value = null
+  }
   busy.value = false
 }
 function next() { if (cursor.value) { stack.value.push(cursor.value); load(cursor.value) } }
@@ -94,7 +99,7 @@ onMounted(() => { if (props.res.custom !== 'zanshin') load() })
 <template>
   <div class="card">
     <h2>{{ res.title }} <small v-if="isList">({{ shown.length !== rows.length ? shown.length + ' of ' : '' }}{{ rows.length }}{{ cursor ? '+' : '' }})</small></h2>
-    <div class="tools" v-if="isList && res.custom !== 'zanshin'">
+    <div class="tools" v-if="isList && !off && res.custom !== 'zanshin'">
       <input class="in" v-model="q" placeholder="filter — any field, space = and" @keyup.enter="load()" /><button class="btn s" v-if="q" @click="q = ''" title="clear">×</button>
       <button class="btn" @click="load()" :disabled="busy">Refresh</button>
       <span style="margin-left:auto;display:flex;gap:8px">
@@ -103,6 +108,7 @@ onMounted(() => { if (props.res.custom !== 'zanshin') load() })
       </span>
     </div>
     <p class="err" v-if="err">{{ err }}</p>
+    <div class="empty off" v-if="off"><b>Not configured on this node.</b> {{ off }} <router-link to="/settings/config">node config →</router-link></div>
     <template v-if="res.custom === 'zanshin'">
       <p>Zanshin is Musubi's LiveOps companion and runs as a <b>separate service</b>: it is never started by this cluster and nothing here depends on it. Musubi exposes two integration points:</p>
       <div class="grid" style="margin-top:14px">
@@ -111,7 +117,7 @@ onMounted(() => { if (props.res.custom !== 'zanshin') load() })
         <div><Kv k="This section" v="Musubi-native schedule" /><div class="note">Live events, flags, experiments, remote config, audiences, news, offers, tournaments and economy changesets on this page are Musubi's own primitives and work without Zanshin.</div></div>
       </div>
     </template>
-    <template v-else-if="isList">
+    <template v-else-if="isList && !off">
       <DataTable :cols="cols" :rows="shown" :loading="busy" pick @pick="pick" :empty="q ? 'Nothing matches the filter' : 'No Data'">
         <template #actions="{ row }" v-if="res.actions || res.link">
           <span style="display:flex;gap:6px;justify-content:flex-end">
@@ -129,7 +135,7 @@ onMounted(() => { if (props.res.custom !== 'zanshin') load() })
       </div>
       <div class="tools"><button class="btn" @click="load()">Refresh</button><button v-for="a in res.pageActions ?? []" :key="a.label" class="btn" :class="{ d: a.danger }" @click="run(a, data)">{{ a.label }}</button></div>
     </template>
-    <div v-else-if="!err && !busy" class="empty">No Data</div>
+    <div v-else-if="!err && !off && !busy" class="empty">No {{ res.title.toLowerCase() }} yet<template v-if="res.template"> — use <b>New</b> above to create the first one</template><template v-else-if="res.rowsKey">; rows appear here as the game creates them</template></div>
   </div>
   <Drawer v-if="open" :title="res.title.replace(/s$/, '') + (open?.[res.key ?? 'id'] ? ' · ' + open[res.key ?? 'id'] : '')" wide @close="open = null">
     <template v-if="!res.item">

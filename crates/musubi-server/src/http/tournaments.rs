@@ -18,7 +18,7 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/tournaments/{id}/join", post(join))
         .route("/v1/tournaments/{id}/records", get(records).post(write))
         .route("/v1/tournaments/{id}/around/{owner}", get(around))
-        .route("/v1/server/tournaments", post(create))
+        .route("/v1/server/tournaments", get(list_server).post(create))
         .route("/v1/server/tournaments/{id}", delete(delete_one))
         .route("/v1/server/tournaments/{id}/end", post(end))
         .route("/v1/tournaments/{id}/bracket", get(bracket_get))
@@ -98,6 +98,24 @@ async fn username(s: &AppState, id: AccountId) -> Result<Option<String>, ApiErro
 async fn list(
     State(s): State<AppState>,
     Bearer(_): Bearer,
+    Query(q): Query<ListQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let f = TournamentFilter {
+        category_start: q.category_start,
+        category_end: q.category_end,
+        start_time: q.start_time,
+        end_time: q.end_time,
+    };
+    let (tournaments, cursor) = s.tournaments.list(f, q.limit, q.cursor.as_deref()).await?;
+    Ok(Json(
+        json!({ "tournaments": tournaments, "cursor": cursor }),
+    ))
+}
+
+/// Same listing for game servers and the console (server key instead of a player bearer).
+async fn list_server(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
     Query(q): Query<ListQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let f = TournamentFilter {
