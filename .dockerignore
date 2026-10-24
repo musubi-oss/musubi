@@ -4,3 +4,5 @@ console/node_modules
 .git
 sdk/unreal/Demo
 docs
+console2/node_modules
+console2/dist
