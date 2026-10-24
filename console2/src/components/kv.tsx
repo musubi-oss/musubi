@@ -1,7 +1,7 @@
 import { Link } from '@tanstack/react-router'
 import { Copy } from 'lucide-react'
 import { toast } from 'sonner'
-import type { ReactNode } from 'react'
+import { isValidElement, type ReactNode } from 'react'
 import { cn } from '@/lib/utils'
 
 export function KvGrid({ children, className }: { children: ReactNode; className?: string }) {
@@ -22,19 +22,22 @@ export function Kv({
   to?: string | null
 }) {
   const empty = v === undefined || v === null || v === ''
-  const text = empty ? '—' : typeof v === 'object' ? JSON.stringify(v) : String(v)
+  const node = isValidElement(v)
+  const text = empty ? '—' : node ? '' : typeof v === 'object' ? JSON.stringify(v) : String(v)
   return (
     <div className="flex items-baseline gap-3 border-b border-border/50 py-1.5 text-sm">
       <dt className="w-32 shrink-0 text-muted-foreground">{k}</dt>
       <dd className={cn('min-w-0 flex-1 break-all', mono && 'font-mono text-xs', empty && 'text-muted-foreground')}>
-        {to && !empty ? (
+        {node ? (
+          (v as ReactNode)
+        ) : to && !empty ? (
           <Link to={to} className="text-primary underline-offset-4 hover:underline">
             {text}
           </Link>
         ) : (
           text
         )}
-        {copy && !empty && (
+        {copy && !empty && !node && (
           <button
             type="button"
             aria-label={`Copy ${k}`}

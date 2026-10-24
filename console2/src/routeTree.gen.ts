@@ -16,6 +16,9 @@ import { Route as AppSectionIndexRouteImport } from './routes/_app/$section/inde
 import { Route as AppSectionPageIndexRouteImport } from './routes/_app/$section/$page/index'
 import { Route as AppSectionPageIdRouteImport } from './routes/_app/$section/$page/$id'
 import { Route as AppPlayersAccountsIdRouteImport } from './routes/_app/players/accounts/$id'
+import { Route as AppServersFleetsIdRouteImport } from './routes/_app/servers/fleets/$id'
+import { Route as AppWorldWorldsWIndexRouteImport } from './routes/_app/world/worlds/$w/index'
+import { Route as AppWorldWorldsWEntitiesIdRouteImport } from './routes/_app/world/worlds/$w/entities/$id'
 
 const AppRoute = AppRouteImport.update({
   id: '/_app',
@@ -51,6 +54,22 @@ const AppPlayersAccountsIdRoute = AppPlayersAccountsIdRouteImport.update({
   path: '/players/accounts/$id',
   getParentRoute: () => AppRoute,
 } as any)
+const AppServersFleetsIdRoute = AppServersFleetsIdRouteImport.update({
+  id: '/servers/fleets/$id',
+  path: '/servers/fleets/$id',
+  getParentRoute: () => AppRoute,
+} as any)
+const AppWorldWorldsWIndexRoute = AppWorldWorldsWIndexRouteImport.update({
+  id: '/world/worlds/$w/',
+  path: '/world/worlds/$w/',
+  getParentRoute: () => AppRoute,
+} as any)
+const AppWorldWorldsWEntitiesIdRoute =
+  AppWorldWorldsWEntitiesIdRouteImport.update({
+    id: '/world/worlds/$w/entities/$id',
+    path: '/world/worlds/$w/entities/$id',
+    getParentRoute: () => AppRoute,
+  } as any)
 
 export interface FileRoutesByFullPath {
   '/': typeof AppIndexRoute
@@ -58,7 +77,10 @@ export interface FileRoutesByFullPath {
   '/$section/': typeof AppSectionIndexRoute
   '/$section/$page/$id': typeof AppSectionPageIdRoute
   '/players/accounts/$id': typeof AppPlayersAccountsIdRoute
+  '/servers/fleets/$id': typeof AppServersFleetsIdRoute
   '/$section/$page/': typeof AppSectionPageIndexRoute
+  '/world/worlds/$w/': typeof AppWorldWorldsWIndexRoute
+  '/world/worlds/$w/entities/$id': typeof AppWorldWorldsWEntitiesIdRoute
 }
 export interface FileRoutesByTo {
   '/login': typeof LoginRoute
@@ -66,7 +88,10 @@ export interface FileRoutesByTo {
   '/$section': typeof AppSectionIndexRoute
   '/$section/$page/$id': typeof AppSectionPageIdRoute
   '/players/accounts/$id': typeof AppPlayersAccountsIdRoute
+  '/servers/fleets/$id': typeof AppServersFleetsIdRoute
   '/$section/$page': typeof AppSectionPageIndexRoute
+  '/world/worlds/$w': typeof AppWorldWorldsWIndexRoute
+  '/world/worlds/$w/entities/$id': typeof AppWorldWorldsWEntitiesIdRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
@@ -76,7 +101,10 @@ export interface FileRoutesById {
   '/_app/$section/': typeof AppSectionIndexRoute
   '/_app/$section/$page/$id': typeof AppSectionPageIdRoute
   '/_app/players/accounts/$id': typeof AppPlayersAccountsIdRoute
+  '/_app/servers/fleets/$id': typeof AppServersFleetsIdRoute
   '/_app/$section/$page/': typeof AppSectionPageIndexRoute
+  '/_app/world/worlds/$w/': typeof AppWorldWorldsWIndexRoute
+  '/_app/world/worlds/$w/entities/$id': typeof AppWorldWorldsWEntitiesIdRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
@@ -86,7 +114,10 @@ export interface FileRouteTypes {
     | '/$section/'
     | '/$section/$page/$id'
     | '/players/accounts/$id'
+    | '/servers/fleets/$id'
     | '/$section/$page/'
+    | '/world/worlds/$w/'
+    | '/world/worlds/$w/entities/$id'
   fileRoutesByTo: FileRoutesByTo
   to:
     | '/login'
@@ -94,7 +125,10 @@ export interface FileRouteTypes {
     | '/$section'
     | '/$section/$page/$id'
     | '/players/accounts/$id'
+    | '/servers/fleets/$id'
     | '/$section/$page'
+    | '/world/worlds/$w'
+    | '/world/worlds/$w/entities/$id'
   id:
     | '__root__'
     | '/_app'
@@ -103,7 +137,10 @@ export interface FileRouteTypes {
     | '/_app/$section/'
     | '/_app/$section/$page/$id'
     | '/_app/players/accounts/$id'
+    | '/_app/servers/fleets/$id'
     | '/_app/$section/$page/'
+    | '/_app/world/worlds/$w/'
+    | '/_app/world/worlds/$w/entities/$id'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
@@ -162,6 +199,27 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AppPlayersAccountsIdRouteImport
       parentRoute: typeof AppRoute
     }
+    '/_app/servers/fleets/$id': {
+      id: '/_app/servers/fleets/$id'
+      path: '/servers/fleets/$id'
+      fullPath: '/servers/fleets/$id'
+      preLoaderRoute: typeof AppServersFleetsIdRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/world/worlds/$w/': {
+      id: '/_app/world/worlds/$w/'
+      path: '/world/worlds/$w'
+      fullPath: '/world/worlds/$w/'
+      preLoaderRoute: typeof AppWorldWorldsWIndexRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/world/worlds/$w/entities/$id': {
+      id: '/_app/world/worlds/$w/entities/$id'
+      path: '/world/worlds/$w/entities/$id'
+      fullPath: '/world/worlds/$w/entities/$id'
+      preLoaderRoute: typeof AppWorldWorldsWEntitiesIdRouteImport
+      parentRoute: typeof AppRoute
+    }
   }
 }
 
@@ -170,7 +228,10 @@ interface AppRouteChildren {
   AppSectionIndexRoute: typeof AppSectionIndexRoute
   AppSectionPageIdRoute: typeof AppSectionPageIdRoute
   AppPlayersAccountsIdRoute: typeof AppPlayersAccountsIdRoute
+  AppServersFleetsIdRoute: typeof AppServersFleetsIdRoute
   AppSectionPageIndexRoute: typeof AppSectionPageIndexRoute
+  AppWorldWorldsWIndexRoute: typeof AppWorldWorldsWIndexRoute
+  AppWorldWorldsWEntitiesIdRoute: typeof AppWorldWorldsWEntitiesIdRoute
 }
 
 const AppRouteChildren: AppRouteChildren = {
@@ -178,7 +239,10 @@ const AppRouteChildren: AppRouteChildren = {
   AppSectionIndexRoute: AppSectionIndexRoute,
   AppSectionPageIdRoute: AppSectionPageIdRoute,
   AppPlayersAccountsIdRoute: AppPlayersAccountsIdRoute,
+  AppServersFleetsIdRoute: AppServersFleetsIdRoute,
   AppSectionPageIndexRoute: AppSectionPageIndexRoute,
+  AppWorldWorldsWIndexRoute: AppWorldWorldsWIndexRoute,
+  AppWorldWorldsWEntitiesIdRoute: AppWorldWorldsWEntitiesIdRoute,
 }
 
 const AppRouteWithChildren = AppRoute._addFileChildren(AppRouteChildren)
