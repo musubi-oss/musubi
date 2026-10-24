@@ -12,6 +12,25 @@ const SIZES = [25, 50, 100, 500]
 const stored = Number(localStorage.getItem('dt.size') || 0)
 const size = ref(props.pageSize || stored || 50)
 const page = ref(0)
+// Hidden columns are remembered per table id (dt.cols.<id>); a column pinned with sort=false cannot be hidden.
+const colsKey = () => 'dt.cols.' + (props.id ?? 'table')
+const hidden = ref<Set<string>>(new Set(JSON.parse(localStorage.getItem(colsKey()) || '[]')))
+watch(() => props.id, () => { hidden.value = new Set(JSON.parse(localStorage.getItem(colsKey()) || '[]')) })
+const vis = computed(() => props.cols.filter((c) => !hidden.value.has(c.key)))
+function toggleCol(c: Col) {
+  const h = new Set(hidden.value)
+  if (h.has(c.key)) h.delete(c.key); else if (vis.value.length > 1) h.add(c.key)
+  hidden.value = h; localStorage.setItem(colsKey(), JSON.stringify([...h]))
+}
+function csv() {
+  const esc = (v: unknown) => { const t = String(v ?? ''); return /[",\n]/.test(t) ? '"' + t.replace(/"/g, '""') + '"' : t }
+  const lines = [vis.value.map((c) => esc(c.label ?? c.key)).join(',')]
+  for (const r of sorted.value) lines.push(vis.value.map((c) => esc(c.fmt ? c.fmt(r) : at(r, c.key))).join(','))
+  const a = document.createElement('a')
+  a.href = URL.createObjectURL(new Blob([lines.join('\n')], { type: 'text/csv' }))
+  a.download = (props.id ?? 'table') + '.csv'; a.click(); URL.revokeObjectURL(a.href)
+  toast.show(`exported ${sorted.value.length} rows`)
+}
 // Newest first by default when the table has a creation/time column; a header click overrides.
 const defaultKey = () => props.cols.find((c) => c.sort !== false && /^(created_at|created|at|ts|time|started_at|received_at|updated_at)$/.test(c.key))?.key ?? ''
 const sortKey = ref(defaultKey()); const sortDir = ref<1 | -1>(-1)
@@ -80,22 +99,27 @@ function setSize(e: Event) { size.value = Number((e.target as HTMLSelectElement)
 <template>
   <table :class="{ loading }">
     <thead><tr>
-      <th v-for="c in cols" :key="c.key" :style="c.width ? { width: c.width } : undefined" :class="{ sortable: c.sort !== false, on: sortKey === c.key }" @click="sortBy(c)">
+      <th v-for="c in vis" :key="c.key" :style="c.width ? { width: c.width } : undefined" :class="{ sortable: c.sort !== false, on: sortKey === c.key }" @click="sortBy(c)">
         {{ c.label ?? c.key }}<span class="arrow" v-if="sortKey === c.key">{{ sortDir === 1 ? '▲' : '▼' }}</span>
       </th><th v-if="$slots.actions"></th></tr></thead>
     <tbody>
       <tr v-for="(r, i) in shown" :key="i" :class="{ row: pick }" @click="pick && emit('pick', r)">
-        <td v-for="c in cols" :key="c.key" :class="{ m: c.mono, dim: c.dim, cpc: copyable(c, r) }" :title="title(c, r)">
+        <td v-for="c in vis" :key="c.key" :class="{ m: c.mono, dim: c.dim, cpc: copyable(c, r) }" :title="title(c, r)">
           <router-link v-if="c.ref !== false && refFor(c.key, at(r, c.key), r)" class="cell ref" :to="refFor(c.key, at(r, c.key), r)!" @click.stop>{{ show(c, r) }}</router-link>
           <span v-else class="cell">{{ show(c, r) }}</span><button v-if="copyable(c, r)" class="cp" title="copy" @click.stop="copy(c, r)"></button>
         </td>
         <td v-if="$slots.actions" @click.stop><slot name="actions" :row="r" /></td>
       </tr>
-      <tr v-if="!rows.length"><td :colspan="cols.length + 1" class="empty">{{ loading ? 'Loading…' : empty ?? 'No Data' }}</td></tr>
+      <tr v-if="!rows.length"><td :colspan="vis.length + 1" class="empty">{{ loading ? 'Loading…' : empty ?? 'No Data' }}</td></tr>
     </tbody>
   </table>
-  <div class="pager" v-if="pages > 1 || size !== SIZES[1]">
+  <div class="pager" v-if="rows.length">
     <span>{{ from.toLocaleString('en-US') }}–{{ to.toLocaleString('en-US') }} of {{ sorted.length.toLocaleString('en-US') }}</span>
+    <details class="colpick"><summary class="btn s" title="choose columns">Columns{{ hidden.size ? ` (${vis.length}/${cols.length})` : '' }}</summary>
+      <div class="menu"><label v-for="c in cols" :key="c.key"><input type="checkbox" :checked="!hidden.has(c.key)" :disabled="c.sort === false" @change="toggleCol(c)" /> {{ c.label ?? c.key }}</label></div>
+    </details>
+    <button class="btn s" @click="csv" title="download visible columns as CSV">CSV</button>
+    <span class="grow"></span>
     <select class="sel sz" :value="size" @change="setSize"><option v-for="s in SIZES" :key="s" :value="s">{{ s }} / page</option></select>
     <button class="btn s" :disabled="page === 0" @click="page = 0" title="first">«</button>
     <button class="btn s" :disabled="page === 0" @click="page--">Prev</button>
@@ -104,3 +128,11 @@ function setSize(e: Event) { size.value = Number((e.target as HTMLSelectElement)
     <button class="btn s" :disabled="page >= pages - 1" @click="page = pages - 1" title="last">»</button>
   </div>
 </template>
+<style scoped>
+.pager .grow { flex: 1 }
+.colpick { position: relative }
+.colpick summary { list-style: none; cursor: pointer; display: inline-block }
+.colpick summary::-webkit-details-marker { display: none }
+.colpick .menu { position: absolute; z-index: 20; top: 100%; left: 0; margin-top: 4px; min-width: 180px; max-height: 320px; overflow: auto; padding: 6px 8px; background: var(--panel, #15171c); border: 1px solid var(--line, #2a2d35); border-radius: 6px; display: flex; flex-direction: column; gap: 4px; font-size: 12px; white-space: nowrap }
+.colpick .menu label { display: flex; gap: 6px; align-items: center; cursor: pointer }
+</style>
