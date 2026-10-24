@@ -79,15 +79,32 @@ fn default_limit() -> usize {
     50
 }
 
+/// Most owner ids one `owner_ids=` filter may name (the record list itself is capped at 100).
+const MAX_OWNER_IDS: usize = 100;
+
 fn parse_ids(s: Option<&str>) -> Result<Vec<AccountId>, ApiError> {
-    s.unwrap_or("")
+    let s = s.unwrap_or("");
+    if s.len() > MAX_OWNER_IDS * 37 {
+        return Err(musubi_core::Error::InvalidArgument(format!(
+            "owner_ids: at most {MAX_OWNER_IDS} ids"
+        ))
+        .into());
+    }
+    let ids: Vec<AccountId> = s
         .split(',')
         .filter(|x| !x.is_empty())
         .map(|x| {
             x.parse::<AccountId>()
                 .map_err(|_| musubi_core::Error::InvalidArgument(format!("bad id {x}")).into())
         })
-        .collect()
+        .collect::<Result<_, ApiError>>()?;
+    if ids.len() > MAX_OWNER_IDS {
+        return Err(musubi_core::Error::InvalidArgument(format!(
+            "owner_ids: at most {MAX_OWNER_IDS} ids"
+        ))
+        .into());
+    }
+    Ok(ids)
 }
 
 async fn username(s: &AppState, id: AccountId) -> Result<Option<String>, ApiError> {

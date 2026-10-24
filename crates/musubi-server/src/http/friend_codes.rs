@@ -100,6 +100,35 @@ async fn owner(s: &AppState, code: &str) -> Result<(String, musubi_core::Account
     }
 }
 
+/// Take one use of a code atomically: the expiry / `max_uses` check and the increment are a single
+/// conditional UPDATE, so N parallel callers of a `max_uses = 1` code cannot all get through.
+pub(crate) async fn claim_friend_code(
+    db: &sqlx::PgPool,
+    code: &str,
+) -> Result<Option<musubi_core::AccountId>, Error> {
+    let r: Option<(uuid::Uuid,)> = sqlx::query_as(
+        "update musubi.friend_codes set uses = uses + 1
+         where code = $1 and (expires_at is null or expires_at > now())
+           and (max_uses is null or uses < max_uses)
+         returning account_id",
+    )
+    .bind(code)
+    .fetch_optional(db)
+    .await
+    .map_err(Error::internal)?;
+    Ok(r.map(|(id,)| musubi_core::AccountId(id)))
+}
+
+/// Give a claimed use back when the add itself failed (policy, block, batch error).
+pub(crate) async fn release_friend_code(db: &sqlx::PgPool, code: &str) -> Result<(), Error> {
+    sqlx::query("update musubi.friend_codes set uses = greatest(uses - 1, 0) where code = $1")
+        .bind(code)
+        .execute(db)
+        .await
+        .map_err(Error::internal)?;
+    Ok(())
+}
+
 /// Public card of the code's owner so the UI can confirm before adding.
 async fn lookup(
     Bearer(_me): Bearer,
@@ -121,12 +150,21 @@ async fn add_by_code(
     State(s): State<AppState>,
     Path(code): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
-    let (code, who) = owner(&s, &code).await?;
+    let code = normalize(&code)?;
+    let who = claim_friend_code(&s.db, &code).await?.ok_or_else(|| {
+        Error::NotFound("no such friend code (or it expired / was used up)".into())
+    })?;
     if who == me.account_id {
+        release_friend_code(&s.db, &code).await?;
         return Err(Error::InvalidArgument("that is your own friend code".into()).into());
     }
-    let out = super::friends::add_targets(&s, me.account_id, vec![who], true).await?;
-    s.social.consume_friend_code(&code).await?;
+    let out = match super::friends::add_targets(&s, me.account_id, vec![who], true).await {
+        Ok(out) => out,
+        Err(e) => {
+            release_friend_code(&s.db, &code).await?;
+            return Err(e);
+        }
+    };
     s.events
         .emit(
             "friend.added_by_code",
@@ -168,4 +206,68 @@ async fn put_settings(
         )
         .await;
     Ok(Json(json!({ "requests": r.requests })))
+}
+
+#[cfg(test)]
+mod audit_tests {
+    use super::*;
+    use crate::http::friends::test_db;
+
+    #[test]
+    fn normalize_maps_lookalikes_and_rejects_bad_lengths() {
+        assert_eq!(normalize("abcd efgh").unwrap(), "ABCD-EFGH");
+        assert_eq!(normalize("o1il-0000").unwrap(), "0111-0000");
+        assert!(normalize("abc").is_err());
+        assert!(normalize("abcdefghi").is_err());
+    }
+
+    /// A `max_uses = 1` code claimed by 16 parallel callers is consumed exactly once; a release
+    /// makes it claimable again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn claim_is_atomic_under_concurrency() {
+        let Some(db) = test_db::pool().await else {
+            return;
+        };
+        let owner = test_db::account(&db).await;
+        let code = fresh_code();
+        sqlx::query(
+            "insert into musubi.friend_codes (account_id, code, max_uses) values ($1, $2, 1)",
+        )
+        .bind(owner.0)
+        .bind(&code)
+        .execute(&db)
+        .await
+        .unwrap();
+        let results =
+            futures::future::join_all((0..16).map(|_| claim_friend_code(&db, &code))).await;
+        let claimed: Vec<_> = results.into_iter().flat_map(|r| r.unwrap()).collect();
+        assert_eq!(claimed, vec![owner]);
+        let uses: i32 = sqlx::query_scalar("select uses from musubi.friend_codes where code = $1")
+            .bind(&code)
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(uses, 1);
+        release_friend_code(&db, &code).await.unwrap();
+        assert_eq!(claim_friend_code(&db, &code).await.unwrap(), Some(owner));
+        assert_eq!(claim_friend_code(&db, &code).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn expired_code_is_not_claimable() {
+        let Some(db) = test_db::pool().await else {
+            return;
+        };
+        let owner = test_db::account(&db).await;
+        let code = fresh_code();
+        sqlx::query(
+            "insert into musubi.friend_codes (account_id, code, expires_at) values ($1, $2, now() - interval '1 second')",
+        )
+        .bind(owner.0)
+        .bind(&code)
+        .execute(&db)
+        .await
+        .unwrap();
+        assert_eq!(claim_friend_code(&db, &code).await.unwrap(), None);
+    }
 }

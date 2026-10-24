@@ -84,6 +84,13 @@ struct Ids {
 
 async fn resolve(s: &AppState, b: Ids) -> Result<Vec<AccountId>, ApiError> {
     let mut ids = b.ids;
+    if b.usernames.len() > musubi_social::MAX_BATCH {
+        return Err(musubi_core::Error::InvalidArgument(format!(
+            "at most {} usernames per call",
+            musubi_social::MAX_BATCH
+        ))
+        .into());
+    }
     if !b.usernames.is_empty() {
         let users = s.accounts.get_users(&[], &b.usernames).await?;
         if users.len() != b.usernames.len() {
@@ -93,6 +100,11 @@ async fn resolve(s: &AppState, b: Ids) -> Result<Vec<AccountId>, ApiError> {
     }
     Ok(ids)
 }
+
+/// Platform identifier bounds for `/v1/friends/import` (a Steam id is 17 digits, an OIDC
+/// subject is at most 255 bytes per the spec).
+const MAX_PROVIDER_LEN: usize = 64;
+const MAX_SUBJECT_LEN: usize = 256;
 
 #[derive(Deserialize)]
 struct ImportBody {
@@ -114,6 +126,21 @@ async fn import(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     if b.subjects.len() > 5000 {
         return Err(musubi_core::Error::InvalidArgument("at most 5000 subjects".into()).into());
+    }
+    if b.provider.is_empty() || b.provider.len() > MAX_PROVIDER_LEN {
+        return Err(musubi_core::Error::InvalidArgument(format!(
+            "provider: 1..={MAX_PROVIDER_LEN} bytes"
+        ))
+        .into());
+    }
+    if b.subjects
+        .iter()
+        .any(|x| x.is_empty() || x.len() > MAX_SUBJECT_LEN)
+    {
+        return Err(musubi_core::Error::InvalidArgument(format!(
+            "subjects: each 1..={MAX_SUBJECT_LEN} bytes"
+        ))
+        .into());
     }
     crate::platform_friends::remember(&s, me.account_id, &b.provider, &b.subjects, b.add).await?;
     let found = s.accounts.by_identities(&b.provider, &b.subjects).await?;
@@ -317,4 +344,38 @@ async fn list(
         }
     }
     Ok(Json(v))
+}
+
+/// Postgres fixture for the audit tests of this module's neighbours (`MUSUBI_TEST_DATABASE_URL`;
+/// tests return early when it is unset, like the integration suite).
+#[cfg(test)]
+pub(crate) mod test_db {
+    use sqlx::PgPool;
+
+    pub(crate) async fn pool() -> Option<PgPool> {
+        let url = std::env::var("MUSUBI_TEST_DATABASE_URL").ok()?;
+        let cfg = musubi_core::config::DatabaseConfig {
+            url,
+            max_connections: 4,
+            run_migrations: true,
+        };
+        let db = crate::db::connect(&cfg).await.expect("connect");
+        static ONCE: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
+        ONCE.get_or_init(|| async {
+            crate::db::migrate(&db).await.expect("migrate");
+        })
+        .await;
+        Some(db)
+    }
+
+    pub(crate) async fn account(db: &PgPool) -> musubi_core::AccountId {
+        let id = uuid::Uuid::now_v7();
+        sqlx::query("insert into musubi.accounts (id, username) values ($1, $2)")
+            .bind(id)
+            .bind(format!("audit_{}", id.simple()))
+            .execute(db)
+            .await
+            .expect("account");
+        musubi_core::AccountId(id)
+    }
 }

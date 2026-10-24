@@ -55,6 +55,15 @@ struct Pool {
 
 const POOL_COLS: &str = "id, group_id, name, currency, goal, raised, tiers, contributor_reward_table, status, ends_at, created_by, created_at, completed_at";
 
+/// Currency ids are stored verbatim on pools / requests / store rows; keep them to the size the
+/// economy accepts for its own currency definitions.
+fn check_currency(c: &str) -> Result<()> {
+    if c.is_empty() || c.len() > 64 {
+        return Err(Error::InvalidArgument("currency: 1..=64 bytes".into()));
+    }
+    Ok(())
+}
+
 fn pool_json(p: &Pool) -> Value {
     json!({
         "id": p.id, "group_id": p.group_id, "name": p.name, "currency": p.currency, "goal": p.goal,
@@ -111,6 +120,7 @@ async fn create_pool(
     if b.name.trim().is_empty() || b.name.len() > 128 {
         return Err(Error::InvalidArgument("name: 1..128".into()).into());
     }
+    check_currency(&b.currency)?;
     if b.goal <= 0 {
         return Err(Error::InvalidArgument("goal must be positive".into()).into());
     }
@@ -226,6 +236,7 @@ async fn contribute(
         return Err(Error::Conflict("pool is not open".into()).into());
     }
     let amount = b.amount.min(p.goal - p.raised).max(1);
+    let p_currency = p.currency.clone();
     s.economy
         .treasury_deposit(
             id.0,
@@ -253,17 +264,37 @@ async fn contribute(
     .execute(&s.db)
     .await
     .map_err(Error::internal)?;
-    let p: Pool = sqlx::query_as(&format!(
+    let p: Option<Pool> = sqlx::query_as(&format!(
         "update musubi.group_pools set raised = raised + $2,
             status = case when raised + $2 >= goal then 'completed' else status end,
             completed_at = case when raised + $2 >= goal then coalesce(completed_at, now()) else completed_at end
-         where id = $1 returning {POOL_COLS}"
+         where id = $1 and status = 'open' and (ends_at is null or ends_at > now()) returning {POOL_COLS}"
     ))
     .bind(pid)
     .bind(amount)
-    .fetch_one(&s.db)
+    .fetch_optional(&s.db)
     .await
     .map_err(Error::internal)?;
+    let Some(p) = p else {
+        // the pool completed / closed between our check and the update: hand the money back
+        sqlx::query("delete from musubi.group_pool_contributions where pool_id = $1 and account_id = $2 and amount = $3 and id = (select id from musubi.group_pool_contributions where pool_id = $1 and account_id = $2 and amount = $3 order by id desc limit 1)")
+            .bind(pid)
+            .bind(me.account_id.0)
+            .bind(amount)
+            .execute(&s.db)
+            .await
+            .map_err(Error::internal)?;
+        s.economy
+            .treasury_withdraw(
+                id.0,
+                me.account_id,
+                &p_currency,
+                amount,
+                &format!("pool:{pid}:refund"),
+            )
+            .await?;
+        return Err(Error::Conflict("pool is not open".into()).into());
+    };
     let mut rewards = Vec::new();
     if first {
         if let Some(t) = &p.contributor_reward_table {
@@ -402,6 +433,7 @@ async fn request_donation(
     if b.amount <= 0 || b.note.len() > 280 {
         return Err(Error::InvalidArgument("amount must be positive, note ≤ 280".into()).into());
     }
+    check_currency(&b.currency)?;
     let open: bool = sqlx::query_scalar(
         "select exists(select 1 from musubi.group_donation_requests where group_id = $1 and account_id = $2 and currency = $3 and status = 'open')",
     )
@@ -467,36 +499,55 @@ async fn give(
     Path((id, did)): Path<(GroupId, Uuid)>,
 ) -> Result<Json<Value>, ApiError> {
     groups(&s).require_member(me.account_id, id).await?;
-    let row: Option<DonationRow> = sqlx::query_as(&format!(
-        "select {DON_COLS} from musubi.group_donation_requests where id = $1 and group_id = $2 and status = 'open'"
-    ))
+    let own: Option<(Uuid,)> = sqlx::query_as(
+        "select account_id from musubi.group_donation_requests where id = $1 and group_id = $2 and status = 'open'",
+    )
     .bind(did)
     .bind(id.0)
     .fetch_optional(&s.db)
     .await
     .map_err(Error::internal)?;
-    let row = row.ok_or_else(|| Error::NotFound(format!("open donation request {did}")))?;
-    let (to, currency, amount) = (AccountId(row.1), row.2.clone(), row.3);
-    if to == me.account_id {
-        return Err(Error::InvalidArgument("cannot fulfil your own request".into()).into());
+    match own {
+        None => return Err(Error::NotFound(format!("open donation request {did}")).into()),
+        Some((who,)) if who == me.account_id.0 => {
+            return Err(Error::InvalidArgument("cannot fulfil your own request".into()).into())
+        }
+        Some(_) => {}
     }
+    // claim the request before any money moves: a second donor racing us gets 404, not a
+    // second payout to the requester
+    let row = claim_donation(&s.db, did, id, me.account_id)
+        .await?
+        .ok_or_else(|| Error::NotFound(format!("open donation request {did}")))?;
+    let (to, currency, amount) = (AccountId(row.1), row.2.clone(), row.3);
     // wallet → treasury → wallet keeps both legs on the audited ledgers
     let reason = format!("donation:{did}");
-    s.economy
+    if let Err(e) = s
+        .economy
         .treasury_deposit(id.0, me.account_id, &currency, amount, &reason)
-        .await?;
-    s.economy
+        .await
+    {
+        reopen_donation(&s.db, did).await?;
+        return Err(e.into());
+    }
+    if let Err(e) = s
+        .economy
         .treasury_withdraw(id.0, to, &currency, amount, &reason)
-        .await?;
-    let row: DonationRow = sqlx::query_as(&format!(
-        "update musubi.group_donation_requests set status = 'fulfilled', fulfilled_by = $2, closed_at = now()
-         where id = $1 returning {DON_COLS}"
-    ))
-    .bind(did)
-    .bind(me.account_id.0)
-    .fetch_one(&s.db)
-    .await
-    .map_err(Error::internal)?;
+        .await
+    {
+        let _ = s
+            .economy
+            .treasury_withdraw(
+                id.0,
+                me.account_id,
+                &currency,
+                amount,
+                &format!("{reason}:rollback"),
+            )
+            .await;
+        reopen_donation(&s.db, did).await?;
+        return Err(e.into());
+    }
     s.events
         .emit(
             "group.donation_given",
@@ -505,6 +556,39 @@ async fn give(
         )
         .await;
     Ok(Json(donation_json(&row)))
+}
+
+/// Atomically move an open request to `fulfilled` by `by` (not its owner); `None` when it was
+/// not open any more.
+pub(crate) async fn claim_donation(
+    db: &sqlx::PgPool,
+    did: Uuid,
+    group: GroupId,
+    by: AccountId,
+) -> Result<Option<DonationRow>> {
+    sqlx::query_as(&format!(
+        "update musubi.group_donation_requests set status = 'fulfilled', fulfilled_by = $3, closed_at = now()
+         where id = $1 and group_id = $2 and status = 'open' and account_id <> $3 returning {DON_COLS}"
+    ))
+    .bind(did)
+    .bind(group.0)
+    .bind(by.0)
+    .fetch_optional(db)
+    .await
+    .map_err(Error::internal)
+}
+
+/// Undo a claim whose payment failed.
+pub(crate) async fn reopen_donation(db: &sqlx::PgPool, did: Uuid) -> Result<()> {
+    sqlx::query(
+        "update musubi.group_donation_requests set status = 'open', fulfilled_by = null, closed_at = null
+         where id = $1 and status = 'fulfilled'",
+    )
+    .bind(did)
+    .execute(db)
+    .await
+    .map_err(Error::internal)?;
+    Ok(())
 }
 
 async fn cancel_donation(
@@ -589,6 +673,7 @@ async fn store_put(
     if b.price < 0 || b.quantity <= 0 {
         return Err(Error::InvalidArgument("price ≥ 0, quantity > 0".into()).into());
     }
+    check_currency(&b.currency)?;
     let exists: bool =
         sqlx::query_scalar("select exists(select 1 from musubi.items where id = $1)")
             .bind(&item)
@@ -701,4 +786,65 @@ async fn store_buy(
     Ok(Json(
         json!({ "item": entry, "paid": price, "currency": currency, "to": to }),
     ))
+}
+
+#[cfg(test)]
+mod audit_tests {
+    use super::*;
+    use crate::http::friends::test_db;
+
+    async fn group(db: &sqlx::PgPool) -> GroupId {
+        let id = Uuid::now_v7();
+        sqlx::query("insert into musubi.groups (id, name) values ($1, $2)")
+            .bind(id)
+            .bind(format!("audit {}", id.simple()))
+            .execute(db)
+            .await
+            .unwrap();
+        GroupId(id)
+    }
+
+    /// Eight donors race to fulfil one request: exactly one claim wins, the owner never can.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn donation_claim_is_atomic() {
+        let Some(db) = test_db::pool().await else {
+            return;
+        };
+        let g = group(&db).await;
+        let owner = test_db::account(&db).await;
+        let did = Uuid::now_v7();
+        sqlx::query(
+            "insert into musubi.group_donation_requests (id, group_id, account_id, currency, amount) values ($1, $2, $3, 'gold', 10)",
+        )
+        .bind(did)
+        .bind(g.0)
+        .bind(owner.0)
+        .execute(&db)
+        .await
+        .unwrap();
+        assert!(claim_donation(&db, did, g, owner).await.unwrap().is_none());
+        let mut donors = Vec::new();
+        for _ in 0..8 {
+            donors.push(test_db::account(&db).await);
+        }
+        let wins =
+            futures::future::join_all(donors.iter().map(|d| claim_donation(&db, did, g, *d)))
+                .await
+                .into_iter()
+                .filter(|r| r.as_ref().unwrap().is_some())
+                .count();
+        assert_eq!(wins, 1);
+        reopen_donation(&db, did).await.unwrap();
+        assert!(claim_donation(&db, did, g, donors[0])
+            .await
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn currency_ids_are_bounded() {
+        assert!(check_currency("gold").is_ok());
+        assert!(check_currency("").is_err());
+        assert!(check_currency(&"x".repeat(65)).is_err());
+    }
 }

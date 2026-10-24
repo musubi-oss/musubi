@@ -73,44 +73,20 @@ async fn file(
     {
         return Err(Error::InvalidArgument("evidence over 4 KB".into()).into());
     }
-    let (today, dup): (i64, bool) = sqlx::query_as(
-        "select (select count(*) from musubi.player_reports where reporter_id = $1 and created_at > now() - interval '1 day'),
-                exists(select 1 from musubi.player_reports where reporter_id = $1 and target_id = $2 and status in ('open', 'reviewing'))",
-    )
-    .bind(me.account_id.0)
-    .bind(target.0)
-    .fetch_one(&s.db)
-    .await
-    .map_err(Error::internal)?;
-    if dup {
-        return Err(
-            Error::AlreadyExists("you already have an open report on this player".into()).into(),
-        );
-    }
-    if today >= PER_DAY {
-        return Err(Error::ResourceExhausted(format!("{PER_DAY} reports per day")).into());
-    }
-    let id = Uuid::now_v7();
     let evidence = if b.evidence.is_null() {
         json!({})
     } else {
         b.evidence
     };
-    sqlx::query(
-        "insert into musubi.player_reports (id, reporter_id, target_id, category, details, evidence) values ($1, $2, $3, $4, $5, $6)",
+    let id = insert_report(
+        &s.db,
+        me.account_id,
+        target,
+        &b.category,
+        &b.details,
+        &evidence,
     )
-    .bind(id)
-    .bind(me.account_id.0)
-    .bind(target.0)
-    .bind(&b.category)
-    .bind(&b.details)
-    .bind(&evidence)
-    .execute(&s.db)
-    .await
-    .map_err(|e| match e {
-        sqlx::Error::Database(d) if d.is_foreign_key_violation() => Error::NotFound("account".into()),
-        e => Error::internal(e),
-    })?;
+    .await?;
     let open: i64 = sqlx::query_scalar(
         "select count(*) from musubi.player_reports where target_id = $1 and status in ('open', 'reviewing')",
     )
@@ -126,6 +102,61 @@ async fn file(
         )
         .await;
     Ok(Json(json!({ "id": id, "status": "open" })))
+}
+
+/// Quota + duplicate check and the insert in one transaction under a per-reporter advisory lock,
+/// so parallel submissions cannot slip past `PER_DAY` or file the same target twice.
+pub(crate) async fn insert_report(
+    db: &sqlx::PgPool,
+    reporter: AccountId,
+    target: AccountId,
+    category: &str,
+    details: &str,
+    evidence: &Value,
+) -> Result<Uuid, Error> {
+    let mut tx = db.begin().await.map_err(Error::internal)?;
+    sqlx::query("select pg_advisory_xact_lock(hashtext('player_report'), hashtext($1::text))")
+        .bind(reporter.0)
+        .execute(&mut *tx)
+        .await
+        .map_err(Error::internal)?;
+    let (today, dup): (i64, bool) = sqlx::query_as(
+        "select (select count(*) from musubi.player_reports where reporter_id = $1 and created_at > now() - interval '1 day'),
+                exists(select 1 from musubi.player_reports where reporter_id = $1 and target_id = $2 and status in ('open', 'reviewing'))",
+    )
+    .bind(reporter.0)
+    .bind(target.0)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(Error::internal)?;
+    if dup {
+        return Err(Error::AlreadyExists(
+            "you already have an open report on this player".into(),
+        ));
+    }
+    if today >= PER_DAY {
+        return Err(Error::ResourceExhausted(format!(
+            "{PER_DAY} reports per day"
+        )));
+    }
+    let id = Uuid::now_v7();
+    sqlx::query(
+        "insert into musubi.player_reports (id, reporter_id, target_id, category, details, evidence) values ($1, $2, $3, $4, $5, $6)",
+    )
+    .bind(id)
+    .bind(reporter.0)
+    .bind(target.0)
+    .bind(category)
+    .bind(details)
+    .bind(evidence)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| match e {
+        sqlx::Error::Database(d) if d.is_foreign_key_violation() => Error::NotFound("account".into()),
+        e => Error::internal(e),
+    })?;
+    tx.commit().await.map_err(Error::internal)?;
+    Ok(id)
 }
 
 type Row = (
@@ -327,6 +358,9 @@ async fn decide(
     if b.decision.chars().count() > 2000 {
         return Err(Error::InvalidArgument("decision over 2000 chars".into()).into());
     }
+    if b.by.as_ref().is_some_and(|by| by.chars().count() > 128) {
+        return Err(Error::InvalidArgument("by over 128 chars".into()).into());
+    }
     let by = b.by.clone().unwrap_or_else(|| "admin".into());
     let closing = b.status != "reviewing";
     let row: Option<(Uuid,)> = sqlx::query_as(
@@ -381,4 +415,60 @@ async fn decide(
     v["ban"] = banned;
     v["also_closed"] = json!(also_closed);
     Ok(Json(v))
+}
+
+#[cfg(test)]
+mod audit_tests {
+    use super::*;
+    use crate::http::friends::test_db;
+
+    /// 2 × PER_DAY parallel submissions against distinct targets: exactly PER_DAY land.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn daily_quota_holds_under_concurrency() {
+        let Some(db) = test_db::pool().await else {
+            return;
+        };
+        let reporter = test_db::account(&db).await;
+        let mut targets = Vec::new();
+        for _ in 0..(PER_DAY * 2) {
+            targets.push(test_db::account(&db).await);
+        }
+        let ev = json!({});
+        let results = futures::future::join_all(
+            targets
+                .iter()
+                .map(|t| insert_report(&db, reporter, *t, "spam", "", &ev)),
+        )
+        .await;
+        let ok = results.iter().filter(|r| r.is_ok()).count();
+        assert_eq!(ok as i64, PER_DAY, "{results:?}");
+        assert!(results
+            .iter()
+            .filter(|r| r.is_err())
+            .all(|r| matches!(r, Err(Error::ResourceExhausted(_)))));
+    }
+
+    /// The same target reported twice in parallel: one report, one AlreadyExists.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn duplicate_open_report_is_rejected_under_concurrency() {
+        let Some(db) = test_db::pool().await else {
+            return;
+        };
+        let reporter = test_db::account(&db).await;
+        let target = test_db::account(&db).await;
+        let ev = json!({});
+        let results = futures::future::join_all(
+            (0..8).map(|_| insert_report(&db, reporter, target, "cheating", "", &ev)),
+        )
+        .await;
+        assert_eq!(
+            results.iter().filter(|r| r.is_ok()).count(),
+            1,
+            "{results:?}"
+        );
+        assert!(results
+            .iter()
+            .filter(|r| r.is_err())
+            .all(|r| matches!(r, Err(Error::AlreadyExists(_)))));
+    }
 }

@@ -67,15 +67,32 @@ fn default_limit() -> usize {
     50
 }
 
+/// Most owner ids one `owner_ids=` filter may name (the record list itself is capped at 100).
+const MAX_OWNER_IDS: usize = 100;
+
 fn parse_ids(s: Option<&str>) -> Result<Vec<AccountId>, ApiError> {
-    s.unwrap_or("")
+    let s = s.unwrap_or("");
+    if s.len() > MAX_OWNER_IDS * 37 {
+        return Err(musubi_core::Error::InvalidArgument(format!(
+            "owner_ids: at most {MAX_OWNER_IDS} ids"
+        ))
+        .into());
+    }
+    let ids: Vec<AccountId> = s
         .split(',')
         .filter(|x| !x.is_empty())
         .map(|x| {
             x.parse::<AccountId>()
                 .map_err(|_| musubi_core::Error::InvalidArgument(format!("bad id {x}")).into())
         })
-        .collect()
+        .collect::<Result<_, ApiError>>()?;
+    if ids.len() > MAX_OWNER_IDS {
+        return Err(musubi_core::Error::InvalidArgument(format!(
+            "owner_ids: at most {MAX_OWNER_IDS} ids"
+        ))
+        .into());
+    }
+    Ok(ids)
 }
 
 async fn list(
@@ -131,8 +148,14 @@ async fn records(
         if from < 1 {
             return Err(musubi_core::Error::InvalidArgument("rank_from starts at 1".into()).into());
         }
-        let to = q.rank_to.unwrap_or(from + q.limit as i64 - 1).max(from);
-        limit = ((to - from + 1) as usize).min(100);
+        let span = i64::try_from(q.limit).unwrap_or(i64::MAX).saturating_sub(1);
+        let to = q
+            .rank_to
+            .unwrap_or_else(|| from.saturating_add(span))
+            .max(from);
+        limit = usize::try_from(to.saturating_sub(from).saturating_add(1))
+            .unwrap_or(usize::MAX)
+            .min(100);
         cursor = Some((from - 1).to_string());
     }
     let mut list = s
@@ -389,4 +412,23 @@ async fn rollover(
         )
         .await;
     Ok(Json(json!({ "rollover": v })))
+}
+
+#[cfg(test)]
+mod audit_tests {
+    use super::{parse_ids, MAX_OWNER_IDS};
+
+    #[test]
+    fn owner_ids_filter_is_capped() {
+        let one = uuid::Uuid::now_v7().to_string();
+        assert_eq!(parse_ids(Some(&one)).ok().map(|v| v.len()), Some(1));
+        assert!(parse_ids(Some("nope")).is_err());
+        let many = vec![one.as_str(); MAX_OWNER_IDS + 1].join(",");
+        assert!(parse_ids(Some(&many)).is_err());
+        let ok = vec![one.as_str(); MAX_OWNER_IDS].join(",");
+        assert_eq!(
+            parse_ids(Some(&ok)).ok().map(|v| v.len()),
+            Some(MAX_OWNER_IDS)
+        );
+    }
 }

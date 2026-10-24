@@ -34,6 +34,8 @@ pub fn routes() -> Router<AppState> {
 const KINDS: [&str; 6] = ["sum", "max", "min", "last", "avg", "avgrate"];
 const VISIBILITY: [&str; 3] = ["public", "friends", "private"];
 const CYCLE_KINDS: [&str; 4] = ["daily", "weekly", "monthly", "custom"];
+/// Longest `custom` cycle (one year); keeps `next_start` arithmetic inside the `time` range.
+const MAX_PERIOD_SECONDS: i64 = 366 * 86_400;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
@@ -62,10 +64,10 @@ impl Cycle {
                 "cycle kind: daily|weekly|monthly|custom".into(),
             ));
         }
-        if self.kind == "custom" && self.period_seconds < 60 {
-            return Err(Error::InvalidArgument(
-                "custom cycle: period_seconds >= 60".into(),
-            ));
+        if self.kind == "custom" && !(60..=MAX_PERIOD_SECONDS).contains(&self.period_seconds) {
+            return Err(Error::InvalidArgument(format!(
+                "custom cycle: period_seconds in 60..={MAX_PERIOD_SECONDS}"
+            )));
         }
         if !(0..24).contains(&self.reset_hour) {
             return Err(Error::InvalidArgument("cycle reset_hour: 0..23".into()));
@@ -1152,5 +1154,23 @@ mod tests {
         }
         .validate()
         .is_err());
+    }
+
+    #[test]
+    fn custom_period_is_bounded_so_next_start_cannot_overflow() {
+        let huge = Cycle {
+            kind: "custom".into(),
+            period_seconds: i64::MAX,
+            ..Default::default()
+        };
+        assert!(huge.validate().is_err());
+        let max = Cycle {
+            kind: "custom".into(),
+            period_seconds: MAX_PERIOD_SECONDS,
+            ..Default::default()
+        };
+        assert!(max.validate().is_ok());
+        let now = OffsetDateTime::now_utc();
+        assert!(max.next_start(now) > now);
     }
 }

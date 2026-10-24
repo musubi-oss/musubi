@@ -429,7 +429,7 @@ async fn attachment_put(
     let mime = headers
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
-        .filter(|m| !m.is_empty() && m.len() <= 128)
+        .filter(|m| valid_mime(m))
         .unwrap_or("application/octet-stream")
         .to_string();
     let max = s.cfg.chat.attachment_max_bytes.max(1);
@@ -493,6 +493,29 @@ async fn attachment_put(
 
 type AttachmentRow = (String, i64, Option<Vec<u8>>, Option<String>);
 
+/// `type/subtype[; params]` of printable ASCII, at most 128 bytes — what we store and echo back
+/// as `Content-Type`; anything else becomes `application/octet-stream`.
+fn valid_mime(m: &str) -> bool {
+    let token = |t: &str| {
+        !t.is_empty()
+            && t.bytes().all(|b| {
+                b.is_ascii_alphanumeric()
+                    || matches!(
+                        b,
+                        b'!' | b'#' | b'$' | b'&' | b'-' | b'^' | b'_' | b'.' | b'+'
+                    )
+            })
+    };
+    if m.is_empty() || m.len() > 128 || !m.bytes().all(|b| (0x20..0x7f).contains(&b)) {
+        return false;
+    }
+    let (essence, _params) = m.split_once(';').unwrap_or((m, ""));
+    match essence.trim_end().split_once('/') {
+        Some((t, st)) => token(t) && token(st),
+        None => false,
+    }
+}
+
 async fn attachment_get(
     State(s): State<AppState>,
     Bearer(me): Bearer,
@@ -526,11 +549,40 @@ async fn attachment_get(
             .into())
         }
     };
+    // user-supplied bytes under a user-supplied type: never let a browser sniff or render them
+    // inline (stored XSS via `text/html` / SVG attachments)
     let res = axum::response::Response::builder()
-        .header(header::CONTENT_TYPE, mime)
+        .header(
+            header::CONTENT_TYPE,
+            if valid_mime(&mime) {
+                mime
+            } else {
+                "application/octet-stream".into()
+            },
+        )
         .header(header::CONTENT_LENGTH, size)
+        .header(header::CONTENT_DISPOSITION, "attachment")
+        .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff")
         .header(header::CACHE_CONTROL, "private, max-age=86400")
         .body(body)
         .map_err(musubi_core::Error::internal)?;
     Ok(res)
+}
+
+#[cfg(test)]
+mod audit_tests {
+    use super::valid_mime;
+
+    #[test]
+    fn mime_is_validated_before_echoing() {
+        assert!(valid_mime("image/png"));
+        assert!(valid_mime("text/plain; charset=utf-8"));
+        assert!(valid_mime("application/vnd.api+json"));
+        assert!(!valid_mime(""));
+        assert!(!valid_mime("png"));
+        assert!(!valid_mime("image/"));
+        assert!(!valid_mime("image/png\r\nX-Injected: 1"));
+        assert!(!valid_mime("image/p ng"));
+        assert!(!valid_mime(&"a/".repeat(80)));
+    }
 }

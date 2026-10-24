@@ -532,6 +532,9 @@ async fn user_groups(
 /// Notification code for a group announcement.
 pub const CODE_GROUP_ANNOUNCEMENT: i32 = 30;
 
+/// Longest timed group ban (100 years); anything longer is a permanent ban (`until_secs` absent).
+const MAX_BAN_SECS: i64 = 100 * 366 * 86_400;
+
 #[derive(Deserialize)]
 struct BanReq {
     ids: Vec<AccountId>,
@@ -542,21 +545,27 @@ struct BanReq {
     until_secs: Option<i64>,
 }
 
+/// `until_secs` → absolute expiry; bounded so the `time` addition can never overflow (panic).
+fn ban_until(secs: Option<i64>) -> Result<Option<time::OffsetDateTime>, musubi_core::Error> {
+    match secs {
+        None => Ok(None),
+        Some(secs) if (1..=MAX_BAN_SECS).contains(&secs) => time::OffsetDateTime::now_utc()
+            .checked_add(time::Duration::seconds(secs))
+            .map(Some)
+            .ok_or_else(|| musubi_core::Error::InvalidArgument("until_secs out of range".into())),
+        Some(_) => Err(musubi_core::Error::InvalidArgument(format!(
+            "until_secs must be 1..={MAX_BAN_SECS}"
+        ))),
+    }
+}
+
 async fn ban(
     State(s): State<AppState>,
     Bearer(me): Bearer,
     Path(id): Path<GroupId>,
     Json(b): Json<BanReq>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let until = match b.until_secs {
-        Some(secs) if secs > 0 => {
-            Some(time::OffsetDateTime::now_utc() + time::Duration::seconds(secs))
-        }
-        Some(_) => {
-            return Err(musubi_core::Error::InvalidArgument("until_secs must be > 0".into()).into())
-        }
-        None => None,
-    };
+    let until = ban_until(b.until_secs)?;
     groups(&s)
         .ban(me.account_id, id, &b.ids, &b.reason, until)
         .await?;
@@ -759,4 +768,20 @@ async fn inventory_withdraw(
         )
         .await;
     Ok(Json(json!({ "entry": e })))
+}
+
+#[cfg(test)]
+mod audit_tests {
+    use super::{ban_until, MAX_BAN_SECS};
+
+    #[test]
+    fn ban_until_rejects_out_of_range_instead_of_panicking() {
+        assert!(ban_until(None).unwrap().is_none());
+        assert!(ban_until(Some(3600)).unwrap().is_some());
+        assert!(ban_until(Some(MAX_BAN_SECS)).unwrap().is_some());
+        assert!(ban_until(Some(0)).is_err());
+        assert!(ban_until(Some(-1)).is_err());
+        assert!(ban_until(Some(MAX_BAN_SECS + 1)).is_err());
+        assert!(ban_until(Some(i64::MAX)).is_err());
+    }
 }

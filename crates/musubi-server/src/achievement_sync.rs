@@ -67,9 +67,16 @@ async fn steam_unlock(s: &AppState, account: AccountId, api_name: &str) -> Resul
         "{}/ISteamUserStats/SetUserStatsForGame/v1/",
         steam.url.trim_end_matches('/')
     );
-    let resp = reqwest::Client::new()
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    let client = CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .user_agent("musubi-achievements")
+            .timeout(std::time::Duration::from_secs(8))
+            .build()
+            .expect("reqwest client")
+    });
+    let resp = client
         .post(url)
-        .timeout(std::time::Duration::from_secs(8))
         .form(&form)
         .send()
         .await

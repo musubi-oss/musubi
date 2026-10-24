@@ -24,6 +24,10 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/server/fleets/{id}/reputation", get(fleet_reputation))
 }
 
+/// Largest delta one report may add per counter (~31 years of `play_secs`): a misbehaving server
+/// cannot push the bigint totals to overflow and wedge every later report with a DB error.
+const MAX_DELTA: i64 = 1_000_000_000_000;
+
 #[derive(Deserialize, Default)]
 #[serde(default)]
 struct Report {
@@ -46,9 +50,11 @@ async fn report(
     let b = body.map(|b| b.0).unwrap_or_default();
     if [b.rounds, b.players, b.play_secs, b.kicks, b.crashes]
         .iter()
-        .any(|v| *v < 0)
+        .any(|v| !(0..=MAX_DELTA).contains(v))
     {
-        return Err(Error::InvalidArgument("gameplay stats must be ≥ 0".into()).into());
+        return Err(
+            Error::InvalidArgument(format!("gameplay stats must be in 0..={MAX_DELTA}")).into(),
+        );
     }
     let fleet: Option<(Uuid,)> = sqlx::query_as(
         "select fleet_id from musubi.game_servers where id = $1 and state <> 'terminated'",
@@ -63,12 +69,13 @@ async fn report(
     let row: (i64, i64, i64, i64, i64, i32) = sqlx::query_as(
         "insert into musubi.server_gameplay_stats (server_id, fleet_id, rounds, players_served, play_secs, kicks, crashes, reports)
          values ($1, $2, $3, $4, $5, $6, $7, 1)
-         on conflict (server_id) do update set rounds = musubi.server_gameplay_stats.rounds + excluded.rounds,
-             players_served = musubi.server_gameplay_stats.players_served + excluded.players_served,
-             play_secs = musubi.server_gameplay_stats.play_secs + excluded.play_secs,
-             kicks = musubi.server_gameplay_stats.kicks + excluded.kicks,
-             crashes = musubi.server_gameplay_stats.crashes + excluded.crashes,
-             reports = musubi.server_gameplay_stats.reports + 1, updated_at = now()
+         on conflict (server_id) do update set
+             rounds = least(musubi.server_gameplay_stats.rounds::numeric + excluded.rounds, 9223372036854775807)::bigint,
+             players_served = least(musubi.server_gameplay_stats.players_served::numeric + excluded.players_served, 9223372036854775807)::bigint,
+             play_secs = least(musubi.server_gameplay_stats.play_secs::numeric + excluded.play_secs, 9223372036854775807)::bigint,
+             kicks = least(musubi.server_gameplay_stats.kicks::numeric + excluded.kicks, 9223372036854775807)::bigint,
+             crashes = least(musubi.server_gameplay_stats.crashes::numeric + excluded.crashes, 9223372036854775807)::bigint,
+             reports = least(musubi.server_gameplay_stats.reports + 1, 2147483647), updated_at = now()
          returning rounds, players_served, play_secs, kicks, crashes, reports",
     )
     .bind(id)
