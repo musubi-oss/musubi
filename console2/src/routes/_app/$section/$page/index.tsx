@@ -42,7 +42,7 @@ function ListPage() {
   const params: Record<string, string | undefined> = { cursor: search.cursor, limit: '50', ...Object.fromEntries(Object.entries(filters).filter(([, v]) => v && v !== 'all')) }
   const list = useQuery({ ...listQuery(res.list, params), placeholderData: keepPreviousData, enabled: res.custom !== 'zanshin' })
   const data = list.data as Row | Row[] | undefined
-  const rows = pickRows(data, res.rowsKey)
+  const rows = pickRows(data, res.rowsKey, res.key)
   const next = !Array.isArray(data) ? (data?.next_cursor ?? data?.cursor ?? null) as string | null : null
   const off = list.error instanceof ApiError ? featureOff(list.error) : (!Array.isArray(data) && data?.enabled === false && !rows.length) ? `${res.title} is disabled in this node's config.` : null
   const q = (search.q ?? '').trim().toLowerCase()

@@ -47,7 +47,7 @@ function DetailPage() {
     queryKey: ['item', section, page, id],
     queryFn: async ({ signal }) => {
       if (path) return unwrap(await raw('GET', path, undefined, { signal }))
-      const rows = pickRows(await raw('GET', res.list + qs({ limit: 500 }), undefined, { signal }), res.rowsKey)
+      const rows = pickRows(await raw('GET', res.list + qs({ limit: 500 }), undefined, { signal }), res.rowsKey, key)
       const row = rows.find((r) => String(r[key] ?? r.id ?? r.name) === id)
       if (!row) throw new Error(`${res.title.replace(/s$/, '')} ${id} is not in the list any more`)
       return row

@@ -9,12 +9,16 @@ export function fill(path: string, row: Row | null | undefined, id?: string): st
 }
 
 /** The list payload is either an array, `{<rowsKey>: [...]}` or the first array-valued field. */
-export function pickRows(d: unknown, rowsKey?: string): Row[] {
-  if (Array.isArray(d)) return d as Row[]
-  if (!d || typeof d !== 'object') return []
-  const o = d as Row
-  const list = rowsKey ? o[rowsKey] : Object.values(o).find(Array.isArray)
-  return Array.isArray(list) ? (list as Row[]) : []
+export function pickRows(d: unknown, rowsKey?: string, key = 'id'): Row[] {
+  let list: unknown = d
+  if (!Array.isArray(d)) {
+    if (!d || typeof d !== 'object') return []
+    const o = d as Row
+    list = rowsKey ? o[rowsKey] : Object.values(o).find(Array.isArray)
+  }
+  if (!Array.isArray(list)) return []
+  // a list of names/ids (worlds, queues) becomes one-column rows keyed by the resource key
+  return list.map((r) => (r !== null && typeof r === 'object' ? (r as Row) : { [key]: r }))
 }
 
 export const rowKey = (res: Res, row: Row): string | undefined => {
