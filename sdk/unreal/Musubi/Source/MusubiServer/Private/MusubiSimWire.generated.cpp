@@ -201,13 +201,13 @@ void FMusubiCellFrame::Read(FMusubiPostcardReader& R, FMusubiCellFrame& Out)
 {
 	FMusubiCellId::Read(R, Out.cell);
 	Out.tick = R.Varint();
-	if (R.Byte() == 1) { FMusubiUuid V0{}; V0 = R.Uuid(); Out.owner = MoveTemp(V0); } else Out.owner.Reset();
-	if (R.Byte() == 1) { bool V0{}; V0 = R.Bool(); Out.full = MoveTemp(V0); } else Out.full.Reset();
-	{ uint64 V0N = R.Len(); Out.owned.Reset((int32)V0N); for (uint64 V0I = 0; V0I < V0N && R.Ok(); ++V0I) { FMusubiWorldEntity V0{}; FMusubiWorldEntity::Read(R, V0); Out.owned.Add(MoveTemp(V0)); } }
-	{ uint64 V0N = R.Len(); Out.ghosts.Reset((int32)V0N); for (uint64 V0I = 0; V0I < V0N && R.Ok(); ++V0I) { FMusubiWorldEntity V0{}; FMusubiWorldEntity::Read(R, V0); Out.ghosts.Add(MoveTemp(V0)); } }
-	if (R.Byte() == 1) { TArray<FMusubiUuid> V0{}; { uint64 V1N = R.Len(); V0.Reset((int32)V1N); for (uint64 V1I = 0; V1I < V1N && R.Ok(); ++V1I) { FMusubiUuid V1{}; V1 = R.Uuid(); V0.Add(MoveTemp(V1)); } } Out.gone = MoveTemp(V0); } else Out.gone.Reset();
-	{ uint64 V0N = R.Len(); Out.globals.Reset((int32)V0N); for (uint64 V0I = 0; V0I < V0N && R.Ok(); ++V0I) { FMusubiUuid V0{}; V0 = R.Uuid(); Out.globals.Add(MoveTemp(V0)); } }
-	if (R.Byte() == 1) { double V0{}; V0 = R.F64(); Out.time_scale = MoveTemp(V0); } else Out.time_scale.Reset();
+	{ uint8 V0T = R.Byte(); if (V0T == 1) { FMusubiUuid V0{}; V0 = R.Uuid(); Out.owner = MoveTemp(V0); } else { if (V0T != 0) R.Fail(); Out.owner.Reset(); } }
+	{ uint8 V0T = R.Byte(); if (V0T == 1) { bool V0{}; V0 = R.Bool(); Out.full = MoveTemp(V0); } else { if (V0T != 0) R.Fail(); Out.full.Reset(); } }
+	{ uint64 V0N = R.Len(); Out.owned.Reset((int32)(V0N < 1024 ? V0N : 1024)); for (uint64 V0I = 0; V0I < V0N && R.Ok(); ++V0I) { FMusubiWorldEntity V0{}; FMusubiWorldEntity::Read(R, V0); Out.owned.Add(MoveTemp(V0)); } }
+	{ uint64 V0N = R.Len(); Out.ghosts.Reset((int32)(V0N < 1024 ? V0N : 1024)); for (uint64 V0I = 0; V0I < V0N && R.Ok(); ++V0I) { FMusubiWorldEntity V0{}; FMusubiWorldEntity::Read(R, V0); Out.ghosts.Add(MoveTemp(V0)); } }
+	{ uint8 V0T = R.Byte(); if (V0T == 1) { TArray<FMusubiUuid> V0{}; { uint64 V1N = R.Len(); V0.Reset((int32)(V1N < 1024 ? V1N : 1024)); for (uint64 V1I = 0; V1I < V1N && R.Ok(); ++V1I) { FMusubiUuid V1{}; V1 = R.Uuid(); V0.Add(MoveTemp(V1)); } } Out.gone = MoveTemp(V0); } else { if (V0T != 0) R.Fail(); Out.gone.Reset(); } }
+	{ uint64 V0N = R.Len(); Out.globals.Reset((int32)(V0N < 1024 ? V0N : 1024)); for (uint64 V0I = 0; V0I < V0N && R.Ok(); ++V0I) { FMusubiUuid V0{}; V0 = R.Uuid(); Out.globals.Add(MoveTemp(V0)); } }
+	{ uint8 V0T = R.Byte(); if (V0T == 1) { double V0{}; V0 = R.F64(); Out.time_scale = MoveTemp(V0); } else { if (V0T != 0) R.Fail(); Out.time_scale.Reset(); } }
 }
 
 TSharedPtr<FJsonValue> FMusubiCoLocateResult::ToJson(const FMusubiCoLocateResult& V)
@@ -254,7 +254,7 @@ void FMusubiCoLocateResult::Read(FMusubiPostcardReader& R, FMusubiCoLocateResult
 	FMusubiCellId::Read(R, Out.cell);
 	Out.until_tick = R.Varint();
 	Out.forwarded = R.Bool();
-	{ uint64 V0N = R.Len(); Out.followers.Reset((int32)V0N); for (uint64 V0I = 0; V0I < V0N && R.Ok(); ++V0I) { FMusubiUuid V0{}; V0 = R.Uuid(); Out.followers.Add(MoveTemp(V0)); } }
+	{ uint64 V0N = R.Len(); Out.followers.Reset((int32)(V0N < 1024 ? V0N : 1024)); for (uint64 V0I = 0; V0I < V0N && R.Ok(); ++V0I) { FMusubiUuid V0{}; V0 = R.Uuid(); Out.followers.Add(MoveTemp(V0)); } }
 }
 
 TSharedPtr<FJsonValue> FMusubiRewindResult::ToJson(const FMusubiRewindResult& V)
@@ -291,9 +291,9 @@ void FMusubiRewindResult::Write(FMusubiPostcardWriter& W, const FMusubiRewindRes
 void FMusubiRewindResult::Read(FMusubiPostcardReader& R, FMusubiRewindResult& Out)
 {
 	Out.tick = R.Varint();
-	if (R.Byte() == 1) { FMusubiPos V0{}; FMusubiPos::Read(R, V0); Out.pos = MoveTemp(V0); } else Out.pos.Reset();
-	if (R.Byte() == 1) { bool V0{}; V0 = R.Bool(); Out.hit = MoveTemp(V0); } else Out.hit.Reset();
-	if (R.Byte() == 1) { uint64 V0{}; V0 = R.Varint(); Out.history_from = MoveTemp(V0); } else Out.history_from.Reset();
+	{ uint8 V0T = R.Byte(); if (V0T == 1) { FMusubiPos V0{}; FMusubiPos::Read(R, V0); Out.pos = MoveTemp(V0); } else { if (V0T != 0) R.Fail(); Out.pos.Reset(); } }
+	{ uint8 V0T = R.Byte(); if (V0T == 1) { bool V0{}; V0 = R.Bool(); Out.hit = MoveTemp(V0); } else { if (V0T != 0) R.Fail(); Out.hit.Reset(); } }
+	{ uint8 V0T = R.Byte(); if (V0T == 1) { uint64 V0{}; V0 = R.Varint(); Out.history_from = MoveTemp(V0); } else { if (V0T != 0) R.Fail(); Out.history_from.Reset(); } }
 }
 
 TSharedPtr<FJsonValue> FMusubiInteractResult::ToJson(const FMusubiInteractResult& V)
@@ -333,10 +333,10 @@ void FMusubiInteractResult::Write(FMusubiPostcardWriter& W, const FMusubiInterac
 void FMusubiInteractResult::Read(FMusubiPostcardReader& R, FMusubiInteractResult& Out)
 {
 	FMusubiDelivered::Read(R, Out.delivered);
-	if (R.Byte() == 1) { uint64 V0{}; V0 = R.Varint(); Out.seq = MoveTemp(V0); } else Out.seq.Reset();
-	if (R.Byte() == 1) { uint64 V0{}; V0 = R.Varint(); Out.tick = MoveTemp(V0); } else Out.tick.Reset();
-	if (R.Byte() == 1) { bool V0{}; V0 = R.Bool(); Out.colocated = MoveTemp(V0); } else Out.colocated.Reset();
-	if (R.Byte() == 1) { TArray<FMusubiUuid> V0{}; { uint64 V1N = R.Len(); V0.Reset((int32)V1N); for (uint64 V1I = 0; V1I < V1N && R.Ok(); ++V1I) { FMusubiUuid V1{}; V1 = R.Uuid(); V0.Add(MoveTemp(V1)); } } Out.followers = MoveTemp(V0); } else Out.followers.Reset();
+	{ uint8 V0T = R.Byte(); if (V0T == 1) { uint64 V0{}; V0 = R.Varint(); Out.seq = MoveTemp(V0); } else { if (V0T != 0) R.Fail(); Out.seq.Reset(); } }
+	{ uint8 V0T = R.Byte(); if (V0T == 1) { uint64 V0{}; V0 = R.Varint(); Out.tick = MoveTemp(V0); } else { if (V0T != 0) R.Fail(); Out.tick.Reset(); } }
+	{ uint8 V0T = R.Byte(); if (V0T == 1) { bool V0{}; V0 = R.Bool(); Out.colocated = MoveTemp(V0); } else { if (V0T != 0) R.Fail(); Out.colocated.Reset(); } }
+	{ uint8 V0T = R.Byte(); if (V0T == 1) { TArray<FMusubiUuid> V0{}; { uint64 V1N = R.Len(); V0.Reset((int32)(V1N < 1024 ? V1N : 1024)); for (uint64 V1I = 0; V1I < V1N && R.Ok(); ++V1I) { FMusubiUuid V1{}; V1 = R.Uuid(); V0.Add(MoveTemp(V1)); } } Out.followers = MoveTemp(V0); } else { if (V0T != 0) R.Fail(); Out.followers.Reset(); } }
 }
 
 const TCHAR* MusubiTagName(EMusubiHandoverOutcomeTag Tag)
@@ -394,7 +394,7 @@ void FMusubiHandoverOutcomeStarted::Read(FMusubiPostcardReader& R, FMusubiHandov
 	Out.entity = R.Uuid();
 	Out.from = R.Uuid();
 	Out.to = R.Uuid();
-	{ uint64 V0N = R.Len(); Out.group.Reset((int32)V0N); for (uint64 V0I = 0; V0I < V0N && R.Ok(); ++V0I) { FMusubiUuid V0{}; V0 = R.Uuid(); Out.group.Add(MoveTemp(V0)); } }
+	{ uint64 V0N = R.Len(); Out.group.Reset((int32)(V0N < 1024 ? V0N : 1024)); for (uint64 V0I = 0; V0I < V0N && R.Ok(); ++V0I) { FMusubiUuid V0{}; V0 = R.Uuid(); Out.group.Add(MoveTemp(V0)); } }
 }
 
 TSharedPtr<FJsonValue> FMusubiHandoverOutcomeCompleted::ToJson(const FMusubiHandoverOutcomeCompleted& V)
@@ -538,7 +538,7 @@ void FMusubiHandoverAckResult::Write(FMusubiPostcardWriter& W, const FMusubiHand
 void FMusubiHandoverAckResult::Read(FMusubiPostcardReader& R, FMusubiHandoverAckResult& Out)
 {
 	FMusubiHandoverOutcome::Read(R, Out.outcome);
-	{ uint64 V0N = R.Len(); Out.buffered_inputs.Reset((int32)V0N); for (uint64 V0I = 0; V0I < V0N && R.Ok(); ++V0I) { FMusubiJson V0{}; V0 = FMusubiJson::FromText(R.Str()); Out.buffered_inputs.Add(MoveTemp(V0)); } }
+	{ uint64 V0N = R.Len(); Out.buffered_inputs.Reset((int32)(V0N < 1024 ? V0N : 1024)); for (uint64 V0I = 0; V0I < V0N && R.Ok(); ++V0I) { FMusubiJson V0{}; V0 = FMusubiJson::FromText(R.Str()); Out.buffered_inputs.Add(MoveTemp(V0)); } }
 }
 
 const TCHAR* MusubiTagName(EMusubiSimEventTag Tag)
@@ -635,7 +635,7 @@ void FMusubiSimEventCellAssigned::Write(FMusubiPostcardWriter& W, const FMusubiS
 void FMusubiSimEventCellAssigned::Read(FMusubiPostcardReader& R, FMusubiSimEventCellAssigned& Out)
 {
 	FMusubiCellId::Read(R, Out.cell);
-	if (R.Byte() == 1) { FMusubiUuid V0{}; V0 = R.Uuid(); Out.from = MoveTemp(V0); } else Out.from.Reset();
+	{ uint8 V0T = R.Byte(); if (V0T == 1) { FMusubiUuid V0{}; V0 = R.Uuid(); Out.from = MoveTemp(V0); } else { if (V0T != 0) R.Fail(); Out.from.Reset(); } }
 	Out.reason = R.Str();
 }
 
@@ -845,7 +845,7 @@ void FMusubiSimEventQueued::Read(FMusubiPostcardReader& R, FMusubiSimEventQueued
 	Out.ticket = R.Uuid();
 	FMusubiCellId::Read(R, Out.cell);
 	Out.position = R.Varint();
-	if (R.Byte() == 1) { uint64 V0{}; V0 = R.Varint(); Out.eta_ticks = MoveTemp(V0); } else Out.eta_ticks.Reset();
+	{ uint8 V0T = R.Byte(); if (V0T == 1) { uint64 V0{}; V0 = R.Varint(); Out.eta_ticks = MoveTemp(V0); } else { if (V0T != 0) R.Fail(); Out.eta_ticks.Reset(); } }
 	Out.soft_cap = (uint32)R.Varint();
 }
 
@@ -885,7 +885,7 @@ void FMusubiSimEventQueueUpdate::Read(FMusubiPostcardReader& R, FMusubiSimEventQ
 	Out.ticket = R.Uuid();
 	FMusubiCellId::Read(R, Out.cell);
 	Out.position = R.Varint();
-	if (R.Byte() == 1) { uint64 V0{}; V0 = R.Varint(); Out.eta_ticks = MoveTemp(V0); } else Out.eta_ticks.Reset();
+	{ uint8 V0T = R.Byte(); if (V0T == 1) { uint64 V0{}; V0 = R.Varint(); Out.eta_ticks = MoveTemp(V0); } else { if (V0T != 0) R.Fail(); Out.eta_ticks.Reset(); } }
 }
 
 TSharedPtr<FJsonValue> FMusubiSimEventQueueAdmitted::ToJson(const FMusubiSimEventQueueAdmitted& V)
@@ -1055,8 +1055,8 @@ void FMusubiSimEventHandoverRequest::Read(FMusubiPostcardReader& R, FMusubiSimEv
 {
 	Out.entity = R.Uuid();
 	Out.from = R.Uuid();
-	if (R.Byte() == 1) { FMusubiWorldEntity V0{}; FMusubiWorldEntity::Read(R, V0); Out.state = MoveTemp(V0); } else Out.state.Reset();
-	{ uint64 V0N = R.Len(); Out.group.Reset((int32)V0N); for (uint64 V0I = 0; V0I < V0N && R.Ok(); ++V0I) { FMusubiWorldEntity V0{}; FMusubiWorldEntity::Read(R, V0); Out.group.Add(MoveTemp(V0)); } }
+	{ uint8 V0T = R.Byte(); if (V0T == 1) { FMusubiWorldEntity V0{}; FMusubiWorldEntity::Read(R, V0); Out.state = MoveTemp(V0); } else { if (V0T != 0) R.Fail(); Out.state.Reset(); } }
+	{ uint64 V0N = R.Len(); Out.group.Reset((int32)(V0N < 1024 ? V0N : 1024)); for (uint64 V0I = 0; V0I < V0N && R.Ok(); ++V0I) { FMusubiWorldEntity V0{}; FMusubiWorldEntity::Read(R, V0); Out.group.Add(MoveTemp(V0)); } }
 }
 
 TSharedPtr<FJsonValue> FMusubiSimEventHandoverStarted::ToJson(const FMusubiSimEventHandoverStarted& V)
@@ -1094,8 +1094,8 @@ void FMusubiSimEventHandoverStarted::Read(FMusubiPostcardReader& R, FMusubiSimEv
 {
 	Out.entity = R.Uuid();
 	Out.to = R.Uuid();
-	if (R.Byte() == 1) { FMusubiUuid V0{}; V0 = R.Uuid(); Out.node = MoveTemp(V0); } else Out.node.Reset();
-	if (R.Byte() == 1) { TArray<FMusubiUuid> V0{}; { uint64 V1N = R.Len(); V0.Reset((int32)V1N); for (uint64 V1I = 0; V1I < V1N && R.Ok(); ++V1I) { FMusubiUuid V1{}; V1 = R.Uuid(); V0.Add(MoveTemp(V1)); } } Out.group = MoveTemp(V0); } else Out.group.Reset();
+	{ uint8 V0T = R.Byte(); if (V0T == 1) { FMusubiUuid V0{}; V0 = R.Uuid(); Out.node = MoveTemp(V0); } else { if (V0T != 0) R.Fail(); Out.node.Reset(); } }
+	{ uint8 V0T = R.Byte(); if (V0T == 1) { TArray<FMusubiUuid> V0{}; { uint64 V1N = R.Len(); V0.Reset((int32)(V1N < 1024 ? V1N : 1024)); for (uint64 V1I = 0; V1I < V1N && R.Ok(); ++V1I) { FMusubiUuid V1{}; V1 = R.Uuid(); V0.Add(MoveTemp(V1)); } } Out.group = MoveTemp(V0); } else { if (V0T != 0) R.Fail(); Out.group.Reset(); } }
 }
 
 TSharedPtr<FJsonValue> FMusubiSimEventHandoverCompleted::ToJson(const FMusubiSimEventHandoverCompleted& V)
@@ -1130,7 +1130,7 @@ void FMusubiSimEventHandoverCompleted::Read(FMusubiPostcardReader& R, FMusubiSim
 {
 	Out.entity = R.Uuid();
 	Out.to = R.Uuid();
-	if (R.Byte() == 1) { FMusubiUuid V0{}; V0 = R.Uuid(); Out.node = MoveTemp(V0); } else Out.node.Reset();
+	{ uint8 V0T = R.Byte(); if (V0T == 1) { FMusubiUuid V0{}; V0 = R.Uuid(); Out.node = MoveTemp(V0); } else { if (V0T != 0) R.Fail(); Out.node.Reset(); } }
 }
 
 TSharedPtr<FJsonValue> FMusubiSimEventHandoverCancelled::ToJson(const FMusubiSimEventHandoverCancelled& V)
@@ -1200,7 +1200,7 @@ void FMusubiSimEventHandoverArrived::Read(FMusubiPostcardReader& R, FMusubiSimEv
 	Out.entity = R.Uuid();
 	Out.from_node = R.Uuid();
 	FMusubiWorldEntity::Read(R, Out.state);
-	{ uint64 V0N = R.Len(); Out.buffered_inputs.Reset((int32)V0N); for (uint64 V0I = 0; V0I < V0N && R.Ok(); ++V0I) { FMusubiJson V0{}; V0 = FMusubiJson::FromText(R.Str()); Out.buffered_inputs.Add(MoveTemp(V0)); } }
+	{ uint64 V0N = R.Len(); Out.buffered_inputs.Reset((int32)(V0N < 1024 ? V0N : 1024)); for (uint64 V0I = 0; V0I < V0N && R.Ok(); ++V0I) { FMusubiJson V0{}; V0 = FMusubiJson::FromText(R.Str()); Out.buffered_inputs.Add(MoveTemp(V0)); } }
 }
 
 TSharedPtr<FJsonValue> FMusubiSimEventInput::ToJson(const FMusubiSimEventInput& V)
@@ -1293,12 +1293,12 @@ void FMusubiSimEventInteraction::Read(FMusubiPostcardReader& R, FMusubiSimEventI
 	Out.kind = R.Str();
 	Out.payload = FMusubiJson::FromText(R.Str());
 	Out.from_sim = R.Uuid();
-	if (R.Byte() == 1) { uint64 V0{}; V0 = R.Varint(); Out.at_tick = MoveTemp(V0); } else Out.at_tick.Reset();
-	if (R.Byte() == 1) { FMusubiPos V0{}; FMusubiPos::Read(R, V0); Out.at = MoveTemp(V0); } else Out.at.Reset();
-	if (R.Byte() == 1) { double V0{}; V0 = R.F64(); Out.tolerance = MoveTemp(V0); } else Out.tolerance.Reset();
+	{ uint8 V0T = R.Byte(); if (V0T == 1) { uint64 V0{}; V0 = R.Varint(); Out.at_tick = MoveTemp(V0); } else { if (V0T != 0) R.Fail(); Out.at_tick.Reset(); } }
+	{ uint8 V0T = R.Byte(); if (V0T == 1) { FMusubiPos V0{}; FMusubiPos::Read(R, V0); Out.at = MoveTemp(V0); } else { if (V0T != 0) R.Fail(); Out.at.Reset(); } }
+	{ uint8 V0T = R.Byte(); if (V0T == 1) { double V0{}; V0 = R.F64(); Out.tolerance = MoveTemp(V0); } else { if (V0T != 0) R.Fail(); Out.tolerance.Reset(); } }
 	{ FString V0 = R.Str(); if (V0 == TEXT("null")) Out.rewind.Reset(); else Out.rewind = FMusubiJson::FromText(V0); }
-	if (R.Byte() == 1) { uint64 V0{}; V0 = R.Varint(); Out.seq = MoveTemp(V0); } else Out.seq.Reset();
-	if (R.Byte() == 1) { uint64 V0{}; V0 = R.Varint(); Out.tick = MoveTemp(V0); } else Out.tick.Reset();
+	{ uint8 V0T = R.Byte(); if (V0T == 1) { uint64 V0{}; V0 = R.Varint(); Out.seq = MoveTemp(V0); } else { if (V0T != 0) R.Fail(); Out.seq.Reset(); } }
+	{ uint8 V0T = R.Byte(); if (V0T == 1) { uint64 V0{}; V0 = R.Varint(); Out.tick = MoveTemp(V0); } else { if (V0T != 0) R.Fail(); Out.tick.Reset(); } }
 }
 
 TSharedPtr<FJsonValue> FMusubiSimEventCoLocate::ToJson(const FMusubiSimEventCoLocate& V)
@@ -1338,7 +1338,7 @@ void FMusubiSimEventCoLocate::Write(FMusubiPostcardWriter& W, const FMusubiSimEv
 void FMusubiSimEventCoLocate::Read(FMusubiPostcardReader& R, FMusubiSimEventCoLocate& Out)
 {
 	Out.entity = R.Uuid();
-	if (R.Byte() == 1) { FMusubiUuid V0{}; V0 = R.Uuid(); Out.with = MoveTemp(V0); } else Out.with.Reset();
+	{ uint8 V0T = R.Byte(); if (V0T == 1) { FMusubiUuid V0{}; V0 = R.Uuid(); Out.with = MoveTemp(V0); } else { if (V0T != 0) R.Fail(); Out.with.Reset(); } }
 	FMusubiCellId::Read(R, Out.cell);
 	Out.by = R.Uuid();
 	Out.until_tick = R.Varint();
@@ -1623,8 +1623,8 @@ void FMusubiSimFrameTick::Write(FMusubiPostcardWriter& W, const FMusubiSimFrameT
 void FMusubiSimFrameTick::Read(FMusubiPostcardReader& R, FMusubiSimFrameTick& Out)
 {
 	Out.tick = R.Varint();
-	{ uint64 V0N = R.Len(); Out.cells.Reset((int32)V0N); for (uint64 V0I = 0; V0I < V0N && R.Ok(); ++V0I) { FMusubiCellFrame V0{}; FMusubiCellFrame::Read(R, V0); Out.cells.Add(MoveTemp(V0)); } }
-	{ uint64 V0N = R.Len(); Out.events.Reset((int32)V0N); for (uint64 V0I = 0; V0I < V0N && R.Ok(); ++V0I) { FMusubiSimEvent V0{}; FMusubiSimEvent::Read(R, V0); Out.events.Add(MoveTemp(V0)); } }
+	{ uint64 V0N = R.Len(); Out.cells.Reset((int32)(V0N < 1024 ? V0N : 1024)); for (uint64 V0I = 0; V0I < V0N && R.Ok(); ++V0I) { FMusubiCellFrame V0{}; FMusubiCellFrame::Read(R, V0); Out.cells.Add(MoveTemp(V0)); } }
+	{ uint64 V0N = R.Len(); Out.events.Reset((int32)(V0N < 1024 ? V0N : 1024)); for (uint64 V0I = 0; V0I < V0N && R.Ok(); ++V0I) { FMusubiSimEvent V0{}; FMusubiSimEvent::Read(R, V0); Out.events.Add(MoveTemp(V0)); } }
 }
 
 TSharedPtr<FJsonValue> FMusubiSimFrame::ToJson(const FMusubiSimFrame& V)
@@ -1732,7 +1732,7 @@ void FMusubiSimCommandLease::Write(FMusubiPostcardWriter& W, const FMusubiSimCom
 
 void FMusubiSimCommandLease::Read(FMusubiPostcardReader& R, FMusubiSimCommandLease& Out)
 {
-	{ uint64 V0N = R.Len(); Out.cells.Reset((int32)V0N); for (uint64 V0I = 0; V0I < V0N && R.Ok(); ++V0I) { FMusubiCellId V0{}; FMusubiCellId::Read(R, V0); Out.cells.Add(MoveTemp(V0)); } }
+	{ uint64 V0N = R.Len(); Out.cells.Reset((int32)(V0N < 1024 ? V0N : 1024)); for (uint64 V0I = 0; V0I < V0N && R.Ok(); ++V0I) { FMusubiCellId V0{}; FMusubiCellId::Read(R, V0); Out.cells.Add(MoveTemp(V0)); } }
 }
 
 TSharedPtr<FJsonValue> FMusubiSimCommandSpawn::ToJson(const FMusubiSimCommandSpawn& V)
@@ -1786,8 +1786,8 @@ void FMusubiSimCommandSpawn::Read(FMusubiPostcardReader& R, FMusubiSimCommandSpa
 	Out.persistent = R.Bool();
 	Out.global = R.Bool();
 	Out.queue = R.Bool();
-	if (R.Byte() == 1) { uint64 V0{}; V0 = R.Varint(); Out.decay_ticks = MoveTemp(V0); } else Out.decay_ticks.Reset();
-	if (R.Byte() == 1) { FMusubiUuid V0{}; V0 = R.Uuid(); Out.owner = MoveTemp(V0); } else Out.owner.Reset();
+	{ uint8 V0T = R.Byte(); if (V0T == 1) { uint64 V0{}; V0 = R.Varint(); Out.decay_ticks = MoveTemp(V0); } else { if (V0T != 0) R.Fail(); Out.decay_ticks.Reset(); } }
+	{ uint8 V0T = R.Byte(); if (V0T == 1) { FMusubiUuid V0{}; V0 = R.Uuid(); Out.owner = MoveTemp(V0); } else { if (V0T != 0) R.Fail(); Out.owner.Reset(); } }
 }
 
 TSharedPtr<FJsonValue> FMusubiSimCommandTickDone::ToJson(const FMusubiSimCommandTickDone& V)
@@ -1940,8 +1940,8 @@ void FMusubiSimCommandApply::Write(FMusubiPostcardWriter& W, const FMusubiSimCom
 void FMusubiSimCommandApply::Read(FMusubiPostcardReader& R, FMusubiSimCommandApply& Out)
 {
 	Out.entity = R.Str();
-	if (R.Byte() == 1) { double V0{}; V0 = R.F64(); Out.x = MoveTemp(V0); } else Out.x.Reset();
-	if (R.Byte() == 1) { double V0{}; V0 = R.F64(); Out.y = MoveTemp(V0); } else Out.y.Reset();
+	{ uint8 V0T = R.Byte(); if (V0T == 1) { double V0{}; V0 = R.F64(); Out.x = MoveTemp(V0); } else { if (V0T != 0) R.Fail(); Out.x.Reset(); } }
+	{ uint8 V0T = R.Byte(); if (V0T == 1) { double V0{}; V0 = R.F64(); Out.y = MoveTemp(V0); } else { if (V0T != 0) R.Fail(); Out.y.Reset(); } }
 	Out.components = FMusubiJson::FromText(R.Str());
 }
 
@@ -1990,10 +1990,10 @@ void FMusubiSimCommandInteract::Read(FMusubiPostcardReader& R, FMusubiSimCommand
 	Out.entity = R.Str();
 	Out.kind = R.Str();
 	Out.payload = FMusubiJson::FromText(R.Str());
-	if (R.Byte() == 1) { uint64 V0{}; V0 = R.Varint(); Out.tick = MoveTemp(V0); } else Out.tick.Reset();
-	if (R.Byte() == 1) { double V0{}; V0 = R.F64(); Out.x = MoveTemp(V0); } else Out.x.Reset();
-	if (R.Byte() == 1) { double V0{}; V0 = R.F64(); Out.y = MoveTemp(V0); } else Out.y.Reset();
-	if (R.Byte() == 1) { double V0{}; V0 = R.F64(); Out.tolerance = MoveTemp(V0); } else Out.tolerance.Reset();
+	{ uint8 V0T = R.Byte(); if (V0T == 1) { uint64 V0{}; V0 = R.Varint(); Out.tick = MoveTemp(V0); } else { if (V0T != 0) R.Fail(); Out.tick.Reset(); } }
+	{ uint8 V0T = R.Byte(); if (V0T == 1) { double V0{}; V0 = R.F64(); Out.x = MoveTemp(V0); } else { if (V0T != 0) R.Fail(); Out.x.Reset(); } }
+	{ uint8 V0T = R.Byte(); if (V0T == 1) { double V0{}; V0 = R.F64(); Out.y = MoveTemp(V0); } else { if (V0T != 0) R.Fail(); Out.y.Reset(); } }
+	{ uint8 V0T = R.Byte(); if (V0T == 1) { double V0{}; V0 = R.F64(); Out.tolerance = MoveTemp(V0); } else { if (V0T != 0) R.Fail(); Out.tolerance.Reset(); } }
 }
 
 TSharedPtr<FJsonValue> FMusubiSimCommandColocate::ToJson(const FMusubiSimCommandColocate& V)
@@ -2069,9 +2069,9 @@ void FMusubiSimCommandRewind::Read(FMusubiPostcardReader& R, FMusubiSimCommandRe
 {
 	Out.entity = R.Str();
 	Out.tick = R.Varint();
-	if (R.Byte() == 1) { double V0{}; V0 = R.F64(); Out.x = MoveTemp(V0); } else Out.x.Reset();
-	if (R.Byte() == 1) { double V0{}; V0 = R.F64(); Out.y = MoveTemp(V0); } else Out.y.Reset();
-	if (R.Byte() == 1) { double V0{}; V0 = R.F64(); Out.tolerance = MoveTemp(V0); } else Out.tolerance.Reset();
+	{ uint8 V0T = R.Byte(); if (V0T == 1) { double V0{}; V0 = R.F64(); Out.x = MoveTemp(V0); } else { if (V0T != 0) R.Fail(); Out.x.Reset(); } }
+	{ uint8 V0T = R.Byte(); if (V0T == 1) { double V0{}; V0 = R.F64(); Out.y = MoveTemp(V0); } else { if (V0T != 0) R.Fail(); Out.y.Reset(); } }
+	{ uint8 V0T = R.Byte(); if (V0T == 1) { double V0{}; V0 = R.F64(); Out.tolerance = MoveTemp(V0); } else { if (V0T != 0) R.Fail(); Out.tolerance.Reset(); } }
 }
 
 TSharedPtr<FJsonValue> FMusubiSimCommandHandoverAck::ToJson(const FMusubiSimCommandHandoverAck& V)

@@ -212,7 +212,7 @@ fn pc_read(model: &Model, t: &Ty, target: &str, pos_cm: bool, depth: usize) -> S
         // the length prefix is peer-controlled: reserve at most PC_RESERVE_CAP elements up front,
         // the loop still stops at the real end of the frame via R.Ok()
         Ty::Vec(i) => format!(
-            "{{ uint64 {v}N = R.Len(); {target}.Reset((int32)FMath::Min<uint64>({v}N, {PC_RESERVE_CAP})); for (uint64 {v}I = 0; {v}I < {v}N && R.Ok(); ++{v}I) {{ {} {v}{{}}; {} {target}.Add(MoveTemp({v})); }} }}",
+            "{{ uint64 {v}N = R.Len(); {target}.Reset((int32)({v}N < {PC_RESERVE_CAP} ? {v}N : {PC_RESERVE_CAP})); for (uint64 {v}I = 0; {v}I < {v}N && R.Ok(); ++{v}I) {{ {} {v}{{}}; {} {target}.Add(MoveTemp({v})); }} }}",
             cpp_ty(model, i),
             pc_read(model, i, &v, pos_cm, depth + 1)
         ),
@@ -734,7 +734,9 @@ mod tests {
             .nth(1)
             .expect("Read impl");
         assert!(
-            read.contains(&format!("FMath::Min<uint64>(V0N, {PC_RESERVE_CAP})")),
+            read.contains(&format!(
+                "(V0N < {PC_RESERVE_CAP} ? V0N : {PC_RESERVE_CAP})"
+            )),
             "{read}"
         );
         assert!(!read.contains("Reset((int32)V0N)"), "{read}");

@@ -242,7 +242,7 @@ void FMusubiUserPresence::Read(FMusubiPostcardReader& R, FMusubiUserPresence& Ou
 	Out.account_id = R.Uuid();
 	Out.session_id = R.Uuid();
 	Out.username = R.Str();
-	if (R.Byte() == 1) { FString V0{}; V0 = R.Str(); Out.status = MoveTemp(V0); } else Out.status.Reset();
+	{ uint8 V0T = R.Byte(); if (V0T == 1) { FString V0{}; V0 = R.Str(); Out.status = MoveTemp(V0); } else { if (V0T != 0) R.Fail(); Out.status.Reset(); } }
 	{ FString V0 = R.Str(); if (V0 == TEXT("null")) Out.rich.Reset(); else Out.rich = FMusubiJson::FromText(V0); }
 	Out.invisible = R.Bool();
 }
@@ -318,7 +318,7 @@ void FMusubiWorldEntity::Read(FMusubiPostcardReader& R, FMusubiWorldEntity& Out)
 	Out.id = R.Uuid();
 	Out.x = MusubiPostcard::FromCm((int32)R.Zigzag());
 	Out.y = MusubiPostcard::FromCm((int32)R.Zigzag());
-	{ uint64 V0N = R.Len(); Out.components.Reset((int32)V0N); for (uint64 V0I = 0; V0I < V0N && R.Ok(); ++V0I) { FMusubiWorldComponent V0{}; FMusubiWorldComponent::Read(R, V0); Out.components.Add(MoveTemp(V0)); } }
+	{ uint64 V0N = R.Len(); Out.components.Reset((int32)(V0N < 1024 ? V0N : 1024)); for (uint64 V0I = 0; V0I < V0N && R.Ok(); ++V0I) { FMusubiWorldComponent V0{}; FMusubiWorldComponent::Read(R, V0); Out.components.Add(MoveTemp(V0)); } }
 }
 
 TSharedPtr<FJsonValue> FMusubiMatchmakerServer::ToJson(const FMusubiMatchmakerServer& V)
@@ -400,7 +400,7 @@ void FMusubiMatchmakerUser::Read(FMusubiPostcardReader& R, FMusubiMatchmakerUser
 	FMusubiUserPresence::Read(R, Out.presence);
 	{ uint64 V0N = R.Len(); Out.string_properties.Reset(); for (uint64 V0I = 0; V0I < V0N && R.Ok(); ++V0I) { FString V0K = R.Str(); FString V0{}; V0 = R.Str(); Out.string_properties.Add(MoveTemp(V0K), MoveTemp(V0)); } }
 	{ uint64 V0N = R.Len(); Out.numeric_properties.Reset(); for (uint64 V0I = 0; V0I < V0N && R.Ok(); ++V0I) { FString V0K = R.Str(); double V0{}; V0 = R.F64(); Out.numeric_properties.Add(MoveTemp(V0K), MoveTemp(V0)); } }
-	if (R.Byte() == 1) { uint32 V0{}; V0 = (uint32)R.Varint(); Out.team = MoveTemp(V0); } else Out.team.Reset();
+	{ uint8 V0T = R.Byte(); if (V0T == 1) { uint32 V0{}; V0 = (uint32)R.Varint(); Out.team = MoveTemp(V0); } else { if (V0T != 0) R.Fail(); Out.team.Reset(); } }
 }
 
 TSharedPtr<FJsonValue> FMusubiReaction::ToJson(const FMusubiReaction& V)
@@ -502,15 +502,15 @@ void FMusubiChannelMessage::Read(FMusubiPostcardReader& R, FMusubiChannelMessage
 	Out.message_id = R.Str();
 	if (!FMusubiChannelKindFromInt((int32)R.Zigzag(), Out.kind)) R.Fail();
 	Out.code = (int32)R.Zigzag();
-	if (R.Byte() == 1) { FMusubiUuid V0{}; V0 = R.Uuid(); Out.sender_id = MoveTemp(V0); } else Out.sender_id.Reset();
+	{ uint8 V0T = R.Byte(); if (V0T == 1) { FMusubiUuid V0{}; V0 = R.Uuid(); Out.sender_id = MoveTemp(V0); } else { if (V0T != 0) R.Fail(); Out.sender_id.Reset(); } }
 	Out.username = R.Str();
 	Out.content = FMusubiJson::FromText(R.Str());
 	Out.create_time = R.Zigzag();
 	Out.update_time = R.Zigzag();
 	Out.persistent = R.Bool();
-	{ uint64 V0N = R.Len(); Out.reactions.Reset((int32)V0N); for (uint64 V0I = 0; V0I < V0N && R.Ok(); ++V0I) { FMusubiReaction V0{}; FMusubiReaction::Read(R, V0); Out.reactions.Add(MoveTemp(V0)); } }
-	if (R.Byte() == 1) { FString V0{}; V0 = R.Str(); Out.reply_to = MoveTemp(V0); } else Out.reply_to.Reset();
-	{ uint64 V0N = R.Len(); Out.mentions.Reset((int32)V0N); for (uint64 V0I = 0; V0I < V0N && R.Ok(); ++V0I) { FMusubiUuid V0{}; V0 = R.Uuid(); Out.mentions.Add(MoveTemp(V0)); } }
+	{ uint64 V0N = R.Len(); Out.reactions.Reset((int32)(V0N < 1024 ? V0N : 1024)); for (uint64 V0I = 0; V0I < V0N && R.Ok(); ++V0I) { FMusubiReaction V0{}; FMusubiReaction::Read(R, V0); Out.reactions.Add(MoveTemp(V0)); } }
+	{ uint8 V0T = R.Byte(); if (V0T == 1) { FString V0{}; V0 = R.Str(); Out.reply_to = MoveTemp(V0); } else { if (V0T != 0) R.Fail(); Out.reply_to.Reset(); } }
+	{ uint64 V0N = R.Len(); Out.mentions.Reset((int32)(V0N < 1024 ? V0N : 1024)); for (uint64 V0I = 0; V0I < V0N && R.Ok(); ++V0I) { FMusubiUuid V0{}; V0 = R.Uuid(); Out.mentions.Add(MoveTemp(V0)); } }
 }
 
 TSharedPtr<FJsonValue> FMusubiPartyListing::ToJson(const FMusubiPartyListing& V)
@@ -521,7 +521,7 @@ TSharedPtr<FJsonValue> FMusubiPartyListing::ToJson(const FMusubiPartyListing& V)
 	O->SetField(TEXT("open"), MakeShared<FJsonValueBoolean>(V.open));
 	O->SetField(TEXT("max_size"), MakeShared<FJsonValueNumber>((double)V.max_size));
 	O->SetField(TEXT("size"), MakeShared<FJsonValueNumber>((double)V.size));
-	if (V.leader_id.IsSet()) O->SetField(TEXT("leader_id"), (V.leader_id.IsSet() ? TSharedPtr<FJsonValue>(MakeShared<FJsonValueString>(V.leader_id.GetValue())) : MusubiJson::Null()));
+	O->SetField(TEXT("leader_id"), (V.leader_id.IsSet() ? TSharedPtr<FJsonValue>(MakeShared<FJsonValueString>(V.leader_id.GetValue())) : MusubiJson::Null()));
 	return MakeShared<FJsonValueObject>(O);
 }
 
@@ -557,7 +557,7 @@ void FMusubiPartyListing::Read(FMusubiPostcardReader& R, FMusubiPartyListing& Ou
 	Out.open = R.Bool();
 	Out.max_size = (uint32)R.Varint();
 	Out.size = (uint32)R.Varint();
-	if (R.Byte() == 1) { FString V0{}; V0 = R.Str(); Out.leader_id = MoveTemp(V0); } else Out.leader_id.Reset();
+	{ uint8 V0T = R.Byte(); if (V0T == 1) { FString V0{}; V0 = R.Str(); Out.leader_id = MoveTemp(V0); } else { if (V0T != 0) R.Fail(); Out.leader_id.Reset(); } }
 }
 
 const TCHAR* MusubiTagName(EMusubiClientMessageTag Tag)
@@ -693,9 +693,9 @@ void FMusubiClientMessageStatusUpdate::Write(FMusubiPostcardWriter& W, const FMu
 
 void FMusubiClientMessageStatusUpdate::Read(FMusubiPostcardReader& R, FMusubiClientMessageStatusUpdate& Out)
 {
-	if (R.Byte() == 1) { FString V0{}; V0 = R.Str(); Out.status = MoveTemp(V0); } else Out.status.Reset();
+	{ uint8 V0T = R.Byte(); if (V0T == 1) { FString V0{}; V0 = R.Str(); Out.status = MoveTemp(V0); } else { if (V0T != 0) R.Fail(); Out.status.Reset(); } }
 	{ FString V0 = R.Str(); if (V0 == TEXT("null")) Out.rich.Reset(); else Out.rich = FMusubiJson::FromText(V0); }
-	if (R.Byte() == 1) { bool V0{}; V0 = R.Bool(); Out.appear_offline = MoveTemp(V0); } else Out.appear_offline.Reset();
+	{ uint8 V0T = R.Byte(); if (V0T == 1) { bool V0{}; V0 = R.Bool(); Out.appear_offline = MoveTemp(V0); } else { if (V0T != 0) R.Fail(); Out.appear_offline.Reset(); } }
 }
 
 TSharedPtr<FJsonValue> FMusubiClientMessageStatusFollow::ToJson(const FMusubiClientMessageStatusFollow& V)
@@ -722,7 +722,7 @@ void FMusubiClientMessageStatusFollow::Write(FMusubiPostcardWriter& W, const FMu
 
 void FMusubiClientMessageStatusFollow::Read(FMusubiPostcardReader& R, FMusubiClientMessageStatusFollow& Out)
 {
-	{ uint64 V0N = R.Len(); Out.account_ids.Reset((int32)V0N); for (uint64 V0I = 0; V0I < V0N && R.Ok(); ++V0I) { FMusubiUuid V0{}; V0 = R.Uuid(); Out.account_ids.Add(MoveTemp(V0)); } }
+	{ uint64 V0N = R.Len(); Out.account_ids.Reset((int32)(V0N < 1024 ? V0N : 1024)); for (uint64 V0I = 0; V0I < V0N && R.Ok(); ++V0I) { FMusubiUuid V0{}; V0 = R.Uuid(); Out.account_ids.Add(MoveTemp(V0)); } }
 }
 
 TSharedPtr<FJsonValue> FMusubiClientMessageStatusUnfollow::ToJson(const FMusubiClientMessageStatusUnfollow& V)
@@ -749,7 +749,7 @@ void FMusubiClientMessageStatusUnfollow::Write(FMusubiPostcardWriter& W, const F
 
 void FMusubiClientMessageStatusUnfollow::Read(FMusubiPostcardReader& R, FMusubiClientMessageStatusUnfollow& Out)
 {
-	{ uint64 V0N = R.Len(); Out.account_ids.Reset((int32)V0N); for (uint64 V0I = 0; V0I < V0N && R.Ok(); ++V0I) { FMusubiUuid V0{}; V0 = R.Uuid(); Out.account_ids.Add(MoveTemp(V0)); } }
+	{ uint64 V0N = R.Len(); Out.account_ids.Reset((int32)(V0N < 1024 ? V0N : 1024)); for (uint64 V0I = 0; V0I < V0N && R.Ok(); ++V0I) { FMusubiUuid V0{}; V0 = R.Uuid(); Out.account_ids.Add(MoveTemp(V0)); } }
 }
 
 TSharedPtr<FJsonValue> FMusubiClientMessageStorageSubscribe::ToJson(const FMusubiClientMessageStorageSubscribe& V)
@@ -783,8 +783,8 @@ void FMusubiClientMessageStorageSubscribe::Write(FMusubiPostcardWriter& W, const
 void FMusubiClientMessageStorageSubscribe::Read(FMusubiPostcardReader& R, FMusubiClientMessageStorageSubscribe& Out)
 {
 	Out.collection = R.Str();
-	if (R.Byte() == 1) { FString V0{}; V0 = R.Str(); Out.key = MoveTemp(V0); } else Out.key.Reset();
-	if (R.Byte() == 1) { FMusubiUuid V0{}; V0 = R.Uuid(); Out.owner_id = MoveTemp(V0); } else Out.owner_id.Reset();
+	{ uint8 V0T = R.Byte(); if (V0T == 1) { FString V0{}; V0 = R.Str(); Out.key = MoveTemp(V0); } else { if (V0T != 0) R.Fail(); Out.key.Reset(); } }
+	{ uint8 V0T = R.Byte(); if (V0T == 1) { FMusubiUuid V0{}; V0 = R.Uuid(); Out.owner_id = MoveTemp(V0); } else { if (V0T != 0) R.Fail(); Out.owner_id.Reset(); } }
 }
 
 TSharedPtr<FJsonValue> FMusubiClientMessageStorageUnsubscribe::ToJson(const FMusubiClientMessageStorageUnsubscribe& V)
@@ -818,8 +818,8 @@ void FMusubiClientMessageStorageUnsubscribe::Write(FMusubiPostcardWriter& W, con
 void FMusubiClientMessageStorageUnsubscribe::Read(FMusubiPostcardReader& R, FMusubiClientMessageStorageUnsubscribe& Out)
 {
 	Out.collection = R.Str();
-	if (R.Byte() == 1) { FString V0{}; V0 = R.Str(); Out.key = MoveTemp(V0); } else Out.key.Reset();
-	if (R.Byte() == 1) { FMusubiUuid V0{}; V0 = R.Uuid(); Out.owner_id = MoveTemp(V0); } else Out.owner_id.Reset();
+	{ uint8 V0T = R.Byte(); if (V0T == 1) { FString V0{}; V0 = R.Str(); Out.key = MoveTemp(V0); } else { if (V0T != 0) R.Fail(); Out.key.Reset(); } }
+	{ uint8 V0T = R.Byte(); if (V0T == 1) { FMusubiUuid V0{}; V0 = R.Uuid(); Out.owner_id = MoveTemp(V0); } else { if (V0T != 0) R.Fail(); Out.owner_id.Reset(); } }
 }
 
 TSharedPtr<FJsonValue> FMusubiClientMessageRpc::ToJson(const FMusubiClientMessageRpc& V)
@@ -951,7 +951,7 @@ void FMusubiClientMessageChannelMessageSend::Read(FMusubiPostcardReader& R, FMus
 {
 	Out.channel_id = R.Str();
 	Out.content = FMusubiJson::FromText(R.Str());
-	if (R.Byte() == 1) { FString V0{}; V0 = R.Str(); Out.reply_to = MoveTemp(V0); } else Out.reply_to.Reset();
+	{ uint8 V0T = R.Byte(); if (V0T == 1) { FString V0{}; V0 = R.Str(); Out.reply_to = MoveTemp(V0); } else { if (V0T != 0) R.Fail(); Out.reply_to.Reset(); } }
 }
 
 TSharedPtr<FJsonValue> FMusubiClientMessageChannelMessageUpdate::ToJson(const FMusubiClientMessageChannelMessageUpdate& V)
@@ -1183,7 +1183,7 @@ void FMusubiClientMessagePartyCreate::Read(FMusubiPostcardReader& R, FMusubiClie
 {
 	Out.open = R.Bool();
 	Out.max_size = (uint32)R.Varint();
-	if (R.Byte() == 1) { FString V0{}; V0 = R.Str(); Out.label = MoveTemp(V0); } else Out.label.Reset();
+	{ uint8 V0T = R.Byte(); if (V0T == 1) { FString V0{}; V0 = R.Str(); Out.label = MoveTemp(V0); } else { if (V0T != 0) R.Fail(); Out.label.Reset(); } }
 	Out.hidden = R.Bool();
 }
 
@@ -1224,10 +1224,10 @@ void FMusubiClientMessagePartyUpdate::Write(FMusubiPostcardWriter& W, const FMus
 void FMusubiClientMessagePartyUpdate::Read(FMusubiPostcardReader& R, FMusubiClientMessagePartyUpdate& Out)
 {
 	Out.party_id = R.Str();
-	if (R.Byte() == 1) { FString V0{}; V0 = R.Str(); Out.label = MoveTemp(V0); } else Out.label.Reset();
-	if (R.Byte() == 1) { bool V0{}; V0 = R.Bool(); Out.open = MoveTemp(V0); } else Out.open.Reset();
-	if (R.Byte() == 1) { bool V0{}; V0 = R.Bool(); Out.hidden = MoveTemp(V0); } else Out.hidden.Reset();
-	if (R.Byte() == 1) { uint32 V0{}; V0 = (uint32)R.Varint(); Out.max_size = MoveTemp(V0); } else Out.max_size.Reset();
+	{ uint8 V0T = R.Byte(); if (V0T == 1) { FString V0{}; V0 = R.Str(); Out.label = MoveTemp(V0); } else { if (V0T != 0) R.Fail(); Out.label.Reset(); } }
+	{ uint8 V0T = R.Byte(); if (V0T == 1) { bool V0{}; V0 = R.Bool(); Out.open = MoveTemp(V0); } else { if (V0T != 0) R.Fail(); Out.open.Reset(); } }
+	{ uint8 V0T = R.Byte(); if (V0T == 1) { bool V0{}; V0 = R.Bool(); Out.hidden = MoveTemp(V0); } else { if (V0T != 0) R.Fail(); Out.hidden.Reset(); } }
+	{ uint8 V0T = R.Byte(); if (V0T == 1) { uint32 V0{}; V0 = (uint32)R.Varint(); Out.max_size = MoveTemp(V0); } else { if (V0T != 0) R.Fail(); Out.max_size.Reset(); } }
 }
 
 TSharedPtr<FJsonValue> FMusubiClientMessagePartyList::ToJson(const FMusubiClientMessagePartyList& V)
@@ -1263,9 +1263,9 @@ void FMusubiClientMessagePartyList::Write(FMusubiPostcardWriter& W, const FMusub
 
 void FMusubiClientMessagePartyList::Read(FMusubiPostcardReader& R, FMusubiClientMessagePartyList& Out)
 {
-	if (R.Byte() == 1) { FString V0{}; V0 = R.Str(); Out.label = MoveTemp(V0); } else Out.label.Reset();
-	if (R.Byte() == 1) { FString V0{}; V0 = R.Str(); Out.label_prefix = MoveTemp(V0); } else Out.label_prefix.Reset();
-	if (R.Byte() == 1) { bool V0{}; V0 = R.Bool(); Out.open = MoveTemp(V0); } else Out.open.Reset();
+	{ uint8 V0T = R.Byte(); if (V0T == 1) { FString V0{}; V0 = R.Str(); Out.label = MoveTemp(V0); } else { if (V0T != 0) R.Fail(); Out.label.Reset(); } }
+	{ uint8 V0T = R.Byte(); if (V0T == 1) { FString V0{}; V0 = R.Str(); Out.label_prefix = MoveTemp(V0); } else { if (V0T != 0) R.Fail(); Out.label_prefix.Reset(); } }
+	{ uint8 V0T = R.Byte(); if (V0T == 1) { bool V0{}; V0 = R.Bool(); Out.open = MoveTemp(V0); } else { if (V0T != 0) R.Fail(); Out.open.Reset(); } }
 	Out.limit = (uint32)R.Varint();
 }
 
@@ -1614,7 +1614,7 @@ void FMusubiClientMessageMatchCreate::Write(FMusubiPostcardWriter& W, const FMus
 
 void FMusubiClientMessageMatchCreate::Read(FMusubiPostcardReader& R, FMusubiClientMessageMatchCreate& Out)
 {
-	if (R.Byte() == 1) { FString V0{}; V0 = R.Str(); Out.name = MoveTemp(V0); } else Out.name.Reset();
+	{ uint8 V0T = R.Byte(); if (V0T == 1) { FString V0{}; V0 = R.Str(); Out.name = MoveTemp(V0); } else { if (V0T != 0) R.Fail(); Out.name.Reset(); } }
 	Out.suppress_presence = R.Bool();
 }
 
@@ -1712,8 +1712,8 @@ void FMusubiClientMessageMatchJoin::Write(FMusubiPostcardWriter& W, const FMusub
 
 void FMusubiClientMessageMatchJoin::Read(FMusubiPostcardReader& R, FMusubiClientMessageMatchJoin& Out)
 {
-	if (R.Byte() == 1) { FString V0{}; V0 = R.Str(); Out.match_id = MoveTemp(V0); } else Out.match_id.Reset();
-	if (R.Byte() == 1) { FString V0{}; V0 = R.Str(); Out.token = MoveTemp(V0); } else Out.token.Reset();
+	{ uint8 V0T = R.Byte(); if (V0T == 1) { FString V0{}; V0 = R.Str(); Out.match_id = MoveTemp(V0); } else { if (V0T != 0) R.Fail(); Out.match_id.Reset(); } }
+	{ uint8 V0T = R.Byte(); if (V0T == 1) { FString V0{}; V0 = R.Str(); Out.token = MoveTemp(V0); } else { if (V0T != 0) R.Fail(); Out.token.Reset(); } }
 	{ uint64 V0N = R.Len(); Out.metadata.Reset(); for (uint64 V0I = 0; V0I < V0N && R.Ok(); ++V0I) { FString V0K = R.Str(); FString V0{}; V0 = R.Str(); Out.metadata.Add(MoveTemp(V0K), MoveTemp(V0)); } }
 	Out.spectator = R.Bool();
 	Out.delay_ticks = R.Varint();
@@ -1798,11 +1798,11 @@ void FMusubiClientMessageWorldSubscribe::Read(FMusubiPostcardReader& R, FMusubiC
 	Out.x = R.F64();
 	Out.y = R.F64();
 	Out.radius = R.F64();
-	if (R.Byte() == 1) { uint32 V0{}; V0 = (uint32)R.Varint(); Out.budget_bytes = MoveTemp(V0); } else Out.budget_bytes.Reset();
+	{ uint8 V0T = R.Byte(); if (V0T == 1) { uint32 V0{}; V0 = (uint32)R.Varint(); Out.budget_bytes = MoveTemp(V0); } else { if (V0T != 0) R.Fail(); Out.budget_bytes.Reset(); } }
 	{ FString V0 = R.Str(); if (V0 == TEXT("null")) Out.filter.Reset(); else Out.filter = FMusubiJson::FromText(V0); }
-	if (R.Byte() == 1) { uint32 V0{}; V0 = (uint32)R.Varint(); Out.max_hz = MoveTemp(V0); } else Out.max_hz.Reset();
+	{ uint8 V0T = R.Byte(); if (V0T == 1) { uint32 V0{}; V0 = (uint32)R.Varint(); Out.max_hz = MoveTemp(V0); } else { if (V0T != 0) R.Fail(); Out.max_hz.Reset(); } }
 	Out.unreliable_updates = R.Bool();
-	if (R.Byte() == 1) { FString V0{}; V0 = R.Str(); Out.inside = MoveTemp(V0); } else Out.inside.Reset();
+	{ uint8 V0T = R.Byte(); if (V0T == 1) { FString V0{}; V0 = R.Str(); Out.inside = MoveTemp(V0); } else { if (V0T != 0) R.Fail(); Out.inside.Reset(); } }
 }
 
 TSharedPtr<FJsonValue> FMusubiClientMessageWorldUnsubscribe::ToJson(const FMusubiClientMessageWorldUnsubscribe& V)
@@ -2088,9 +2088,9 @@ void FMusubiClientMessageMatchDataSend::Read(FMusubiPostcardReader& R, FMusubiCl
 	Out.match_id = R.Str();
 	Out.op_code = R.Zigzag();
 	R.Bytes(Out.data);
-	{ uint64 V0N = R.Len(); Out.presences.Reset((int32)V0N); for (uint64 V0I = 0; V0I < V0N && R.Ok(); ++V0I) { FMusubiUserPresence V0{}; FMusubiUserPresence::Read(R, V0); Out.presences.Add(MoveTemp(V0)); } }
+	{ uint64 V0N = R.Len(); Out.presences.Reset((int32)(V0N < 1024 ? V0N : 1024)); for (uint64 V0I = 0; V0I < V0N && R.Ok(); ++V0I) { FMusubiUserPresence V0{}; FMusubiUserPresence::Read(R, V0); Out.presences.Add(MoveTemp(V0)); } }
 	Out.reliable = R.Bool();
-	if (R.Byte() == 1) { FMusubiChannel V0{}; FMusubiChannel::Read(R, V0); Out.channel = MoveTemp(V0); } else Out.channel.Reset();
+	{ uint8 V0T = R.Byte(); if (V0T == 1) { FMusubiChannel V0{}; FMusubiChannel::Read(R, V0); Out.channel = MoveTemp(V0); } else { if (V0T != 0) R.Fail(); Out.channel.Reset(); } }
 }
 
 TSharedPtr<FJsonValue> FMusubiClientMessageTransport::ToJson(const FMusubiClientMessageTransport& V)
@@ -2117,7 +2117,7 @@ void FMusubiClientMessageTransport::Write(FMusubiPostcardWriter& W, const FMusub
 
 void FMusubiClientMessageTransport::Read(FMusubiPostcardReader& R, FMusubiClientMessageTransport& Out)
 {
-	if (R.Byte() == 1) { FString V0{}; V0 = R.Str(); Out.compress = MoveTemp(V0); } else Out.compress.Reset();
+	{ uint8 V0T = R.Byte(); if (V0T == 1) { FString V0{}; V0 = R.Str(); Out.compress = MoveTemp(V0); } else { if (V0T != 0) R.Fail(); Out.compress.Reset(); } }
 }
 
 TSharedPtr<FJsonValue> FMusubiClientMessagePartyInvite::ToJson(const FMusubiClientMessagePartyInvite& V)
@@ -2563,7 +2563,7 @@ void FMusubiServerMessageStatus::Write(FMusubiPostcardWriter& W, const FMusubiSe
 
 void FMusubiServerMessageStatus::Read(FMusubiPostcardReader& R, FMusubiServerMessageStatus& Out)
 {
-	{ uint64 V0N = R.Len(); Out.presences.Reset((int32)V0N); for (uint64 V0I = 0; V0I < V0N && R.Ok(); ++V0I) { FMusubiUserPresence V0{}; FMusubiUserPresence::Read(R, V0); Out.presences.Add(MoveTemp(V0)); } }
+	{ uint64 V0N = R.Len(); Out.presences.Reset((int32)(V0N < 1024 ? V0N : 1024)); for (uint64 V0I = 0; V0I < V0N && R.Ok(); ++V0I) { FMusubiUserPresence V0{}; FMusubiUserPresence::Read(R, V0); Out.presences.Add(MoveTemp(V0)); } }
 }
 
 TSharedPtr<FJsonValue> FMusubiServerMessageStatusPresenceEvent::ToJson(const FMusubiServerMessageStatusPresenceEvent& V)
@@ -2593,8 +2593,8 @@ void FMusubiServerMessageStatusPresenceEvent::Write(FMusubiPostcardWriter& W, co
 
 void FMusubiServerMessageStatusPresenceEvent::Read(FMusubiPostcardReader& R, FMusubiServerMessageStatusPresenceEvent& Out)
 {
-	{ uint64 V0N = R.Len(); Out.joins.Reset((int32)V0N); for (uint64 V0I = 0; V0I < V0N && R.Ok(); ++V0I) { FMusubiUserPresence V0{}; FMusubiUserPresence::Read(R, V0); Out.joins.Add(MoveTemp(V0)); } }
-	{ uint64 V0N = R.Len(); Out.leaves.Reset((int32)V0N); for (uint64 V0I = 0; V0I < V0N && R.Ok(); ++V0I) { FMusubiUserPresence V0{}; FMusubiUserPresence::Read(R, V0); Out.leaves.Add(MoveTemp(V0)); } }
+	{ uint64 V0N = R.Len(); Out.joins.Reset((int32)(V0N < 1024 ? V0N : 1024)); for (uint64 V0I = 0; V0I < V0N && R.Ok(); ++V0I) { FMusubiUserPresence V0{}; FMusubiUserPresence::Read(R, V0); Out.joins.Add(MoveTemp(V0)); } }
+	{ uint64 V0N = R.Len(); Out.leaves.Reset((int32)(V0N < 1024 ? V0N : 1024)); for (uint64 V0I = 0; V0I < V0N && R.Ok(); ++V0I) { FMusubiUserPresence V0{}; FMusubiUserPresence::Read(R, V0); Out.leaves.Add(MoveTemp(V0)); } }
 }
 
 TSharedPtr<FJsonValue> FMusubiServerMessageStorageUpdate::ToJson(const FMusubiServerMessageStorageUpdate& V)
@@ -2639,7 +2639,7 @@ void FMusubiServerMessageStorageUpdate::Read(FMusubiPostcardReader& R, FMusubiSe
 	Out.collection = R.Str();
 	Out.key = R.Str();
 	Out.owner_id = R.Uuid();
-	if (R.Byte() == 1) { FString V0{}; V0 = R.Str(); Out.version = MoveTemp(V0); } else Out.version.Reset();
+	{ uint8 V0T = R.Byte(); if (V0T == 1) { FString V0{}; V0 = R.Str(); Out.version = MoveTemp(V0); } else { if (V0T != 0) R.Fail(); Out.version.Reset(); } }
 	{ FString V0 = R.Str(); if (V0 == TEXT("null")) Out.value.Reset(); else Out.value = FMusubiJson::FromText(V0); }
 	Out.deleted = R.Bool();
 }
@@ -2685,7 +2685,7 @@ TSharedPtr<FJsonValue> FMusubiServerMessageNotification::ToJson(const FMusubiSer
 	O->SetField(TEXT("sender_id"), (V.sender_id.IsSet() ? TSharedPtr<FJsonValue>(MakeShared<FJsonValueString>(V.sender_id.GetValue().ToString())) : MusubiJson::Null()));
 	O->SetField(TEXT("create_time"), MakeShared<FJsonValueNumber>((double)V.create_time));
 	O->SetField(TEXT("persistent"), MakeShared<FJsonValueBoolean>(V.persistent));
-	if (V.expire_time.IsSet()) O->SetField(TEXT("expire_time"), (V.expire_time.IsSet() ? TSharedPtr<FJsonValue>(MakeShared<FJsonValueNumber>((double)V.expire_time.GetValue())) : MusubiJson::Null()));
+	O->SetField(TEXT("expire_time"), (V.expire_time.IsSet() ? TSharedPtr<FJsonValue>(MakeShared<FJsonValueNumber>((double)V.expire_time.GetValue())) : MusubiJson::Null()));
 	return MakeShared<FJsonValueObject>(O);
 }
 
@@ -2724,10 +2724,10 @@ void FMusubiServerMessageNotification::Read(FMusubiPostcardReader& R, FMusubiSer
 	Out.subject = R.Str();
 	Out.content = FMusubiJson::FromText(R.Str());
 	Out.code = (int32)R.Zigzag();
-	if (R.Byte() == 1) { FMusubiUuid V0{}; V0 = R.Uuid(); Out.sender_id = MoveTemp(V0); } else Out.sender_id.Reset();
+	{ uint8 V0T = R.Byte(); if (V0T == 1) { FMusubiUuid V0{}; V0 = R.Uuid(); Out.sender_id = MoveTemp(V0); } else { if (V0T != 0) R.Fail(); Out.sender_id.Reset(); } }
 	Out.create_time = R.Zigzag();
 	Out.persistent = R.Bool();
-	if (R.Byte() == 1) { int64 V0{}; V0 = R.Zigzag(); Out.expire_time = MoveTemp(V0); } else Out.expire_time.Reset();
+	{ uint8 V0T = R.Byte(); if (V0T == 1) { int64 V0{}; V0 = R.Zigzag(); Out.expire_time = MoveTemp(V0); } else { if (V0T != 0) R.Fail(); Out.expire_time.Reset(); } }
 }
 
 TSharedPtr<FJsonValue> FMusubiServerMessageChannel::ToJson(const FMusubiServerMessageChannel& V)
@@ -2765,7 +2765,7 @@ void FMusubiServerMessageChannel::Read(FMusubiPostcardReader& R, FMusubiServerMe
 {
 	Out.id = R.Str();
 	if (!FMusubiChannelKindFromInt((int32)R.Zigzag(), Out.kind)) R.Fail();
-	{ uint64 V0N = R.Len(); Out.presences.Reset((int32)V0N); for (uint64 V0I = 0; V0I < V0N && R.Ok(); ++V0I) { FMusubiUserPresence V0{}; FMusubiUserPresence::Read(R, V0); Out.presences.Add(MoveTemp(V0)); } }
+	{ uint64 V0N = R.Len(); Out.presences.Reset((int32)(V0N < 1024 ? V0N : 1024)); for (uint64 V0I = 0; V0I < V0N && R.Ok(); ++V0I) { FMusubiUserPresence V0{}; FMusubiUserPresence::Read(R, V0); Out.presences.Add(MoveTemp(V0)); } }
 	FMusubiUserPresence::Read(R, Out.me);
 }
 
@@ -2847,8 +2847,8 @@ void FMusubiServerMessageChannelPresenceEvent::Write(FMusubiPostcardWriter& W, c
 void FMusubiServerMessageChannelPresenceEvent::Read(FMusubiPostcardReader& R, FMusubiServerMessageChannelPresenceEvent& Out)
 {
 	Out.channel_id = R.Str();
-	{ uint64 V0N = R.Len(); Out.joins.Reset((int32)V0N); for (uint64 V0I = 0; V0I < V0N && R.Ok(); ++V0I) { FMusubiUserPresence V0{}; FMusubiUserPresence::Read(R, V0); Out.joins.Add(MoveTemp(V0)); } }
-	{ uint64 V0N = R.Len(); Out.leaves.Reset((int32)V0N); for (uint64 V0I = 0; V0I < V0N && R.Ok(); ++V0I) { FMusubiUserPresence V0{}; FMusubiUserPresence::Read(R, V0); Out.leaves.Add(MoveTemp(V0)); } }
+	{ uint64 V0N = R.Len(); Out.joins.Reset((int32)(V0N < 1024 ? V0N : 1024)); for (uint64 V0I = 0; V0I < V0N && R.Ok(); ++V0I) { FMusubiUserPresence V0{}; FMusubiUserPresence::Read(R, V0); Out.joins.Add(MoveTemp(V0)); } }
+	{ uint64 V0N = R.Len(); Out.leaves.Reset((int32)(V0N < 1024 ? V0N : 1024)); for (uint64 V0I = 0; V0I < V0N && R.Ok(); ++V0I) { FMusubiUserPresence V0{}; FMusubiUserPresence::Read(R, V0); Out.leaves.Add(MoveTemp(V0)); } }
 }
 
 TSharedPtr<FJsonValue> FMusubiServerMessageChannelTyping::ToJson(const FMusubiServerMessageChannelTyping& V)
@@ -2974,9 +2974,9 @@ void FMusubiServerMessageMatchmakerMatched::Read(FMusubiPostcardReader& R, FMusu
 {
 	Out.ticket = R.Str();
 	Out.token = R.Str();
-	{ uint64 V0N = R.Len(); Out.users.Reset((int32)V0N); for (uint64 V0I = 0; V0I < V0N && R.Ok(); ++V0I) { FMusubiMatchmakerUser V0{}; FMusubiMatchmakerUser::Read(R, V0); Out.users.Add(MoveTemp(V0)); } }
+	{ uint64 V0N = R.Len(); Out.users.Reset((int32)(V0N < 1024 ? V0N : 1024)); for (uint64 V0I = 0; V0I < V0N && R.Ok(); ++V0I) { FMusubiMatchmakerUser V0{}; FMusubiMatchmakerUser::Read(R, V0); Out.users.Add(MoveTemp(V0)); } }
 	FMusubiMatchmakerUser::Read(R, Out.me);
-	if (R.Byte() == 1) { FMusubiMatchmakerServer V0{}; FMusubiMatchmakerServer::Read(R, V0); Out.server = MoveTemp(V0); } else Out.server.Reset();
+	{ uint8 V0T = R.Byte(); if (V0T == 1) { FMusubiMatchmakerServer V0{}; FMusubiMatchmakerServer::Read(R, V0); Out.server = MoveTemp(V0); } else { if (V0T != 0) R.Fail(); Out.server.Reset(); } }
 }
 
 TSharedPtr<FJsonValue> FMusubiServerMessageMatchmakerReadyCheck::ToJson(const FMusubiServerMessageMatchmakerReadyCheck& V)
@@ -3015,7 +3015,7 @@ void FMusubiServerMessageMatchmakerReadyCheck::Read(FMusubiPostcardReader& R, FM
 	Out.ticket = R.Str();
 	Out.token = R.Str();
 	Out.deadline_ms = R.Varint();
-	{ uint64 V0N = R.Len(); Out.users.Reset((int32)V0N); for (uint64 V0I = 0; V0I < V0N && R.Ok(); ++V0I) { FMusubiMatchmakerUser V0{}; FMusubiMatchmakerUser::Read(R, V0); Out.users.Add(MoveTemp(V0)); } }
+	{ uint64 V0N = R.Len(); Out.users.Reset((int32)(V0N < 1024 ? V0N : 1024)); for (uint64 V0I = 0; V0I < V0N && R.Ok(); ++V0I) { FMusubiMatchmakerUser V0{}; FMusubiMatchmakerUser::Read(R, V0); Out.users.Add(MoveTemp(V0)); } }
 }
 
 TSharedPtr<FJsonValue> FMusubiServerMessageMatchmakerReadyFailed::ToJson(const FMusubiServerMessageMatchmakerReadyFailed& V)
@@ -3109,7 +3109,7 @@ void FMusubiServerMessageParty::Read(FMusubiPostcardReader& R, FMusubiServerMess
 	Out.hidden = R.Bool();
 	FMusubiUserPresence::Read(R, Out.me);
 	FMusubiUserPresence::Read(R, Out.leader);
-	{ uint64 V0N = R.Len(); Out.presences.Reset((int32)V0N); for (uint64 V0I = 0; V0I < V0N && R.Ok(); ++V0I) { FMusubiUserPresence V0{}; FMusubiUserPresence::Read(R, V0); Out.presences.Add(MoveTemp(V0)); } }
+	{ uint64 V0N = R.Len(); Out.presences.Reset((int32)(V0N < 1024 ? V0N : 1024)); for (uint64 V0I = 0; V0I < V0N && R.Ok(); ++V0I) { FMusubiUserPresence V0{}; FMusubiUserPresence::Read(R, V0); Out.presences.Add(MoveTemp(V0)); } }
 }
 
 TSharedPtr<FJsonValue> FMusubiServerMessagePartyJoinRequest::ToJson(const FMusubiServerMessagePartyJoinRequest& V)
@@ -3140,7 +3140,7 @@ void FMusubiServerMessagePartyJoinRequest::Write(FMusubiPostcardWriter& W, const
 void FMusubiServerMessagePartyJoinRequest::Read(FMusubiPostcardReader& R, FMusubiServerMessagePartyJoinRequest& Out)
 {
 	Out.party_id = R.Str();
-	{ uint64 V0N = R.Len(); Out.presences.Reset((int32)V0N); for (uint64 V0I = 0; V0I < V0N && R.Ok(); ++V0I) { FMusubiUserPresence V0{}; FMusubiUserPresence::Read(R, V0); Out.presences.Add(MoveTemp(V0)); } }
+	{ uint64 V0N = R.Len(); Out.presences.Reset((int32)(V0N < 1024 ? V0N : 1024)); for (uint64 V0I = 0; V0I < V0N && R.Ok(); ++V0I) { FMusubiUserPresence V0{}; FMusubiUserPresence::Read(R, V0); Out.presences.Add(MoveTemp(V0)); } }
 }
 
 TSharedPtr<FJsonValue> FMusubiServerMessagePartyLeader::ToJson(const FMusubiServerMessagePartyLeader& V)
@@ -3205,8 +3205,8 @@ void FMusubiServerMessagePartyPresenceEvent::Write(FMusubiPostcardWriter& W, con
 void FMusubiServerMessagePartyPresenceEvent::Read(FMusubiPostcardReader& R, FMusubiServerMessagePartyPresenceEvent& Out)
 {
 	Out.party_id = R.Str();
-	{ uint64 V0N = R.Len(); Out.joins.Reset((int32)V0N); for (uint64 V0I = 0; V0I < V0N && R.Ok(); ++V0I) { FMusubiUserPresence V0{}; FMusubiUserPresence::Read(R, V0); Out.joins.Add(MoveTemp(V0)); } }
-	{ uint64 V0N = R.Len(); Out.leaves.Reset((int32)V0N); for (uint64 V0I = 0; V0I < V0N && R.Ok(); ++V0I) { FMusubiUserPresence V0{}; FMusubiUserPresence::Read(R, V0); Out.leaves.Add(MoveTemp(V0)); } }
+	{ uint64 V0N = R.Len(); Out.joins.Reset((int32)(V0N < 1024 ? V0N : 1024)); for (uint64 V0I = 0; V0I < V0N && R.Ok(); ++V0I) { FMusubiUserPresence V0{}; FMusubiUserPresence::Read(R, V0); Out.joins.Add(MoveTemp(V0)); } }
+	{ uint64 V0N = R.Len(); Out.leaves.Reset((int32)(V0N < 1024 ? V0N : 1024)); for (uint64 V0I = 0; V0I < V0N && R.Ok(); ++V0I) { FMusubiUserPresence V0{}; FMusubiUserPresence::Read(R, V0); Out.leaves.Add(MoveTemp(V0)); } }
 }
 
 TSharedPtr<FJsonValue> FMusubiServerMessagePartyData::ToJson(const FMusubiServerMessagePartyData& V)
@@ -3330,7 +3330,7 @@ void FMusubiServerMessagePartyList::Write(FMusubiPostcardWriter& W, const FMusub
 
 void FMusubiServerMessagePartyList::Read(FMusubiPostcardReader& R, FMusubiServerMessagePartyList& Out)
 {
-	{ uint64 V0N = R.Len(); Out.parties.Reset((int32)V0N); for (uint64 V0I = 0; V0I < V0N && R.Ok(); ++V0I) { FMusubiPartyListing V0{}; FMusubiPartyListing::Read(R, V0); Out.parties.Add(MoveTemp(V0)); } }
+	{ uint64 V0N = R.Len(); Out.parties.Reset((int32)(V0N < 1024 ? V0N : 1024)); for (uint64 V0I = 0; V0I < V0N && R.Ok(); ++V0I) { FMusubiPartyListing V0{}; FMusubiPartyListing::Read(R, V0); Out.parties.Add(MoveTemp(V0)); } }
 }
 
 TSharedPtr<FJsonValue> FMusubiServerMessageMatch::ToJson(const FMusubiServerMessageMatch& V)
@@ -3380,11 +3380,11 @@ void FMusubiServerMessageMatch::Read(FMusubiPostcardReader& R, FMusubiServerMess
 {
 	Out.match_id = R.Str();
 	Out.authoritative = R.Bool();
-	if (R.Byte() == 1) { FString V0{}; V0 = R.Str(); Out.label = MoveTemp(V0); } else Out.label.Reset();
+	{ uint8 V0T = R.Byte(); if (V0T == 1) { FString V0{}; V0 = R.Str(); Out.label = MoveTemp(V0); } else { if (V0T != 0) R.Fail(); Out.label.Reset(); } }
 	Out.size = (uint32)R.Varint();
-	{ uint64 V0N = R.Len(); Out.presences.Reset((int32)V0N); for (uint64 V0I = 0; V0I < V0N && R.Ok(); ++V0I) { FMusubiUserPresence V0{}; FMusubiUserPresence::Read(R, V0); Out.presences.Add(MoveTemp(V0)); } }
+	{ uint64 V0N = R.Len(); Out.presences.Reset((int32)(V0N < 1024 ? V0N : 1024)); for (uint64 V0I = 0; V0I < V0N && R.Ok(); ++V0I) { FMusubiUserPresence V0{}; FMusubiUserPresence::Read(R, V0); Out.presences.Add(MoveTemp(V0)); } }
 	FMusubiUserPresence::Read(R, Out.me);
-	if (R.Byte() == 1) { FMusubiUserPresence V0{}; FMusubiUserPresence::Read(R, V0); Out.host = MoveTemp(V0); } else Out.host.Reset();
+	{ uint8 V0T = R.Byte(); if (V0T == 1) { FMusubiUserPresence V0{}; FMusubiUserPresence::Read(R, V0); Out.host = MoveTemp(V0); } else { if (V0T != 0) R.Fail(); Out.host.Reset(); } }
 	Out.suppress_presence = R.Bool();
 }
 
@@ -3506,9 +3506,9 @@ void FMusubiServerMessageWorldDelta::Read(FMusubiPostcardReader& R, FMusubiServe
 {
 	Out.world = R.Str();
 	Out.tick = R.Varint();
-	{ uint64 V0N = R.Len(); Out.spawned.Reset((int32)V0N); for (uint64 V0I = 0; V0I < V0N && R.Ok(); ++V0I) { FMusubiWorldEntity V0{}; FMusubiWorldEntity::Read(R, V0); Out.spawned.Add(MoveTemp(V0)); } }
-	{ uint64 V0N = R.Len(); Out.updated.Reset((int32)V0N); for (uint64 V0I = 0; V0I < V0N && R.Ok(); ++V0I) { FMusubiWorldEntity V0{}; FMusubiWorldEntity::Read(R, V0); Out.updated.Add(MoveTemp(V0)); } }
-	{ uint64 V0N = R.Len(); Out.despawned.Reset((int32)V0N); for (uint64 V0I = 0; V0I < V0N && R.Ok(); ++V0I) { FMusubiUuid V0{}; V0 = R.Uuid(); Out.despawned.Add(MoveTemp(V0)); } }
+	{ uint64 V0N = R.Len(); Out.spawned.Reset((int32)(V0N < 1024 ? V0N : 1024)); for (uint64 V0I = 0; V0I < V0N && R.Ok(); ++V0I) { FMusubiWorldEntity V0{}; FMusubiWorldEntity::Read(R, V0); Out.spawned.Add(MoveTemp(V0)); } }
+	{ uint64 V0N = R.Len(); Out.updated.Reset((int32)(V0N < 1024 ? V0N : 1024)); for (uint64 V0I = 0; V0I < V0N && R.Ok(); ++V0I) { FMusubiWorldEntity V0{}; FMusubiWorldEntity::Read(R, V0); Out.updated.Add(MoveTemp(V0)); } }
+	{ uint64 V0N = R.Len(); Out.despawned.Reset((int32)(V0N < 1024 ? V0N : 1024)); for (uint64 V0I = 0; V0I < V0N && R.Ok(); ++V0I) { FMusubiUuid V0{}; V0 = R.Uuid(); Out.despawned.Add(MoveTemp(V0)); } }
 	Out.time_scale = R.F64();
 	Out.sequenced = R.Bool();
 }
@@ -3552,7 +3552,7 @@ void FMusubiServerMessageNetOpened::Read(FMusubiPostcardReader& R, FMusubiServer
 	Out.world = R.Str();
 	Out.entity = R.Str();
 	Out.conn = R.Varint();
-	if (R.Byte() == 1) { FMusubiUuid V0{}; V0 = R.Uuid(); Out.server = MoveTemp(V0); } else Out.server.Reset();
+	{ uint8 V0T = R.Byte(); if (V0T == 1) { FMusubiUuid V0{}; V0 = R.Uuid(); Out.server = MoveTemp(V0); } else { if (V0T != 0) R.Fail(); Out.server.Reset(); } }
 	Out.max_packet = (uint32)R.Varint();
 }
 
@@ -3685,7 +3685,7 @@ void FMusubiServerMessageNetRehome::Read(FMusubiPostcardReader& R, FMusubiServer
 	Out.world = R.Str();
 	Out.entity = R.Str();
 	Out.conn = R.Varint();
-	if (R.Byte() == 1) { FMusubiUuid V0{}; V0 = R.Uuid(); Out.server = MoveTemp(V0); } else Out.server.Reset();
+	{ uint8 V0T = R.Byte(); if (V0T == 1) { FMusubiUuid V0{}; V0 = R.Uuid(); Out.server = MoveTemp(V0); } else { if (V0T != 0) R.Fail(); Out.server.Reset(); } }
 }
 
 TSharedPtr<FJsonValue> FMusubiServerMessageMatchInputAck::ToJson(const FMusubiServerMessageMatchInputAck& V)
@@ -3829,7 +3829,7 @@ void FMusubiServerMessageMatchStateDelta::Read(FMusubiPostcardReader& R, FMusubi
 {
 	Out.match_id = R.Str();
 	Out.tick = R.Varint();
-	{ uint64 V0N = R.Len(); Out.ops.Reset((int32)V0N); for (uint64 V0I = 0; V0I < V0N && R.Ok(); ++V0I) { FMusubiJson V0{}; V0 = FMusubiJson::FromText(R.Str()); Out.ops.Add(MoveTemp(V0)); } }
+	{ uint64 V0N = R.Len(); Out.ops.Reset((int32)(V0N < 1024 ? V0N : 1024)); for (uint64 V0I = 0; V0I < V0N && R.Ok(); ++V0I) { FMusubiJson V0{}; V0 = FMusubiJson::FromText(R.Str()); Out.ops.Add(MoveTemp(V0)); } }
 }
 
 TSharedPtr<FJsonValue> FMusubiServerMessageMatchData::ToJson(const FMusubiServerMessageMatchData& V)
@@ -3875,12 +3875,12 @@ void FMusubiServerMessageMatchData::Write(FMusubiPostcardWriter& W, const FMusub
 void FMusubiServerMessageMatchData::Read(FMusubiPostcardReader& R, FMusubiServerMessageMatchData& Out)
 {
 	Out.match_id = R.Str();
-	if (R.Byte() == 1) { FMusubiUserPresence V0{}; FMusubiUserPresence::Read(R, V0); Out.presence = MoveTemp(V0); } else Out.presence.Reset();
+	{ uint8 V0T = R.Byte(); if (V0T == 1) { FMusubiUserPresence V0{}; FMusubiUserPresence::Read(R, V0); Out.presence = MoveTemp(V0); } else { if (V0T != 0) R.Fail(); Out.presence.Reset(); } }
 	Out.op_code = R.Zigzag();
 	R.Bytes(Out.data);
 	Out.reliable = R.Bool();
-	if (R.Byte() == 1) { FMusubiChannel V0{}; FMusubiChannel::Read(R, V0); Out.channel = MoveTemp(V0); } else Out.channel.Reset();
-	if (R.Byte() == 1) { uint64 V0{}; V0 = R.Varint(); Out.seq = MoveTemp(V0); } else Out.seq.Reset();
+	{ uint8 V0T = R.Byte(); if (V0T == 1) { FMusubiChannel V0{}; FMusubiChannel::Read(R, V0); Out.channel = MoveTemp(V0); } else { if (V0T != 0) R.Fail(); Out.channel.Reset(); } }
+	{ uint8 V0T = R.Byte(); if (V0T == 1) { uint64 V0{}; V0 = R.Varint(); Out.seq = MoveTemp(V0); } else { if (V0T != 0) R.Fail(); Out.seq.Reset(); } }
 }
 
 TSharedPtr<FJsonValue> FMusubiServerMessageTransport::ToJson(const FMusubiServerMessageTransport& V)
@@ -3920,9 +3920,9 @@ void FMusubiServerMessageTransport::Write(FMusubiPostcardWriter& W, const FMusub
 void FMusubiServerMessageTransport::Read(FMusubiPostcardReader& R, FMusubiServerMessageTransport& Out)
 {
 	Out.transport = R.Str();
-	{ uint64 V0N = R.Len(); Out.channels.Reset((int32)V0N); for (uint64 V0I = 0; V0I < V0N && R.Ok(); ++V0I) { FMusubiChannel V0{}; FMusubiChannel::Read(R, V0); Out.channels.Add(MoveTemp(V0)); } }
+	{ uint64 V0N = R.Len(); Out.channels.Reset((int32)(V0N < 1024 ? V0N : 1024)); for (uint64 V0I = 0; V0I < V0N && R.Ok(); ++V0I) { FMusubiChannel V0{}; FMusubiChannel::Read(R, V0); Out.channels.Add(MoveTemp(V0)); } }
 	Out.max_frame_bytes = R.Varint();
-	{ uint64 V0N = R.Len(); Out.compression.Reset((int32)V0N); for (uint64 V0I = 0; V0I < V0N && R.Ok(); ++V0I) { FString V0{}; V0 = R.Str(); Out.compression.Add(MoveTemp(V0)); } }
+	{ uint64 V0N = R.Len(); Out.compression.Reset((int32)(V0N < 1024 ? V0N : 1024)); for (uint64 V0I = 0; V0I < V0N && R.Ok(); ++V0I) { FString V0{}; V0 = R.Str(); Out.compression.Add(MoveTemp(V0)); } }
 	Out.compressed = R.Bool();
 }
 
@@ -3957,8 +3957,8 @@ void FMusubiServerMessageMatchPresenceEvent::Write(FMusubiPostcardWriter& W, con
 void FMusubiServerMessageMatchPresenceEvent::Read(FMusubiPostcardReader& R, FMusubiServerMessageMatchPresenceEvent& Out)
 {
 	Out.match_id = R.Str();
-	{ uint64 V0N = R.Len(); Out.joins.Reset((int32)V0N); for (uint64 V0I = 0; V0I < V0N && R.Ok(); ++V0I) { FMusubiUserPresence V0{}; FMusubiUserPresence::Read(R, V0); Out.joins.Add(MoveTemp(V0)); } }
-	{ uint64 V0N = R.Len(); Out.leaves.Reset((int32)V0N); for (uint64 V0I = 0; V0I < V0N && R.Ok(); ++V0I) { FMusubiUserPresence V0{}; FMusubiUserPresence::Read(R, V0); Out.leaves.Add(MoveTemp(V0)); } }
+	{ uint64 V0N = R.Len(); Out.joins.Reset((int32)(V0N < 1024 ? V0N : 1024)); for (uint64 V0I = 0; V0I < V0N && R.Ok(); ++V0I) { FMusubiUserPresence V0{}; FMusubiUserPresence::Read(R, V0); Out.joins.Add(MoveTemp(V0)); } }
+	{ uint64 V0N = R.Len(); Out.leaves.Reset((int32)(V0N < 1024 ? V0N : 1024)); for (uint64 V0I = 0; V0I < V0N && R.Ok(); ++V0I) { FMusubiUserPresence V0{}; FMusubiUserPresence::Read(R, V0); Out.leaves.Add(MoveTemp(V0)); } }
 }
 
 TSharedPtr<FJsonValue> FMusubiServerMessageChannelMessageReaction::ToJson(const FMusubiServerMessageChannelMessageReaction& V)
@@ -4048,7 +4048,7 @@ TSharedPtr<FJsonValue> FMusubiServerMessageStreamData::ToJson(const FMusubiServe
 	TSharedPtr<FJsonObject> O = MakeShared<FJsonObject>();
 	O->SetField(TEXT("stream"), MakeShared<FJsonValueString>(V.stream));
 	O->SetField(TEXT("data"), MusubiJson::JsonOrNull(V.data));
-	if (V.sender.IsSet()) O->SetField(TEXT("sender"), (V.sender.IsSet() ? TSharedPtr<FJsonValue>(FMusubiUserPresence::ToJson(V.sender.GetValue())) : MusubiJson::Null()));
+	O->SetField(TEXT("sender"), (V.sender.IsSet() ? TSharedPtr<FJsonValue>(FMusubiUserPresence::ToJson(V.sender.GetValue())) : MusubiJson::Null()));
 	return MakeShared<FJsonValueObject>(O);
 }
 
@@ -4075,7 +4075,7 @@ void FMusubiServerMessageStreamData::Read(FMusubiPostcardReader& R, FMusubiServe
 {
 	Out.stream = R.Str();
 	Out.data = FMusubiJson::FromText(R.Str());
-	if (R.Byte() == 1) { FMusubiUserPresence V0{}; FMusubiUserPresence::Read(R, V0); Out.sender = MoveTemp(V0); } else Out.sender.Reset();
+	{ uint8 V0T = R.Byte(); if (V0T == 1) { FMusubiUserPresence V0{}; FMusubiUserPresence::Read(R, V0); Out.sender = MoveTemp(V0); } else { if (V0T != 0) R.Fail(); Out.sender.Reset(); } }
 }
 
 TSharedPtr<FJsonValue> FMusubiServerMessage::ToJson(const FMusubiServerMessage& V)
