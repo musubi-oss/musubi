@@ -56,9 +56,10 @@ public:
 	UPROPERTY(Config)
 	float RehomeTimeout = 5.f;
 	/** Client: after `NMT_Welcome` on a rehome, how long to hold `NMT_Join` for the new owner's NetGUID table (`net_meta`)
-	 *  before joining without it (the kept actors are then swapped for the owner's copies instead of reused). */
+	 *  before joining without it (the kept actors are then swapped for the owner's copies instead of reused). A server that
+	 *  has just adopted the entity (failover into a replacement) answers late; 1 s lost the identity there. */
 	UPROPERTY(Config)
-	float GuidTableTimeout = 1.f;
+	float GuidTableTimeout = 3.f;
 
 protected:
 	/** Client: the entity moved to another simulator. Default: travel to the same URL (`TRAVEL_Absolute`), i.e. a reconnect; projects override for an in-place restart. */
