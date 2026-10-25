@@ -15,6 +15,7 @@
 #include "Engine/GameInstance.h"
 #include "Engine/World.h"
 #include "EngineUtils.h"
+#include "WorldPartition/WorldPartition.h"
 #include "Kismet/GameplayStatics.h"
 #include "GameFramework/PlayerController.h"
 #include "GameFramework/PlayerState.h"
@@ -94,6 +95,11 @@ void UMusubiNitlSubsystem::OnWorldTick(UWorld* World, ELevelTick, float)
 	// the player walks +X: input on the possessed pawn, CharacterMovement predicts locally and sends ServerMove to whoever owns the entity
 	if (!World || !GetGameInstance() || World != GetGameInstance()->GetWorld()) return;
 	APlayerController* PC = UGameplayStatics::GetPlayerController(World, 0);
+	// -MusubiNitlNoWpSource (NITL_WP=1): this client does not stream the partitioned map by its controller. The harness runs
+	// uncooked `UnrealEditor -server` processes, which have no WP cell packages on disk and kick a client that reports a
+	// cell visible they have not streamed in (MissingLevelPackage); the walk here leaves the two leased cells far behind.
+	static const bool bNoWpSource = FParse::Param(FCommandLine::Get(), TEXT("MusubiNitlNoWpSource"));
+	if (PC && bNoWpSource) PC->bEnableStreamingSource = false;
 	APawn* P = PC ? PC->GetPawn() : nullptr;
 	static const float Walk = [] { float W = 60.f; FParse::Value(FCommandLine::Get(), TEXT("MusubiNitlWalk="), W); return W; }();
 	if (Walk <= 0.f) return; // -MusubiNitlWalk=0: a spectator whose pawn stays put
@@ -232,6 +238,15 @@ bool UMusubiNitlSubsystem::Report(float)
 			Nitl && Nitl->Loadout ? *Nitl->Loadout->GetName() : TEXT("-"), PS ? *PS->GetName() : TEXT("-"));
 		++N;
 	}
+	// NITL_WP=1: which marker cells of the partitioned map the engine streamed in here (server: by the simulator's leases)
+	TArray<FString> Markers;
+	for (TActorIterator<AActor> It(World); It; ++It)
+	{
+		if (It->ActorHasTag(TEXT("MusubiWpMarker")) && It->Tags.Num() > 1) Markers.Add(It->Tags[1].ToString());
+	}
+	Markers.Sort();
+	UE_LOG(LogMusubiNitl, Log, TEXT("nitl: wp partitioned=%d leased=%s markers=%s"), (int)(World->GetWorldPartition() != nullptr),
+		Sim.IsValid() ? *FString::Join(Sim->LeasedCells(), TEXT(";")) : TEXT("-"), *FString::Join(Markers, TEXT(";")));
 	if (Mode == TEXT("client"))
 	{
 		UE_LOG(LogMusubiNitl, Log, TEXT("nitl: client pawns=%d netdriver=%s"), N, World->GetNetDriver() ? *World->GetNetDriver()->GetDescription() : TEXT("none"));

@@ -7,4 +7,6 @@ MUSUBISERVER_API DECLARE_LOG_CATEGORY_EXTERN(LogMusubiServer, Log, All);
 
 class FMusubiServerModule : public IModuleInterface
 {
+public:
+	virtual void StartupModule() override;
 };

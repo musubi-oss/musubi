@@ -11,6 +11,7 @@
 #include "Subsystems/GameInstanceSubsystem.h"
 #include "MusubiSimWire.generated.h"
 #include "MusubiSimStream.h"
+#include "WorldPartition/WorldPartitionStreamingSource.h"
 #include "MusubiSimulatorSubsystem.generated.h"
 
 class UMusubiAuthorityComponent;
@@ -50,7 +51,7 @@ DECLARE_DELEGATE_RetVal_ThreeParams(AActor*, FMusubiSpawnEntityActor, const FMus
 DECLARE_MULTICAST_DELEGATE_OneParam(FMusubiSimEventDelegate, const FMusubiSimEvent&);
 
 UCLASS()
-class MUSUBISERVER_API UMusubiSimulatorSubsystem : public UGameInstanceSubsystem
+class MUSUBISERVER_API UMusubiSimulatorSubsystem : public UGameInstanceSubsystem, public IWorldPartitionStreamingSourceProvider
 {
 	GENERATED_BODY()
 public:
@@ -66,6 +67,13 @@ public:
 	UFUNCTION(BlueprintPure, Category = "Musubi|Simulator") FString GetSimulatorId() const { return SimId.ToString(); }
 	UFUNCTION(BlueprintPure, Category = "Musubi|Simulator") FMusubiSimulatorStats GetStats() const { return Stats; }
 	UFUNCTION(BlueprintPure, Category = "Musubi|Simulator") TArray<FString> LeasedCells() const;
+	/** The world's grid (from the node at start): base cell side in cm, 0 until known. */
+	UFUNCTION(BlueprintPure, Category = "Musubi|Simulator") float WorldCellSize() const { return (float)GridCellSize; }
+	/** World-space bounds of a cell ("x,y" or "x,y,z@level"); invalid until the grid is known. */
+	UFUNCTION(BlueprintPure, Category = "Musubi|Simulator") FBox CellBounds(const FString& Cell) const;
+	// IWorldPartitionStreamingSourceProvider: one source, a sphere per leased cell (UMusubiSimulatorSettings::bWorldPartitionStreaming)
+	virtual bool GetStreamingSource(FWorldPartitionStreamingSource& OutSource) const override;
+	virtual const UObject* GetStreamingSourceOwner() const override { return this; }
 	/** Override settings before Start (tests, command line). */
 	void Configure(const FString& ApiBase, const FString& ServerKey, const FString& World, int32 Capacity, int32 Hz);
 
@@ -176,6 +184,16 @@ private:
 	FString HeightComponent;
 	TArray<FString> InitialCells;
 	TMap<FMusubiCellId, FCell> Cells;
+	TSet<FMusubiCellId> Leased;
+	double GridCellSize = 0, GridGhostMargin = 0;
+	bool bGridThreeD = false;
+	double NextGridFetch = 0;
+	TWeakObjectPtr<class UWorldPartitionSubsystem> WpSubsystem;
+	bool bWpFilterBound = false;
+	void FetchWorldGrid();
+	void UpdateWorldPartitionSource();
+	void UnregisterWorldPartitionSource();
+	FBox BoundsOf(const FMusubiCellId& C) const;
 	TMap<FMusubiUuid, FEntity> Entities;
 	TArray<FMusubiSimFrameTick> Inbox;
 	uint64 LastTick = 0;

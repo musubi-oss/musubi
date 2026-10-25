@@ -39,7 +39,7 @@ else
   sed -i "s/\"EngineAssociation\": \"\"/\"EngineAssociation\": \"${VER%.*}\"/" "$PROJ/HostProject.uproject"
 fi
 
-cleanup() { set +e; curl -s http://127.0.0.1:7360/metrics > "$OUT/metrics.txt" 2>/dev/null; for N in $NAMES; do docker logs "$N" > "$OUT/$N.log" 2>&1; done; for p in "${PIDS[@]:-}"; do kill "$p" 2>/dev/null; done; docker rm -f nitl-s1 nitl-s2 nitl-c >/dev/null 2>&1; }
+cleanup() { set +e; curl -s http://127.0.0.1:7360/metrics > "$OUT/metrics.txt" 2>/dev/null; for N in $NAMES; do docker logs "$N" > "$OUT/$N.log" 2>&1; done; for p in "${PIDS[@]:-}"; do kill "$p" 2>/dev/null; done; wait "${PIDS[@]:-}" 2>/dev/null; docker rm -f nitl-s1 nitl-s2 nitl-c >/dev/null 2>&1; } # wait: the node we started must be gone before a back-to-back run probes healthz
 trap cleanup EXIT
 PIDS=()
 if ! curl -fsS "$API/healthz" >/dev/null 2>&1; then
@@ -70,6 +70,22 @@ ue() { # name, extra args...
     -unattended -nosplash -nullrhi -NoSound -stdout -FullStdOutLogOutput -log -LogCmds="LogMusubiServer VeryVerbose, LogMusubiNet Verbose, LogMusubiMesh Verbose, LogNet Verbose${NITL_LOGCMDS_EXTRA:-}" \
     -MusubiApi="$API" -MusubiKey="$KEY" -MusubiWorld="$WORLD" $ENCARG "$@" >/dev/null
 }
+# NITL_WP=1: a World Partition map built headless by the plugin's commandlet (grid = the world's cell size, a marker actor
+# per cell along x); the servers stream it by their leases, the client by its controller — one map, no travel on rehome.
+WP="${NITL_WP:-0}"; WPCLIENT=""
+if [ "$WP" = 1 ] && [ -z "${NITL_PROJECT:-}" ]; then
+  echo "== wp map"
+  docker run --rm --network none -u "$(id -u):$(id -g)" -e HOME="/out/home" -v "$OUT:/out" "$IMG" \
+    /home/ue4/UnrealEngine/Engine/Binaries/Linux/UnrealEditor-Cmd "/out/HostProject/$UPROJ" -run=MusubiNitlWpMap -Cell="$CELL" -Markers=12 \
+    -unattended -nosplash -nullrhi -NoSound -stdout -FullStdOutLogOutput > "$OUT/wpmap.log" 2>&1 || { echo "wp map commandlet failed"; grep -i "error\|wpmap" "$OUT/wpmap.log" | tail -20; exit 1; }
+  [ -f "$PROJ/Content/NitlWP.umap" ] || { echo "wp map not written"; grep -i "wpmap\|error" "$OUT/wpmap.log" | tail -20; exit 1; }
+  echo "wp map: $(grep -o 'wpmap: .*' "$OUT/wpmap.log" | tail -1)"
+  MAP=/Game/NitlWP
+  # An uncooked `UnrealEditor -server` has no WP cell packages on disk and kicks a client that reports a WP cell visible
+  # which this server has not streamed in (MissingLevelPackage; cooked servers have every cell package and take any), and
+  # the walk leaves the two leased cells far behind — so the harness client does not stream by its controller.
+  WPCLIENT="-MusubiNitlNoWpSource"
+fi
 echo "== servers"
 S2SPAWN=""; if [ "$CHAOS" = 1 ]; then
   S2SPAWN="-MusubiNitlSpawn=$((CELL + CELL / 2)),100${NITL_SPAWN_Z:+,$NITL_SPAWN_Z}"
@@ -82,29 +98,31 @@ ue nitl-s1 -server ${NITL_SERVER_EXTRA:-} -MusubiNitl=server -MusubiCells="0,0" 
 ue nitl-s2 -server ${NITL_SERVER_EXTRA:-} -MusubiNitl=server -MusubiCells="1,0" -MusubiNitlWalk="$WALK" $S2SPAWN
 ENTITY=""
 if [ "$JOIN" = 1 ]; then
-  # s1 must hold its cell before the client joins, so the policy spawn lands on a live lease
-  for i in $(seq 1 180); do docker logs nitl-s1 2>&1 | grep -q "nitl: cell .* assigned=1" && break; sleep 1; done
+  # s1 must hold its cell before the client joins, so the policy spawn lands on a live lease. `|| true` on every docker logs
+  # pipe: grep -q / head close the pipe early, docker logs dies of SIGPIPE and under pipefail the && never fires — the wait
+  # then runs its full 180 s and the quiet cells hibernate before the client arrives.
+  for i in $(seq 1 180); do (docker logs nitl-s1 2>&1 || true) | grep -q "nitl: cell .* assigned=1" && break; sleep 1; done
   echo "== client (join)"
-  ue nitl-c -game -MusubiNitl=client -MusubiNitlJoin -MusubiNitlWalk="$WALK"
+  ue nitl-c -game -MusubiNitl=client -MusubiNitlJoin -MusubiNitlWalk="$WALK" ${WPCLIENT:-}
   for i in $(seq 1 180); do
-    ENTITY=$(docker logs nitl-c 2>&1 | sed -n 's/.*my avatar in .* is \([0-9a-f-]*\) .*/\1/p' | head -1); [ -n "$ENTITY" ] && break; sleep 1
+    ENTITY=$((docker logs nitl-c 2>&1 || true) | sed -n 's/.*my avatar in .* is \([0-9a-f-]*\) .*/\1/p' | head -1); [ -n "$ENTITY" ] && break; sleep 1
   done
-  [ -n "$ENTITY" ] || { echo "client never got its avatar (world_join)"; docker logs nitl-c 2>&1 | grep -i "musubi\|error" | tail -40; exit 1; }
+  [ -n "$ENTITY" ] || { echo "client never got its avatar (world_join)"; (docker logs nitl-c 2>&1 || true) | grep -i "musubi\|error" | tail -40; exit 1; }
 fi
 for i in $(seq 1 180); do
   [ -n "$ENTITY" ] && break
-  ENTITY=$(docker logs nitl-s1 2>&1 | sed -n 's/.*nitl: spawned \([0-9a-f-]*\).*/\1/p' | head -1); [ -n "$ENTITY" ] && break; sleep 1
+  ENTITY=$((docker logs nitl-s1 2>&1 || true) | sed -n 's/.*nitl: spawned \([0-9a-f-]*\).*/\1/p' | head -1); [ -n "$ENTITY" ] && break; sleep 1
 done
 curl -fsS "$API/v1/server/worlds/$WORLD" -H "x-musubi-server-key: $KEY" > "$OUT/world-after.json" 2>/dev/null; echo "world state: $(head -c 600 "$OUT/world-after.json")"
-[ -n "$ENTITY" ] || { echo "s1 never spawned the entity"; docker logs nitl-s1 2>&1 | grep -i "musubi\|error\|warning: " | tail -40; exit 1; }
+[ -n "$ENTITY" ] || { echo "s1 never spawned the entity"; (docker logs nitl-s1 2>&1 || true) | grep -i "musubi\|error\|warning: " | tail -40; exit 1; }
 echo "entity=$ENTITY"
 ENTITY2=""; if [ "$CHAOS" = 1 ]; then
-  for i in $(seq 1 120); do ENTITY2=$(docker logs nitl-s2 2>&1 | sed -n 's/.*nitl: spawned \([0-9a-f-]*\).*/\1/p' | head -1); [ -n "$ENTITY2" ] && break; sleep 1; done
+  for i in $(seq 1 120); do ENTITY2=$((docker logs nitl-s2 2>&1 || true) | sed -n 's/.*nitl: spawned \([0-9a-f-]*\).*/\1/p' | head -1); [ -n "$ENTITY2" ] && break; sleep 1; done
   [ -n "$ENTITY2" ] || { echo "s2 never spawned the second entity"; exit 1; }; echo "entity2=$ENTITY2"
 fi
 if [ "$JOIN" != 1 ]; then
   echo "== client"
-  ue nitl-c -game -MusubiNitl=client -MusubiEntity="$ENTITY" -MusubiNitlWalk="$WALK"
+  ue nitl-c -game -MusubiNitl=client -MusubiEntity="$ENTITY" -MusubiNitlWalk="$WALK" ${WPCLIENT:-}
 fi
 if [ "$CHAOS" = 1 ]; then
   ue nitl-c2 -game -MusubiNitl=client -MusubiEntity="$ENTITY2" -MusubiNitlWalk=0
@@ -204,6 +222,21 @@ if [ "$S1R" = "role=3 auth=1" ]; then echo "PASS nitl-s1: owner has ROLE_Authori
 S1G=$(grep "nitl: server pawn .* id=$ENTITY owned=0 role=" "$OUT/nitl-s1.log" | grep -o "role=[0-9]* auth=[0-9]*" | tail -1)
 if [ "$S1G" = "role=1 auth=0" ]; then echo "PASS nitl-s1: old owner became a ROLE_SimulatedProxy ghost after the handover ($S1G)"; else echo "FAIL nitl-s1: old owner became a ROLE_SimulatedProxy ghost after the handover (${S1G:-none})"; ok=0; fi
 case "$VER" in 5.8*) ;; *) chk "$S2LOG" "ghost PreReplication as SimulatedProxy";; esac
+if [ "$WP" = 1 ] && [ "$CHAOS" != 1 ]; then
+  # servers: WP streaming on, and the streamed-in markers follow the lease — s2 (cell 1,0 + margin) has 1,0 and not 11,0,
+  # s1 (0,0) has 0,0 and not 11,0; nothing is loaded for cells nobody leases. The engine adds its own server extra radius
+  # (wp.Runtime.ServerStreamingSourceMinimumExtraRadius / 2 × source location quantization ≈ 8 m) on top of the margin,
+  # which on this toy 2.56 m grid is a few cells — hence a far marker 11 cells out.
+  chk nitl-s1 "IsServerStreamingEnabled = 1"
+  chk nitl-s1 "world partition: simulator registered as the streaming source"
+  wpm() { grep "nitl: wp partitioned=1 leased=$2 " "$OUT/$1.log" | grep -o "markers=.*" | tail -1; }
+  WM2=$(wpm "$S2LOG" "1,0"); WM1=$(wpm nitl-s1 "0,0")
+  case "$WM2" in *"1,0"*) echo "PASS $S2LOG: wp streamed in the leased cell 1,0 ($WM2)";; *) echo "FAIL $S2LOG: wp streamed in the leased cell 1,0 (${WM2:-none})"; ok=0;; esac
+  case "$WM2" in *"11,0"*) echo "FAIL $S2LOG: wp did not stream a far cell 11,0 ($WM2)"; ok=0;; *) echo "PASS $S2LOG: wp did not stream a far cell 11,0";; esac
+  case "$WM1" in *"0,0"*) echo "PASS nitl-s1: wp streamed in the leased cell 0,0 ($WM1)";; *) echo "FAIL nitl-s1: wp streamed in the leased cell 0,0 (${WM1:-none})"; ok=0;; esac
+  case "$WM1" in *"11,0"*) echo "FAIL nitl-s1: wp did not stream a far cell 11,0 ($WM1)"; ok=0;; *) echo "PASS nitl-s1: wp did not stream a far cell 11,0";; esac
+  chk nitl-c "nitl: wp partitioned=1"
+fi
 if [ "$JOIN" = 1 ]; then echo "SKIP nitl-s: inventory / iris-seed / subobject-seed checks (the node-spawned avatar carries no NITL seed; the client did see the new owner's FastArray and subobject above)"; else
 GINV=$(grep "nitl: server pawn .* id=$ENTITY owned=0 " "$OUT/$S2LOG.log" | grep -o "inv=[0-9]* gold=[0-9]*" | tail -1)
 GHOW="ghost received the inventory component via iris"

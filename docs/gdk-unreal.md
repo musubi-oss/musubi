@@ -232,6 +232,30 @@ contact: `IMusubiAuthority::OnInteraction(from, payload)`), `CoLocate` (node pin
 our cell — spawn ghosts as full actors), `TxCommitted/TxAborted` (inventory tx outcomes),
 `Unknown` (logged once per tag).
 
+### 6.2a World Partition: one map for the whole world, streamed by lease
+A dedicated server is itself a WP streaming source (`UMusubiSimulatorSubsystem` implements
+`IWorldPartitionStreamingSourceProvider`, registered with `UWorldPartitionSubsystem` while it runs): one source
+with a sphere per leased cell — the cell's half diagonal plus `CellStreamingMargin` (default: the world's
+`ghost_margin`, where this server's ghosts of the neighbours live), `Activated`, priority `High`; the engine adds
+its own server extra radius on top (`wp.Runtime.ServerStreamingSourceMinimumExtraRadius`, at least twice the
+source location quantization — about 8 m by default). The grid
+(`cell_size`, `ghost_margin`, `three_d`, cell `level` for split cells) comes from `GET /v1/server/worlds/{w}` at
+start; until it answers the source is empty. The engine then loads/unloads the map's WP cells under
+`CellAssigned`/`CellRevoked`/`CellReleased`, split/merge and handover by itself — the whole world is one
+partitioned map, both servers hold the geometry around the border, placed actors live in WP cells and are
+simulated by whoever owns the Musubi cell, and a rehome never changes the client's map (its own controller
+streams as usual). Server streaming is off in the engine by default and resolved once at world init, so the
+`MusubiServer` module sets `wp.Runtime.EnableServerStreaming` and `...Out` on a `-server` process at startup
+(an ini / command-line value has a higher priority and wins); `bIgnorePlayerStreamingSources` filters player
+controllers out of the server's sources (`OnIsStreamingSourceProviderFiltered`, unless the project bound it),
+so a server streams by its leases, not by where its players stand. `bWorldPartitionStreaming = false` turns it
+all off; the per-cell level instances above (`CellLevels`) remain for non-WP maps. NITL covers it with
+`NITL_WP=1` (an empty partitioned map with a grid equal to the world's and a marker actor per cell, built
+headless by `UMusubiNitlWpMapCommandlet`; the servers' logs show which markers are streamed in per lease). Mind an
+uncooked `UnrealEditor -server`: it has no WP cell packages on disk and closes a client that reports a cell visible
+which the server has not streamed in itself (`MissingLevelPackage`) — cooked servers hold every cell package and
+accept any; the harness client therefore runs with `-MusubiNitlNoWpSource` (its controller is not a streaming source).
+
 ### 6.3 Authority & handover of actors
 * Owned entity ⇄ `AActor` with `UMusubiAuthorityComponent` (id, components, `bOwned`).
   Ghosts (entities of neighbouring cells in our view) are spawned as **kinematic** actors:

@@ -48,6 +48,14 @@ public:
 	 *  and still replicate to this server's clients as simulated proxies (role swap on replicate; 5.8+: EnableReplicationOfActorsWithAnyRole).
 	 *  Off = ghosts keep ROLE_Authority like before (ask IsGhost()). Ignored on an Iris GameNetDriver before 5.8, which cannot replicate non-authority actors. */
 	UPROPERTY(Config, EditAnywhere, Category = "Actors") bool bGhostsAsSimulatedProxy = true;
+	/** World Partition on a dedicated server: this simulator is a streaming source covering its leased cells (+ margin), so the
+	 *  engine loads/unloads the map's WP cells under split/merge/handover by itself (one map for the whole world, no travel).
+	 *  Turns on wp.Runtime.EnableServerStreaming(+Out) at module start unless an ini/command line already set them. */
+	UPROPERTY(Config, EditAnywhere, Category = "World Partition") bool bWorldPartitionStreaming = true;
+	/** Extra radius (cm) streamed around each leased cell; < 0 = the world's ghost_margin (where ghosts of neighbouring cells live). */
+	UPROPERTY(Config, EditAnywhere, Category = "World Partition") float CellStreamingMargin = -1.f;
+	/** Ignore player controllers as server streaming sources (clients stream by their own controller; the server streams by its cells). */
+	UPROPERTY(Config, EditAnywhere, Category = "World Partition") bool bIgnorePlayerStreamingSources = true;
 	/** Component carrying height (cm) for actors; empty = keep the actor's Z. */
 	UPROPERTY(Config, EditAnywhere, Category = "Actors") FString HeightComponent = TEXT("z");
 };

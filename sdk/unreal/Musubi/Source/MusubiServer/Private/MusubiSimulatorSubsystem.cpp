@@ -15,6 +15,14 @@
 #include "Misc/Guid.h"
 #include "Misc/CommandLine.h"
 #include "Misc/Parse.h"
+#include "WorldPartition/WorldPartitionSubsystem.h"
+#include "GameFramework/PlayerController.h"
+#include "HttpModule.h"
+#include "GenericPlatform/GenericPlatformHttp.h"
+#include "Interfaces/IHttpRequest.h"
+#include "Interfaces/IHttpResponse.h"
+#include "Dom/JsonObject.h"
+#include "Serialization/JsonSerializer.h"
 
 // ---- lifecycle ----
 
@@ -109,7 +117,7 @@ void UMusubiSimulatorSubsystem::Start()
 		{
 			// a (re)connected stream starts with no leases: ask for the configured cells again
 			TArray<FString> Want = Weak->InitialCells;
-			for (const auto& KV : Weak->Cells) Want.AddUnique(CellKey(KV.Key));
+			for (const FMusubiCellId& C : Weak->Leased) Want.AddUnique(CellKey(C));
 			if (Want.Num()) Weak->LeaseCells(Want);
 		}
 	});
@@ -118,6 +126,7 @@ void UMusubiSimulatorSubsystem::Start()
 	Cfg.bCbor = bCbor;
 	Link->Connect(ApiBase, ServerKey, WorldName, SimId, Cfg);
 	Accum = 0;
+	NextGridFetch = 0;
 	StatsWindowStart = FPlatformTime::Seconds();
 	PostActorTickHandle = FWorldDelegates::OnWorldPostActorTick.AddUObject(this, &UMusubiSimulatorSubsystem::PreReplicateGhosts);
 	TickerHandle = FTSTicker::GetCoreTicker().AddTicker(TEXT("MusubiSimulator"), 0.0f, [Weak](float Dt) {
@@ -131,6 +140,9 @@ void UMusubiSimulatorSubsystem::Stop()
 	if (bRunning) OnStopped.Broadcast();
 	if (!bRunning) return;
 	bRunning = false;
+	UnregisterWorldPartitionSource();
+	Leased.Reset();
+	GridCellSize = GridGhostMargin = 0;
 	FWorldDelegates::OnWorldPostActorTick.Remove(PostActorTickHandle);
 	PostActorTickHandle.Reset();
 	FTSTicker::GetCoreTicker().RemoveTicker(TickerHandle);
@@ -174,6 +186,8 @@ bool UMusubiSimulatorSubsystem::EngineTick(float DeltaSeconds)
 {
 	if (!bRunning) return false;
 	if (Link.IsValid()) Link->Tick(DeltaSeconds);
+	if (GridCellSize <= 0 && FPlatformTime::Seconds() >= NextGridFetch) FetchWorldGrid();
+	UpdateWorldPartitionSource();
 	const double Step = 1.0 / (double)Hz;
 	Accum += DeltaSeconds;
 	int32 Steps = 0;
@@ -436,6 +450,7 @@ void UMusubiSimulatorSubsystem::HandleEvent(const FMusubiSimEvent& E)
 		{
 			FCell& C = Cells.FindOrAdd(E.CellAssigned->cell);
 			C.Id = E.CellAssigned->cell;
+			Leased.Add(C.Id);
 			LoadCellLevel(C);
 			OnCellChanged.Broadcast(CellKey(C.Id), true);
 		}
@@ -446,6 +461,7 @@ void UMusubiSimulatorSubsystem::HandleEvent(const FMusubiSimEvent& E)
 		const FMusubiCellId Cell = E.Tag == EMusubiSimEventTag::CellRevoked ? (E.CellRevoked.IsSet() ? E.CellRevoked->cell : FMusubiCellId())
 																			  : (E.CellReleased.IsSet() ? E.CellReleased->cell : FMusubiCellId());
 		FCell Gone;
+		Leased.Remove(Cell);
 		if (Cells.RemoveAndCopyValue(Cell, Gone))
 		{
 			TArray<FMusubiUuid> Ids = Gone.Owned.Array();
@@ -957,7 +973,7 @@ TArray<AActor*> UMusubiSimulatorSubsystem::OwnedActors() const
 TArray<FString> UMusubiSimulatorSubsystem::LeasedCells() const
 {
 	TArray<FString> Out;
-	for (const auto& KV : Cells) Out.Add(CellKey(KV.Key));
+	for (const FMusubiCellId& C : Leased) Out.Add(CellKey(C));
 	return Out;
 }
 
@@ -985,4 +1001,118 @@ void UMusubiSimulatorSubsystem::RollStats(double Now)
 	FramesThisSec = TicksThisSec = AppliesThisSec = 0;
 	StatsWindowStart = Now;
 	OnStats.Broadcast(Stats);
+}
+
+// ---- world partition: this server streams the map by its leased cells ----
+
+// The grid (cell_size, ghost_margin, three_d) is world config on the node; the stream does not carry it, so ask once at
+// start (retried every 5 s until it answers — the source is empty until then, nothing of the map is loaded by us).
+void UMusubiSimulatorSubsystem::FetchWorldGrid()
+{
+	NextGridFetch = FPlatformTime::Seconds() + 5.0;
+	const UMusubiSimulatorSettings* S = GetDefault<UMusubiSimulatorSettings>();
+	if (!S || !S->bWorldPartitionStreaming) return;
+	FString Base = ApiBase;
+	Base.RemoveFromEnd(TEXT("/"));
+	TSharedRef<IHttpRequest, ESPMode::ThreadSafe> Req = FHttpModule::Get().CreateRequest();
+	Req->SetURL(FString::Printf(TEXT("%s/v1/server/worlds/%s"), *Base, *FGenericPlatformHttp::UrlEncode(WorldName)));
+	Req->SetVerb(TEXT("GET"));
+	Req->SetHeader(TEXT("x-musubi-server-key"), ServerKey);
+	TWeakObjectPtr<UMusubiSimulatorSubsystem> Weak(this);
+	Req->OnProcessRequestComplete().BindLambda([Weak](FHttpRequestPtr, FHttpResponsePtr Resp, bool bOk) {
+		if (!Weak.IsValid() || Weak->GridCellSize > 0) return;
+		if (!bOk || !Resp.IsValid() || Resp->GetResponseCode() != 200)
+		{
+			UE_LOG(LogMusubiServer, Warning, TEXT("world grid: GET world failed (%d)"), Resp.IsValid() ? Resp->GetResponseCode() : 0);
+			return;
+		}
+		TSharedPtr<FJsonObject> Root;
+		const TSharedPtr<FJsonObject>* Cfg = nullptr;
+		double Size = 0;
+		if (!FJsonSerializer::Deserialize(TJsonReaderFactory<>::Create(Resp->GetContentAsString()), Root) || !Root.IsValid() ||
+			!Root->TryGetObjectField(TEXT("config"), Cfg) || !Cfg || !(*Cfg)->TryGetNumberField(TEXT("cell_size"), Size) || Size <= 0)
+		{
+			UE_LOG(LogMusubiServer, Warning, TEXT("world grid: no config.cell_size in the world reply"));
+			return;
+		}
+		Weak->GridCellSize = Size;
+		(*Cfg)->TryGetNumberField(TEXT("ghost_margin"), Weak->GridGhostMargin);
+		(*Cfg)->TryGetBoolField(TEXT("three_d"), Weak->bGridThreeD);
+		UE_LOG(LogMusubiServer, Log, TEXT("world grid: cell_size=%.0f ghost_margin=%.0f three_d=%d"), Size, Weak->GridGhostMargin, (int)Weak->bGridThreeD);
+	});
+	Req->ProcessRequest();
+}
+
+FBox UMusubiSimulatorSubsystem::BoundsOf(const FMusubiCellId& C) const
+{
+	if (GridCellSize <= 0) return FBox(ForceInit);
+	const double Side = GridCellSize / (double)(1u << C.level);
+	const FVector Min((double)C.x * Side, (double)C.y * Side, bGridThreeD ? (double)C.z * Side : 0.0);
+	return FBox(Min, Min + FVector(Side, Side, bGridThreeD ? Side : 0.0));
+}
+
+FBox UMusubiSimulatorSubsystem::CellBounds(const FString& Cell) const
+{
+	FMusubiCellId C;
+	return ParseCell(Cell, C) ? BoundsOf(C) : FBox(ForceInit);
+}
+
+// One source with a sphere per leased cell (shapes are in source space; the source sits at the origin, unrotated):
+// the half diagonal of the cell plus the margin where this server's ghosts of the neighbours live. Activated, so the
+// WP cells are added to the world (actors ticking, replicating), not merely loaded.
+bool UMusubiSimulatorSubsystem::GetStreamingSource(FWorldPartitionStreamingSource& Out) const
+{
+	if (GridCellSize <= 0 || Leased.IsEmpty()) return false;
+	const UMusubiSimulatorSettings* S = GetDefault<UMusubiSimulatorSettings>();
+	const double Margin = S && S->CellStreamingMargin >= 0.f ? (double)S->CellStreamingMargin : GridGhostMargin;
+	Out.Name = TEXT("MusubiCells");
+	Out.Location = FVector::ZeroVector;
+	Out.Rotation = FRotator::ZeroRotator;
+	Out.TargetState = EStreamingSourceTargetState::Activated;
+	Out.Priority = EStreamingSourcePriority::High;
+	Out.bBlockOnSlowLoading = false;
+	for (const FMusubiCellId& C : Leased)
+	{
+		const FBox B = BoundsOf(C);
+		FStreamingSourceShape& Shape = Out.Shapes.AddDefaulted_GetRef();
+		Shape.bUseGridLoadingRange = false;
+		Shape.Location = B.GetCenter();
+		Shape.Radius = (float)(B.GetExtent().Size() + Margin);
+	}
+	return true;
+}
+
+void UMusubiSimulatorSubsystem::UpdateWorldPartitionSource()
+{
+	const UMusubiSimulatorSettings* S = GetDefault<UMusubiSimulatorSettings>();
+	UWorld* W = GetWorld();
+	if (!S || !S->bWorldPartitionStreaming || !W || W->GetNetMode() == NM_Client) return;
+	UWorldPartitionSubsystem* WPS = W->GetSubsystem<UWorldPartitionSubsystem>();
+	if (!WPS || WpSubsystem.Get() == WPS) return;
+	UnregisterWorldPartitionSource(); // a previous world's subsystem (travel)
+	WPS->RegisterStreamingSourceProvider(this);
+	WpSubsystem = WPS;
+	// clients stream by their own controller; on the server a controller as a source would pull cells by player position
+	// rather than by lease — unless the project already filters providers itself
+	if (S->bIgnorePlayerStreamingSources && !WPS->OnIsStreamingSourceProviderFiltered().IsBound())
+	{
+		WPS->OnIsStreamingSourceProviderFiltered().BindLambda([](const IWorldPartitionStreamingSourceProvider* P) {
+			const UObject* Owner = P ? P->GetStreamingSourceOwner() : nullptr;
+			return Owner && Owner->IsA<APlayerController>();
+		});
+		bWpFilterBound = true;
+	}
+	UE_LOG(LogMusubiServer, Log, TEXT("world partition: simulator registered as the streaming source (world %s, partitioned=%d)"),
+		*W->GetName(), (int)(W->GetWorldPartition() != nullptr));
+}
+
+void UMusubiSimulatorSubsystem::UnregisterWorldPartitionSource()
+{
+	if (UWorldPartitionSubsystem* WPS = WpSubsystem.Get())
+	{
+		WPS->UnregisterStreamingSourceProvider(this);
+		if (bWpFilterBound) WPS->OnIsStreamingSourceProviderFiltered().Unbind();
+	}
+	WpSubsystem.Reset();
+	bWpFilterBound = false;
 }
