@@ -5735,6 +5735,13 @@ impl WorldRegistry {
             let mut outcomes = st.world.advance();
             outcomes.extend(st.world.detect_handovers());
             drain_admission(st);
+            // an entity with an open engine connection is a player: touch it before decay and
+            // hibernation look at the tick — `advance` may have skipped ticks after a stall
+            for (id, conns) in &st.net_sessions {
+                if !conns.is_empty() {
+                    st.world.keep_awake(*id);
+                }
+            }
             decay_entities(st);
             if self.is_split(&name) {
                 let (hosted_only, home_node) = (st.hosted_only, st.home_node);
@@ -5891,11 +5898,6 @@ impl WorldRegistry {
             for (id, prev, now) in rehome {
                 tracing::info!(entity = %id, from = %prev, to = %now, "relayed entity changed owner outside a handover; re-homing its clients");
                 net_rehome(st, &name, id, prev, Some(now));
-            }
-            for (id, conns) in &st.net_sessions {
-                if !conns.is_empty() {
-                    st.world.keep_awake(*id);
-                }
             }
             st.controller.observe(&st.world);
             if st.world.tick % CONTROL_EVERY == 0 {
