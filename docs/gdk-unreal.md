@@ -578,10 +578,21 @@ Module `MusubiNet` (runtime, all tiers: the driver uses only classic `UNetDriver
   kinematic body, hence after), `PutRigidBodyToSleep`/`WakeRigidBody`, `BreakConstraint` for the broken ones.
   Ghosts apply `q` with the position every frame they are updated. Welded children ride in the root; per-bone
   states of skeletal bodies are out of scope (the root body is what crosses the border).
-- Roles (done as designed): an owned actor is `ROLE_Authority`; a ghost is `ROLE_Authority` for the local
-  driver too (it must replicate to this server's clients, 9.2), so `AActor::HasAuthority()` stays
-  engine-true on both and cannot tell them apart. The one rule a project learns: simulation authority is
-  `UMusubiAuthorityComponent::IsOwned()` / `IsGhost()`; clients get the same answer from the replicated
+- Roles: an owned actor is `ROLE_Authority`; a ghost is `ROLE_SimulatedProxy` with `RemoteRole =
+  ROLE_Authority` (`UMusubiAuthorityComponent::ApplyNetRole`, on bind and on every ownership flip), so
+  `AActor::HasAuthority()` is false on it for every Blueprint and third-party plugin, CharacterMovement runs
+  its simulated tick, and a Server RPC called on a ghost is `Remote` → routed to the owner by the mesh
+  driver (9.4). It still replicates to this server's clients (9.2): `UNetDriver::SetRoleSwapOnReplicate`
+  swaps the pair for the duration of `ServerReplicateActors`, so the wire carries (Authority, SimulatedProxy)
+  exactly like an owned actor and the client sees a plain simulated proxy either way. Before 5.8 the engine
+  calls `PreReplication` (ReplicatedMovement, Character's movement mode/base) only on authority, so the
+  simulator calls it itself for ghosts after the actor tick (`OnWorldPostActorTick`, before `TickFlush`);
+  5.8+ enables `EnableReplicationOfActorsWithAnyRole` on the server driver instead, which also makes the
+  Iris GameNetDriver accept ghosts — on 5.3–5.7 an Iris GameNetDriver keeps ghosts at `ROLE_Authority` (the
+  engine bridge drops non-authority actors), as does `bGhostsAsSimulatedProxy = false`. Replicated
+  subobjects are registered before the role drops (`AddReplicatedSubObject` checks `HasAuthority()`;
+  BeginPlay runs inside SpawnActor, before Bind). Simulation authority is still what
+  `UMusubiAuthorityComponent::IsOwned()` / `IsGhost()` say; clients get the same answer from the replicated
   `bNetOwned` (and the entity from `NetEntityId`).
 
 ### 9.6 Order and proof
@@ -705,7 +716,7 @@ private to `AActor` (`FSubObjectRegistry`, reachable only through an engine-priv
 them with Musubi explicitly — `Authority->RegisterMusubiSubObject(Obj)` (Blueprint-callable, `Unregister…` to drop).
 A registered object is exported and applied exactly like a replicated component, keyed by its name, so the contract
 is: give it a stable name under the actor (`NewObject<ULoadout>(this, TEXT("Loadout"))`), create and register it on
-every *server* side (BeginPlay runs on the ghost too, `HasAuthority()` is true on both), and set
+every *server* side (BeginPlay runs on the ghost too, still as authority — the role drops after Bind), and set
 `bReplicateUsingRegisteredSubObjectList = true` so the classic driver ships it to clients — a client must not create
 its own (the replicated instance would land beside a local empty one): keep the pointer in a replicated UPROPERTY
 and register it in the RepNotify if the client reads it through the registry too. A replicated UPROPERTY that points

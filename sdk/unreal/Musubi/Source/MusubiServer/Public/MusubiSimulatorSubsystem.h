@@ -7,6 +7,7 @@
 
 #include "CoreMinimal.h"
 #include "Containers/Ticker.h"
+#include "Engine/EngineBaseTypes.h"
 #include "Subsystems/GameInstanceSubsystem.h"
 #include "MusubiSimWire.generated.h"
 #include "MusubiSimStream.h"
@@ -163,6 +164,8 @@ private:
 
 	TSharedPtr<FMusubiSimStream> Link;
 	FTSTicker::FDelegateHandle TickerHandle;
+	FDelegateHandle PostActorTickHandle;
+	void PreReplicateGhosts(UWorld* W, ELevelTick TickType, float DeltaSeconds);
 	FMusubiUuid SimId;
 	bool bRunning = false;
 	FString ApiBase, ServerKey, WorldName;

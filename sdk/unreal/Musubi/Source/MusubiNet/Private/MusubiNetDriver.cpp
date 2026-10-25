@@ -22,6 +22,8 @@
 #include "IPAddress.h"
 #include "MusubiNetConnection.h"
 #include "MusubiSimulatorSubsystem.h"
+#include "MusubiSimulatorSettings.h"
+#include "Runtime/Launch/Resources/Version.h"
 #include "MusubiSocket.h"
 #include "MusubiSubsystem.h"
 #include "MusubiWire.generated.h"
@@ -69,6 +71,10 @@ UMusubiNetDriver::UMusubiNetDriver(const FObjectInitializer& ObjectInitializer)
 
 bool UMusubiNetDriver::InitBase(bool bInitAsClient, FNetworkNotify* InNotify, const FURL& URL, bool bReuseAddressAndPort, FString& Error)
 {
+#if ENGINE_MAJOR_VERSION > 5 || ENGINE_MINOR_VERSION >= 8
+	// ghosts are ROLE_SimulatedProxy on the server (UMusubiAuthorityComponent::ApplyNetRole); the Iris bridge reads this once at init
+	if (!bInitAsClient && GetDefault<UMusubiSimulatorSettings>()->bGhostsAsSimulatedProxy) EnableReplicationOfActorsWithAnyRole(true);
+#endif
 	return Super::InitBase(bInitAsClient, InNotify, URL, bReuseAddressAndPort, Error);
 }
 

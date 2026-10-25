@@ -97,6 +97,9 @@ public:
 	void Bind(class UMusubiSimulatorSubsystem* Owner, const FMusubiUuid& Id, const FMusubiCellId& InCell, bool bIsOwned);
 	void SetCell(const FMusubiCellId& InCell) { Cell = InCell; }
 	void SetOwned(bool bIsOwned);
+	/** Owned → ROLE_Authority, ghost → ROLE_SimulatedProxy (+ role swap on replicate); see UMusubiSimulatorSettings::bGhostsAsSimulatedProxy. */
+	void ApplyNetRole(bool bIsOwned);
+	static bool GhostRoleDowngradeEnabled(const AActor* A);
 	void SetInHandover(bool b) { bInHandover = b; }
 	/** From the node: only versions newer than what we have are applied; returns true when something changed. */
 	bool ApplyFromNode(const FMusubiWorldEntity& E);

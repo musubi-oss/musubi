@@ -5,6 +5,10 @@
 #include "Components/PrimitiveComponent.h"
 #include "GameFramework/Actor.h"
 #include "Net/UnrealNetwork.h"
+#include "Engine/NetDriver.h"
+#include "Engine/World.h"
+#include "MusubiSimulatorSettings.h"
+#include "Runtime/Launch/Resources/Version.h"
 #include "PhysicsEngine/PhysicsConstraintComponent.h"
 
 UMusubiAuthorityComponent::FMusubiOnClientEntityIdentified UMusubiAuthorityComponent::OnClientEntityIdentified;
@@ -114,11 +118,47 @@ void UMusubiAuthorityComponent::Bind(UMusubiSimulatorSubsystem* Owner, const FMu
 	OnServerEntityBound.Broadcast(this);
 }
 
+bool UMusubiAuthorityComponent::GhostRoleDowngradeEnabled(const AActor* A)
+{
+	const UMusubiSimulatorSettings* S = GetDefault<UMusubiSimulatorSettings>();
+	if (!S || !S->bGhostsAsSimulatedProxy || !A) return false;
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION < 8
+	// before 5.8 the engine Iris bridge only replicates ROLE_Authority actors (no EnableReplicationOfActorsWithAnyRole)
+	const UWorld* W = A->GetWorld();
+	const UNetDriver* D = W ? W->GetNetDriver() : nullptr;
+#if UE_WITH_IRIS
+	if (D && D->GetReplicationSystem()) return false;
+#endif
+#endif
+	return true;
+}
+
+// RemoteRole has no public setter (SetRemoteRoleForBackwardsCompat is protected, ExchangeNetRoles is one-way), so write the
+// property the way UNetDriver itself finds it.
+static void SetRemoteRoleOf(AActor* A, ENetRole R)
+{
+	static FProperty* P = FindFProperty<FProperty>(AActor::StaticClass(), TEXT("RemoteRole"));
+	if (P) *P->ContainerPtrToValuePtr<uint8>(A) = (uint8)R;
+}
+
+void UMusubiAuthorityComponent::ApplyNetRole(bool bIsOwned)
+{
+	AActor* A = GetOwner();
+	if (!A || !A->GetIsReplicated() || !GhostRoleDowngradeEnabled(A)) return;
+	// ghost: Role=SimulatedProxy / RemoteRole=Authority — HasAuthority() is false for every Blueprint and plugin, and the swap on
+	// replicate sends it to this server's clients as (Role=Authority, RemoteRole=SimulatedProxy), the same as an owned actor
+	A->SetRole(bIsOwned ? ROLE_Authority : ROLE_SimulatedProxy);
+	SetRemoteRoleOf(A, bIsOwned ? ROLE_SimulatedProxy : ROLE_Authority);
+	if (UNetDriver* D = A->GetNetDriver()) D->SetRoleSwapOnReplicate(A, !bIsOwned);
+	A->ForceNetUpdate();
+}
+
 void UMusubiAuthorityComponent::SetOwned(bool bIsOwned)
 {
 	if (bOwned == bIsOwned) return;
 	bOwned = bIsOwned;
 	bNetOwned = bIsOwned;
+	ApplyNetRole(bIsOwned);
 	SetPhysicsEnabled(bIsOwned);
 	OnAuthorityChanged.Broadcast(bIsOwned);
 }

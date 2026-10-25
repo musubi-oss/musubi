@@ -192,6 +192,18 @@ case "$H" in *"changes=0 live=1") echo "PASS nitl-c: entity handle resolves to t
 # replicated components in the binary iris state: the ghost on s2 saw the inventory before owning, the new owner carried on from it
 EXPC=$(grep -o "first binary iris state exported ([0-9]* component" "$OUT/nitl-s1.log" | head -1 | grep -o "[0-9]*")
 if [ "${EXPC:-0}" -ge 1 ]; then echo "PASS nitl-s1: replicated components exported in the iris state ($EXPC)"; else echo "FAIL nitl-s1: replicated components exported in the iris state (${EXPC:-0})"; ok=0; fi
+# ghost roles: on the receiving server the entity is a ghost first (ROLE_SimulatedProxy=1, HasAuthority()=0), then the owner (ROLE_Authority=3, 1); on s1 the owner has authority
+GR=$(grep "nitl: server pawn .* id=$ENTITY owned=0 role=" "$OUT/$S2LOG.log" | grep -o "role=[0-9]* auth=[0-9]*" | tail -1)
+OR=$(grep "nitl: server pawn .* id=$ENTITY owned=1 role=" "$OUT/$S2LOG.log" | grep -o "role=[0-9]* auth=[0-9]*" | tail -1)
+S1R=$(grep "nitl: server pawn .* id=$ENTITY owned=1 role=" "$OUT/nitl-s1.log" | grep -o "role=[0-9]* auth=[0-9]*" | head -1)
+if [ -n "$GR" ]; then
+  if [ "$GR" = "role=1 auth=0" ]; then echo "PASS $S2LOG: ghost is ROLE_SimulatedProxy without authority ($GR)"; else echo "FAIL $S2LOG: ghost is ROLE_SimulatedProxy without authority ($GR)"; ok=0; fi
+else echo "SKIP $S2LOG: ghost role check (no ghost phase)"; fi
+if [ "$OR" = "role=3 auth=1" ]; then echo "PASS $S2LOG: owner has ROLE_Authority after the handover ($OR)"; else echo "FAIL $S2LOG: owner has ROLE_Authority after the handover (${OR:-none})"; ok=0; fi
+if [ "$S1R" = "role=3 auth=1" ]; then echo "PASS nitl-s1: owner has ROLE_Authority before the handover ($S1R)"; else echo "FAIL nitl-s1: owner has ROLE_Authority before the handover (${S1R:-none})"; ok=0; fi
+S1G=$(grep "nitl: server pawn .* id=$ENTITY owned=0 role=" "$OUT/nitl-s1.log" | grep -o "role=[0-9]* auth=[0-9]*" | tail -1)
+if [ "$S1G" = "role=1 auth=0" ]; then echo "PASS nitl-s1: old owner became a ROLE_SimulatedProxy ghost after the handover ($S1G)"; else echo "FAIL nitl-s1: old owner became a ROLE_SimulatedProxy ghost after the handover (${S1G:-none})"; ok=0; fi
+case "$VER" in 5.8*) ;; *) chk "$S2LOG" "ghost PreReplication as SimulatedProxy";; esac
 if [ "$JOIN" = 1 ]; then echo "SKIP nitl-s: inventory / iris-seed / subobject-seed checks (the node-spawned avatar carries no NITL seed; the client did see the new owner's FastArray and subobject above)"; else
 GINV=$(grep "nitl: server pawn .* id=$ENTITY owned=0 " "$OUT/$S2LOG.log" | grep -o "inv=[0-9]* gold=[0-9]*" | tail -1)
 GHOW="ghost received the inventory component via iris"

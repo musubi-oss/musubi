@@ -6,6 +6,8 @@
 #include "MusubiServerModule.h"
 #include "MusubiJson.h"
 #include "Containers/Ticker.h"
+#include "Engine/NetDriver.h"
+#include "Runtime/Launch/Resources/Version.h"
 #include "Engine/GameInstance.h"
 #include "Engine/World.h"
 #include "GameFramework/Actor.h"
@@ -117,6 +119,7 @@ void UMusubiSimulatorSubsystem::Start()
 	Link->Connect(ApiBase, ServerKey, WorldName, SimId, Cfg);
 	Accum = 0;
 	StatsWindowStart = FPlatformTime::Seconds();
+	PostActorTickHandle = FWorldDelegates::OnWorldPostActorTick.AddUObject(this, &UMusubiSimulatorSubsystem::PreReplicateGhosts);
 	TickerHandle = FTSTicker::GetCoreTicker().AddTicker(TEXT("MusubiSimulator"), 0.0f, [Weak](float Dt) {
 		return Weak.IsValid() ? Weak->EngineTick(Dt) : false;
 	});
@@ -128,6 +131,8 @@ void UMusubiSimulatorSubsystem::Stop()
 	if (bRunning) OnStopped.Broadcast();
 	if (!bRunning) return;
 	bRunning = false;
+	FWorldDelegates::OnWorldPostActorTick.Remove(PostActorTickHandle);
+	PostActorTickHandle.Reset();
 	FTSTicker::GetCoreTicker().RemoveTicker(TickerHandle);
 	TickerHandle.Reset();
 	if (Link.IsValid()) { Link->Close(); Link.Reset(); }
@@ -140,6 +145,30 @@ void UMusubiSimulatorSubsystem::Stop()
 }
 
 // ---- loop ----
+
+// Before 5.8 AActor::CallPreReplication runs PreReplication (ReplicatedMovement, Character's replicated movement mode/base)
+// only for ROLE_Authority, so a SimulatedProxy ghost would freeze on this server's clients: call it ourselves after the actor
+// tick and before the net driver's TickFlush, with the roles swapped the way ServerReplicateActors will see them. 5.8+ does
+// this itself once EnableReplicationOfActorsWithAnyRole is on (UMusubiNetDriver::InitBase).
+void UMusubiSimulatorSubsystem::PreReplicateGhosts(UWorld* W, ELevelTick, float)
+{
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION < 8
+	if (!W || W != GetWorld()) return;
+	UNetDriver* D = W->GetNetDriver();
+	if (!D || !D->IsServer()) return;
+	static bool bLogged = false;
+	for (auto& KV : Entities)
+	{
+		if (KV.Value.bOwned) continue;
+		AActor* A = KV.Value.Actor.Get();
+		if (!A || A->GetLocalRole() != ROLE_SimulatedProxy || !A->GetIsReplicated()) continue;
+		A->SetRole(ROLE_Authority);
+		A->CallPreReplication(D);
+		A->SetRole(ROLE_SimulatedProxy);
+		if (!bLogged) { bLogged = true; UE_LOG(LogMusubiServer, Log, TEXT("ghost PreReplication as SimulatedProxy: %s (%s)"), *A->GetName(), *KV.Key.ToString()); }
+	}
+#endif
+}
 
 bool UMusubiSimulatorSubsystem::EngineTick(float DeltaSeconds)
 {

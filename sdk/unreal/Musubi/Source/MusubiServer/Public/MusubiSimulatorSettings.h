@@ -44,6 +44,10 @@ public:
 	UPROPERTY(Config, EditAnywhere, Category = "Actors") TSoftClassPtr<AActor> OwnedActorClass;
 	/** Actor spawned for ghosts (entities of neighbouring cells, kinematic). Empty = same as OwnedActorClass. */
 	UPROPERTY(Config, EditAnywhere, Category = "Actors") TSoftClassPtr<AActor> GhostActorClass;
+	/** Ghosts live as ROLE_SimulatedProxy on this server (HasAuthority() false, CharacterMovement in simulated mode, Server RPCs routed to the owner)
+	 *  and still replicate to this server's clients as simulated proxies (role swap on replicate; 5.8+: EnableReplicationOfActorsWithAnyRole).
+	 *  Off = ghosts keep ROLE_Authority like before (ask IsGhost()). Ignored on an Iris GameNetDriver before 5.8, which cannot replicate non-authority actors. */
+	UPROPERTY(Config, EditAnywhere, Category = "Actors") bool bGhostsAsSimulatedProxy = true;
 	/** Component carrying height (cm) for actors; empty = keep the actor's Z. */
 	UPROPERTY(Config, EditAnywhere, Category = "Actors") FString HeightComponent = TEXT("z");
 };
