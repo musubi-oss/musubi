@@ -12,6 +12,9 @@ AActor* FMusubiEntityHandle::Get(const UObject* WorldContext) const
 	return R ? R->Resolve(EntityId) : nullptr;
 }
 
+const FName UMusubiEntityRegistry::IrisNetFactoryName(TEXT("MusubiActor"));
+const FName UMusubiEntityRegistry::IrisSubObjectFactoryName(TEXT("MusubiSubObject"));
+
 UMusubiEntityRegistry* UMusubiEntityRegistry::Get(const UObject* WorldContext)
 {
 	UWorld* W = GEngine ? GEngine->GetWorldFromContextObject(WorldContext, EGetWorldErrorMode::ReturnNull) : nullptr;
@@ -72,4 +75,32 @@ void UMusubiEntityRegistry::Unregister(const FString& EntityId, AActor* Actor)
 {
 	TWeakObjectPtr<AActor>* P = Actors.Find(EntityId);
 	if (P && (!P->IsValid() || P->Get() == Actor)) Actors.Remove(EntityId);
+}
+
+AActor* UMusubiEntityRegistry::RehomeKeptPlayerActor(const UClass* Cls) const
+{
+	if (!bRehoming || !Cls) return nullptr;
+	for (AActor* A : { RehomeKeptPC.Get(), RehomeKeptPS.Get() })
+		if (IsValid(A) && A->IsA(Cls)) return A;
+	return nullptr;
+}
+
+void UMusubiEntityRegistry::SetRehoming(bool bOn)
+{
+	bRehoming = bOn;
+	IrisKept = 0; IrisReused = 0;
+	if (!bOn) { RehomeKeptPC.Reset(); RehomeKeptPS.Reset(); }
+}
+
+void UMusubiEntityRegistry::SetRehomeKeptPlayer(AActor* PC, AActor* PS)
+{
+	RehomeKeptPC = PC;
+	RehomeKeptPS = PS;
+}
+
+void UMusubiEntityRegistry::NoteRehomeKeptPlayerReused(const AActor* A)
+{
+	if (A && A == RehomeKeptPC.Get()) RehomeKeptPC.Reset();
+	if (A && A == RehomeKeptPS.Get()) RehomeKeptPS.Reset();
+	++IrisReused;
 }

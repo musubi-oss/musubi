@@ -1,4 +1,5 @@
 #include "MusubiNitlPawn.h"
+#include "Misc/EngineVersionComparison.h"
 #include "TimerManager.h"
 #include "MusubiNitlInventoryComponent.h"
 #include "MusubiNitlLoadout.h"
@@ -10,6 +11,10 @@
 #include "Engine/NetDriver.h"
 #include "Engine/NetConnection.h"
 #include "Engine/World.h"
+#include "MusubiEntityRegistry.h"
+#if UE_WITH_IRIS && ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 7
+#include "Net/Iris/ReplicationSystem/EngineReplicationBridge.h"
+#endif
 #include "Misc/CommandLine.h"
 #include "Misc/Parse.h"
 
@@ -108,3 +113,11 @@ void AMusubiNitlPawn::OnRep_Steps()
 		UE_LOG(LogMusubiNitl, Log, TEXT("client sees %s (%s) at %.0f,%.0f steps=%d push=%d owned=%d"), *GetName(), Authority ? *Authority->NetEntityId : TEXT("?"), L.X, L.Y, Steps, PushSteps, Authority ? (int)Authority->bNetOwned : -1);
 	}
 }
+
+#if UE_WITH_IRIS && ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 7
+void AMusubiNitlPawn::FillReplicationParams(const FFillReplicationParamsContext& Context, FActorReplicationParams& OutParams)
+{
+	Super::FillReplicationParams(Context, OutParams);
+	OutParams.NetFactoryName = UMusubiEntityRegistry::IrisNetFactoryName;
+}
+#endif

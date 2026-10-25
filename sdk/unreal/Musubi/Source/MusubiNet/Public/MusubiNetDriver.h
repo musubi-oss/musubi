@@ -63,6 +63,7 @@ public:
 protected:
 	/** Client: the entity moved to another simulator. Default: travel to the same URL (`TRAVEL_Absolute`), i.e. a reconnect; projects override for an in-place restart. */
 	virtual void OnRehome(const FMusubiServerMessageNetRehome& Msg);
+	virtual bool ShouldClientDestroyActor(AActor* Actor, EChannelCloseReason CloseReason) const override;
 	int32 Rehomes = 0, Adopted = 0, Reused = 0;
 	// FNetworkNotify: owns the control channel during an in-place rehome, forwards everything else to the world
 	virtual EAcceptConnection::Type NotifyAcceptingConnection() override { return WorldNotify ? WorldNotify->NotifyAcceptingConnection() : EAcceptConnection::Reject; }

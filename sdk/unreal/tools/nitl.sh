@@ -7,6 +7,7 @@
 #   NITL_PROJECT=target/ue/demo-5.8.4/MusubiThirdPerson NITL_MAP=/Game/ThirdPerson/Lvl_ThirdPerson NITL_SPAWN_Z=300 \
 #     tools/nitl.sh 5.8.4 [seconds]      # the same run on the Third Person demo (after tools/demo-build.sh 5.8.4)
 #   NITL_LOGCMDS_EXTRA=", LogWebSockets VeryVerbose" tools/nitl.sh 5.8.4   # extra -LogCmds for the UE processes
+#   NITL_IRIS=1 NITL_JOIN=1 tools/nitl.sh 5.7.4   # relay driver on Iris: same pawn/PC/PS/subobject across the rehome (9.2)
 set -euo pipefail
 VER="${1:?engine version, e.g. 5.3.2}"; DUR="${2:-90}"
 ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
@@ -22,6 +23,9 @@ JOIN="${NITL_JOIN:-0}"
 # NITL_ENCRYPT=1: AES-256-GCM on the relayed engine connections through the standard PacketHandler chain (-MusubiNitlEncrypt
 # keys both ends; the client travels with ?EncryptionToken=, every owner acks it, the rehome re-keys with the new owner).
 ENCRYPT="${NITL_ENCRYPT:-0}"; ENCARG=""; [ "$ENCRYPT" = 1 ] && ENCARG="-MusubiNitlEncrypt"
+# NITL_IRIS=1: the relay GameNetDriver (client <-> owning server) runs Iris replication on every UE process
+# (bCanUseIris=true is in the HostProject's NetDriverDefinitions; the cvar decides at driver creation).
+IRIS="${NITL_IRIS:-0}"; IRISARG=""; [ "$IRIS" = 1 ] && IRISARG="-ini:Engine:[SystemSettings]:net.Iris.UseIrisReplication=1 -ini:Engine:[SystemSettings]:net.SubObjects.DefaultUseSubObjectReplicationList=1"
 CHAOS="${NITL_CHAOS:-0}"; NAMES="nitl-s1 nitl-s2 nitl-c"; [ "$CHAOS" = 1 ] && NAMES="nitl-s1 nitl-s2 nitl-c nitl-c2 nitl-s2b"
 # NITL_PROJECT=<dir of a built project incl. Plugins/Musubi> + NITL_MAP=<map>: run the same scenario on another project
 # (the Third Person demo, phase 9g-9: `tools/demo-build.sh <ver>` then NITL_PROJECT=target/ue/demo-<ver>/MusubiThirdPerson).
@@ -68,7 +72,7 @@ ue() { # name, extra args...
   docker run -d --name "$N" --network host -u "$(id -u):$(id -g)" -e HOME="/out/home-$N" -v "$OUT:/out" "${MOUNT[@]}" "$IMG" \
     /home/ue4/UnrealEngine/Engine/Binaries/Linux/UnrealEditor "$UPATH" "$MAP" \
     -unattended -nosplash -nullrhi -NoSound -stdout -FullStdOutLogOutput -log -LogCmds="LogMusubiServer VeryVerbose, LogMusubiNet Verbose, LogMusubiMesh Verbose, LogNet Verbose${NITL_LOGCMDS_EXTRA:-}" \
-    -MusubiApi="$API" -MusubiKey="$KEY" -MusubiWorld="$WORLD" $ENCARG "$@" >/dev/null
+    -MusubiApi="$API" -MusubiKey="$KEY" -MusubiWorld="$WORLD" $ENCARG $IRISARG "$@" >/dev/null
 }
 # NITL_WP=1: a World Partition map built headless by the plugin's commandlet (grid = the world's cell size, a marker actor
 # per cell along x); the servers stream it by their leases, the client by its controller — one map, no travel on rehome.
@@ -214,14 +218,19 @@ if [ "${EXPC:-0}" -ge 1 ]; then echo "PASS nitl-s1: replicated components export
 GR=$(grep "nitl: server pawn .* id=$ENTITY owned=0 role=" "$OUT/$S2LOG.log" | grep -o "role=[0-9]* auth=[0-9]*" | tail -1)
 OR=$(grep "nitl: server pawn .* id=$ENTITY owned=1 role=" "$OUT/$S2LOG.log" | grep -o "role=[0-9]* auth=[0-9]*" | tail -1)
 S1R=$(grep "nitl: server pawn .* id=$ENTITY owned=1 role=" "$OUT/nitl-s1.log" | grep -o "role=[0-9]* auth=[0-9]*" | head -1)
-if [ -n "$GR" ]; then
+# on the Iris driver before 5.8 ghosts stay ROLE_Authority (the engine replicates authority actors only; EnableReplicationOfActorsWithAnyRole is 5.8+)
+GHOSTROLE=1; if [ "$IRIS" = 1 ]; then case "$VER" in 5.8*) ;; *) GHOSTROLE=0;; esac; fi
+if [ "$GHOSTROLE" = 0 ]; then echo "SKIP $S2LOG: ghost role checks (Iris driver before 5.8: ghosts keep ROLE_Authority)"
+elif [ -n "$GR" ]; then
   if [ "$GR" = "role=1 auth=0" ]; then echo "PASS $S2LOG: ghost is ROLE_SimulatedProxy without authority ($GR)"; else echo "FAIL $S2LOG: ghost is ROLE_SimulatedProxy without authority ($GR)"; ok=0; fi
 else echo "SKIP $S2LOG: ghost role check (no ghost phase)"; fi
 if [ "$OR" = "role=3 auth=1" ]; then echo "PASS $S2LOG: owner has ROLE_Authority after the handover ($OR)"; else echo "FAIL $S2LOG: owner has ROLE_Authority after the handover (${OR:-none})"; ok=0; fi
 if [ "$S1R" = "role=3 auth=1" ]; then echo "PASS nitl-s1: owner has ROLE_Authority before the handover ($S1R)"; else echo "FAIL nitl-s1: owner has ROLE_Authority before the handover (${S1R:-none})"; ok=0; fi
 S1G=$(grep "nitl: server pawn .* id=$ENTITY owned=0 role=" "$OUT/nitl-s1.log" | grep -o "role=[0-9]* auth=[0-9]*" | tail -1)
-if [ "$S1G" = "role=1 auth=0" ]; then echo "PASS nitl-s1: old owner became a ROLE_SimulatedProxy ghost after the handover ($S1G)"; else echo "FAIL nitl-s1: old owner became a ROLE_SimulatedProxy ghost after the handover (${S1G:-none})"; ok=0; fi
-case "$VER" in 5.8*) ;; *) chk "$S2LOG" "ghost PreReplication as SimulatedProxy";; esac
+if [ "$GHOSTROLE" = 1 ]; then
+  if [ "$S1G" = "role=1 auth=0" ]; then echo "PASS nitl-s1: old owner became a ROLE_SimulatedProxy ghost after the handover ($S1G)"; else echo "FAIL nitl-s1: old owner became a ROLE_SimulatedProxy ghost after the handover (${S1G:-none})"; ok=0; fi
+  case "$VER" in 5.8*) ;; *) chk "$S2LOG" "ghost PreReplication as SimulatedProxy";; esac
+fi
 if [ "$WP" = 1 ] && [ "$CHAOS" != 1 ]; then
   # servers: WP streaming on, and the streamed-in markers follow the lease — s2 (cell 1,0 + margin) has 1,0 and not 11,0,
   # s1 (0,0) has 0,0 and not 11,0; nothing is loaded for cells nobody leases. The engine adds its own server extra radius

@@ -7,6 +7,7 @@
 #include "GameFramework/PlayerState.h"
 #include "Engine/PackageMapClient.h"
 #include "MusubiAuthorityComponent.h"
+#include "MusubiEntityRegistry.h"
 #include "Runtime/Launch/Resources/Version.h"
 #include "Net/DataChannel.h"
 #include "Engine/ActorChannel.h"
@@ -330,13 +331,27 @@ void UMusubiNetDriver::OnRehome(const FMusubiServerMessageNetRehome& Msg)
 	// (HandleClientPlayer re-links Player/NetConnection when the new owner's bunch re-attaches)
 	Old->OwningActor = nullptr;
 	Old->PlayerController = nullptr;
+	// Iris: the engine detaches every replicated actor with the connection; the Musubi factory keeps entity actors while
+	// the registry says we are rehoming (the new owner re-attaches to them by entity id), ShouldClientDestroyActor keeps
+	// the player's controller/state
+	UMusubiEntityRegistry* Reg = UMusubiEntityRegistry::Get(W);
+	if (Reg) { Reg->SetRehoming(true); Reg->SetRehomeKeptPlayer(LocalPC, LocalPS); Reg->SetKeepingOnDetach(true); }
 	Old->CleanUp();
+	if (Reg) Reg->SetKeepingOnDetach(false);
 	check(ServerConnection == nullptr);
 	// the new owner numbers its NetGUIDs independently of the old one: with the old cache its GUIDs resolve to our old
 	// actors ("open bunch for a torn off actor") — start the cache over
 	GuidCache = TSharedPtr<FNetGUIDCache>(new FNetGUIDCache(this));
 	UMusubiNetConnection* Conn = NewObject<UMusubiNetConnection>(GetTransientPackage(), static_cast<UClass*>(NetConnectionClass));
 	ServerConnection = Conn;
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 7
+	// the new owner is another replication system: its NetRefHandles, exported paths and string tokens are numbered
+	// independently of the old one's, so the client's Iris system starts over too (actors stay: Shutdown only detaches
+	// instance protocols). Same sequence the engine uses in TryUpgradeNetworkFeatures. After ServerConnection is set:
+	// CreateReplicationSystem(!IsServer()) decides client/authority by it; before InitLocalConnection: InitBase joins
+	// the connection to the current system.
+	if (IsUsingIrisReplication()) RestartIrisSystem();
+#endif
 	Conn->InitLocalConnection(this, nullptr, ClientURL, USOCK_Pending);
 	Conn->Opened(ConnId, OldMaxPacket);
 	CreateInitialClientChannels();
@@ -434,11 +449,15 @@ void UMusubiNetDriver::FinishRehome(bool bOk, const FString& Why)
 	const bool bWas = bRehoming;
 	bRehoming = false;
 	if (WorldNotify) { Notify = WorldNotify; WorldNotify = nullptr; }
+	UMusubiEntityRegistry* Reg = UMusubiEntityRegistry::Get(GetWorld());
+	const int32 IrisKept = Reg ? Reg->IrisKeptCount() : 0;
 	if (bOk)
 	{
-		UE_LOG(LogMusubiNet, Log, TEXT("rehomed in place (%s), %d actors kept for adoption"), *Why, TornOff.Num());
+		// Iris: the registry's rehome window stays open until the new owner's controller/state arrived (TickDispatch)
+		UE_LOG(LogMusubiNet, Log, TEXT("rehomed in place (%s), %d actors kept for adoption"), *Why, TornOff.Num() + IrisKept);
 		return;
 	}
+	if (Reg) Reg->SetRehoming(false);
 	UE_LOG(LogMusubiNet, Warning, TEXT("in-place rehome failed (%s)%s"), *Why, bWas ? TEXT(": travelling") : TEXT(": reconnecting"));
 	TornOff.Reset();
 	if (GEngine)
@@ -642,6 +661,21 @@ void UMusubiNetDriver::TickDispatch(float DeltaTime)
 		UE_LOG(LogMusubiNet, Warning, TEXT("rehome: no NetGUID table from the new owner within %.1fs, joining without it (kept actors will be swapped)"), GuidTableTimeout);
 		SendJoin(ServerConnection);
 	}
+	{
+		// Iris reuse window: closes once the new owner's controller/state took the kept ones (or replaced them), or on timeout
+		UMusubiEntityRegistry* Reg = bRehoming ? nullptr : UMusubiEntityRegistry::Get(GetWorld());
+		if (Reg && Reg->IsRehoming())
+		{
+			UWorld* W = GetWorld();
+			APlayerController* PC = W ? W->GetFirstPlayerController() : nullptr;
+			const bool bSettled = !Reg->RehomeKeptPlayerPending() || (PC && KeptPC.IsValid() && PC != KeptPC.Get());
+			if (bSettled || FPlatformTime::Seconds() - RehomeStarted > 2.0 * RehomeTimeout)
+			{
+				UE_LOG(LogMusubiNet, Log, TEXT("rehome: %d actors kept, %d reused in place (Iris)"), Reg->IrisKeptCount(), Reg->IrisReusedCount());
+				Reg->SetRehoming(false);
+			}
+		}
+	}
 	if (bRehoming && FPlatformTime::Seconds() - RehomeStarted > RehomeTimeout) FinishRehome(false, TEXT("timeout"));
 	else if (!bRehoming && TornOff.Num() && FPlatformTime::Seconds() - RehomeStarted > 2.0 * RehomeTimeout)
 	{
@@ -733,4 +767,17 @@ void UMusubiNetDriver::LowLevelDestroy()
 	ByConn.Reset();
 	Inbox.Reset();
 	Super::LowLevelDestroy();
+}
+
+bool UMusubiNetDriver::ShouldClientDestroyActor(AActor* Actor, EChannelCloseReason CloseReason) const
+{
+	// in-place rehome (Iris): the engine detaches the player's controller/state and the entity actors with the old
+	// connection; they stay for the new owner (classic closes their channels as dormant instead, see OnRehome)
+	if (bRehoming && Actor)
+	{
+		if (Actor == KeptPC.Get() || Actor == KeptPS.Get()) return false;
+		if (const UMusubiAuthorityComponent* Auth = Actor->FindComponentByClass<UMusubiAuthorityComponent>())
+			if (!Auth->NetEntityId.IsEmpty()) return false;
+	}
+	return Super::ShouldClientDestroyActor(Actor, CloseReason);
 }

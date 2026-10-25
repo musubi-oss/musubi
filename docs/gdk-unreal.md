@@ -542,6 +542,46 @@ Module `MusubiNet` (runtime, all tiers: the driver uses only classic `UNetDriver
   `ReplicationBridgeClassName` stays the engine default (`UEngineReplicationBridge`). `net.Iris.UseIrisReplication`
   and `UGameInstance::GetDesiredReplicationSystem` keep their engine meaning. Nothing in the project's gameplay
   code changes: `HasAuthority()`, `Role`, `GetLifetimeReplicatedProps`, RPC macros all behave as on `UIpNetDriver`.
+- **Iris on path A (5.7+, verified 5.7.4 / 5.8.4 with `NITL_IRIS=1`).** With `bCanUseIris=true` and
+  `net.Iris.UseIrisReplication=1` (+ `net.SubObjects.DefaultUseSubObjectReplicationList=1`, Iris requires it) the
+  relay driver runs the engine's `UEngineReplicationBridge` unchanged; what Musubi adds is two factories on top of the
+  engine's (`MusubiIrisImpl/MusubiActorFactory.h`, `MusubiSubObjectFactory.h`):
+  - `UMusubiActorFactory : UNetActorFactory` (name `MusubiActor` = `UMusubiEntityRegistry::IrisNetFactoryName`): the
+    engine's dynamic-actor creation header plus the entity id (1 bit + 16 bytes when the actor has an authority
+    component). On the client `InstantiateReplicatedObjectFromHeader` first asks `UMusubiEntityRegistry` for the
+    entity's actor — same class → that `AActor*` is handed to the engine (no spawn); a `PlayerController`/`PlayerState`
+    header during a rehome gets the client's kept controller/state the same way; otherwise `Super` spawns exactly as
+    `UNetActorFactory` does (archetype, spawn info, `OnActorChannelOpen` custom data, roles, `BeginPlay`).
+  - `UMusubiSubObjectFactory : UNetSubObjectFactory` (`MusubiSubObject`): a dynamic (registered, non-component)
+    subobject of a kept actor is matched to the instance the actor already owns — same outer, same class, not yet
+    attached to the new replication system (the client never registers subobjects itself, so the owner's list cannot
+    be used) — ambiguity (two of the same class under one outer) falls back to creating a new one with a warning.
+    Components are stable-named and the engine resolves them by path anyway.
+  - Both are the bridge's defaults: `Config/DefaultEngine.ini` `[/Script/Engine.EngineReplicationBridge]
+    ActorFactoryName=MusubiActor / SubObjectFactoryName=MusubiSubObject`; because engine-module CDOs read config
+    before plugin ini files are merged, `FMusubiIrisModule::StartupModule` re-reads the CDO's config and, if the names
+    are still the engine's, sets ours (a project that configured another factory keeps it). A project that does not
+    want the default returns `UMusubiEntityRegistry::IrisNetFactoryName` from `AActor::FillReplicationParams`
+    (`AMusubiNitlPawn` shows it) for the actors that should rehome in place.
+  - Rehome under Iris (`UMusubiNetDriver::OnRehome`): no NetGUID table is involved. The old connection's `CleanUp`
+    detaches every replicated object; inside that call the registry's *keeping-on-detach* scope is open, so the
+    factories' `DetachedFromReplication` keep entity actors, the kept controller/state and their subobjects (the engine
+    would destroy them; `UMusubiNetDriver::ShouldClientDestroyActor` says no for the same set on 5.8's
+    `ShouldClientDestroyActor` path). Then `RestartIrisSystem()` — the new owner numbers its `NetRefHandle`s, exported
+    paths and string tokens independently, so the client's `UReplicationSystem` starts over (actors stay: `Shutdown`
+    only detaches instance protocols); it must run after `ServerConnection` is set (`CreateReplicationSystem(!IsServer())`
+    decides client vs authority by it) and before the new connection's `InitBase` (which joins the current system).
+    The *reuse window* (`UMusubiEntityRegistry::IsRehoming`) stays open past `FinishRehome` until the new owner's
+    controller/state were taken from the kept ones (or replaced them) or `2 × RehomeTimeout`; kept actors the new owner
+    never re-sends are not destroyed by Musubi — they were detached as usual and simply have no owner (the classic
+    path's "dropped stale twin" sweep is NetGUID-table driven and does not run).
+  - What the harness proves (`NITL_IRIS=1 NITL_JOIN=1 tools/nitl.sh <ver>`): same pawn, controller, state and
+    `MusubiNitlLoadout` instances before/after the rehome, the client-local timer on the pawn keeps counting, movement
+    continues from the new owner, no protocol mismatch / stale-token / export errors; the log line is
+    `rehome: N actors kept, M reused in place (Iris)`.
+  - Not covered: 5.5/5.6 (`UNetActorFactory` subclassing is compiled only for 5.7+; the relay driver stays classic
+    there), classic ↔ Iris mixed owners (both servers of one world must run the same replication system — the
+    engine negotiates per connection, the client would re-create everything on a mismatch).
 - **Ghosts to clients.** A client connected to server S sees S's owned actors by normal replication. Entities
   owned by other servers reach the client either through the world view (today) or, with
   `UMusubiSimulatorSettings::bReplicateGhosts = true` (default), as actors S replicates too: ghosts are

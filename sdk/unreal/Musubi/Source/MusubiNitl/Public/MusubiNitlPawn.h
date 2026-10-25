@@ -1,6 +1,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "Misc/EngineVersionComparison.h"
 #include "GameFramework/Character.h"
 #include "MusubiNitlPawn.generated.h"
 
@@ -16,6 +17,10 @@ public:
 	virtual void EndPlay(const EEndPlayReason::Type Reason) override;
 	virtual void PossessedBy(AController* NewController) override;
 	virtual void GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const override;
+#if UE_WITH_IRIS && ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 7
+	/** Iris: replicate through the Musubi NetObjectFactory (created by entity id on clients, same actor across a rehome). */
+	virtual void FillReplicationParams(const FFillReplicationParamsContext& Context, FActorReplicationParams& OutParams) override;
+#endif
 
 	UPROPERTY(VisibleAnywhere, Category = "Musubi") TObjectPtr<class UMusubiAuthorityComponent> Authority;
 	UPROPERTY(VisibleAnywhere, Category = "Musubi")
