@@ -2782,7 +2782,7 @@ checksum = "743fb55ba31b18fb1ecef6bdc9aa2743314978ac084044301a7eee33fb99a20d"
 
 [[package]]
 name = "musubi-account"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "musubi-core",
  "regex",
@@ -2795,7 +2795,7 @@ dependencies = [
 
 [[package]]
 name = "musubi-actor"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "musubi-core",
  "musubi-proto",
@@ -2808,7 +2808,7 @@ dependencies = [
 
 [[package]]
 name = "musubi-auth"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "argon2",
  "base64 0.22.1",
@@ -2832,7 +2832,7 @@ dependencies = [
 
 [[package]]
 name = "musubi-chat"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "musubi-core",
  "musubi-proto",
@@ -2847,7 +2847,7 @@ dependencies = [
 
 [[package]]
 name = "musubi-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -2874,7 +2874,7 @@ dependencies = [
 
 [[package]]
 name = "musubi-cluster"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "base64 0.22.1",
  "hex",
@@ -2900,7 +2900,7 @@ dependencies = [
 
 [[package]]
 name = "musubi-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "base64 0.22.1",
  "chacha20poly1305",
@@ -2918,7 +2918,7 @@ dependencies = [
 
 [[package]]
 name = "musubi-economy"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "hex",
  "musubi-core",
@@ -2934,7 +2934,7 @@ dependencies = [
 
 [[package]]
 name = "musubi-edge"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "dashmap",
@@ -2944,7 +2944,7 @@ dependencies = [
 
 [[package]]
 name = "musubi-fleet"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "axum",
  "dashmap",
@@ -2967,7 +2967,7 @@ dependencies = [
 
 [[package]]
 name = "musubi-idl"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -2977,7 +2977,7 @@ dependencies = [
 
 [[package]]
 name = "musubi-integrations"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "base64 0.22.1",
  "jsonwebtoken",
@@ -2999,7 +2999,7 @@ dependencies = [
 
 [[package]]
 name = "musubi-leaderboard"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "chrono-tz",
@@ -3015,7 +3015,7 @@ dependencies = [
 
 [[package]]
 name = "musubi-matchmaker"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "musubi-core",
  "musubi-proto",
@@ -3027,7 +3027,7 @@ dependencies = [
 
 [[package]]
 name = "musubi-mesh"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ahash",
  "base64 0.22.1",
@@ -3042,7 +3042,7 @@ dependencies = [
 
 [[package]]
 name = "musubi-proto"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "criterion",
@@ -3056,7 +3056,7 @@ dependencies = [
 
 [[package]]
 name = "musubi-quic-ffi"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "musubi-transport",
@@ -3070,7 +3070,7 @@ dependencies = [
 
 [[package]]
 name = "musubi-runtime"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "musubi-core",
  "musubi-idl",
@@ -3084,7 +3084,7 @@ dependencies = [
 
 [[package]]
 name = "musubi-server"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "aes",
  "anyhow",
@@ -3168,7 +3168,7 @@ dependencies = [
 
 [[package]]
 name = "musubi-sim-sdk"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "futures",
  "musubi-mesh",
@@ -3185,7 +3185,7 @@ dependencies = [
 
 [[package]]
 name = "musubi-social"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "musubi-account",
  "musubi-core",
@@ -3198,7 +3198,7 @@ dependencies = [
 
 [[package]]
 name = "musubi-storage"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "base64 0.22.1",
  "hex",
@@ -3214,7 +3214,7 @@ dependencies = [
 
 [[package]]
 name = "musubi-transport"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "axum",
  "bytes",
@@ -3238,7 +3238,7 @@ dependencies = [
 
 [[package]]
 name = "musubi-unreal-gen"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "proc-macro2",
