@@ -391,6 +391,12 @@ pub struct WorldConfig {
     /// here yet. `None`: the project spawns avatars itself and `world_join` only finds them.
     #[serde(default)]
     pub player_spawn: Option<PlayerSpawn>,
+    /// Level (map asset) per cell for engines that build the world from level instances
+    /// (`"x,y"` → asset path, `"*"` = every cell without its own entry). Simulators load the
+    /// levels of their leased cells plus the ring around them, clients the ones around their
+    /// avatar, so a handover never needs a map travel. Empty: the engine's own config decides.
+    #[serde(default)]
+    pub levels: BTreeMap<String, String>,
 }
 
 /// Avatar template for `world_join`: components it starts with, where it appears, whether it
@@ -457,6 +463,7 @@ impl Default for WorldConfig {
             unload_after_ticks: 0,
             replicas: 1,
             repl_keyframe_ticks: 60,
+            levels: BTreeMap::new(),
         }
     }
 }

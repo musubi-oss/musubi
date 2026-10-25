@@ -58,6 +58,20 @@ if [ "$JOIN" = 1 ]; then
   JX=$((${NITL_CELL:-256} - 40)); JZ="${NITL_SPAWN_Z:-0}"
   WBODY="{\"name\":\"$WORLD\",\"config\":{\"player_spawn\":{\"components\":{\"z\":$JZ},\"points\":[{\"x\":$JX,\"y\":100,\"z\":0}],\"persistent\":false}}}"
 fi
+# NITL_LEVELS=1: multi-map world as level instances — one small map per cell built headless by the plugin's commandlet,
+# listed in the world's `levels` config; servers stream their leased cells + the ring, the client the cells around its
+# pawn (UMusubiNetDriver::CellLevelRadius); same persistent map everywhere, no travel on handover / rehome.
+LEVELS="${NITL_LEVELS:-0}"
+if [ "$LEVELS" = 1 ]; then
+  [ "${NITL_WP:-0}" = 1 ] && { echo "NITL_LEVELS and NITL_WP are exclusive"; exit 1; }
+  echo "== cell levels"
+  docker run --rm --network none -u "$(id -u):$(id -g)" -e HOME="/out/home" -v "$OUT:/out" "$IMG" \
+    /home/ue4/UnrealEngine/Engine/Binaries/Linux/UnrealEditor-Cmd "/out/HostProject/$UPROJ" -run=MusubiNitlCellMap -Cell="${NITL_CELL:-256}" -Count=12 \
+    -unattended -nosplash -nullrhi -NoSound -stdout -FullStdOutLogOutput > "$OUT/cellmap.log" 2>&1 || { echo "cell map commandlet failed"; grep -i "error\|cellmap" "$OUT/cellmap.log" | tail -20; exit 1; }
+  [ -f "$PROJ/Content/NitlCell_1_0.umap" ] || { echo "cell levels not written"; grep -i "cellmap\|error" "$OUT/cellmap.log" | tail -20; exit 1; }
+  echo "cell levels: $(grep -o 'cellmap: .*' "$OUT/cellmap.log" | tail -1)"
+  WBODY=$(python3 -c "import json,sys; d=json.loads(sys.argv[1]); d.setdefault('config',{})['levels']={'%d,0'%i: '/Game/NitlCell_%d_0'%i for i in range(12)}; print(json.dumps(d))" "$WBODY")
+fi
 curl -fsS -X POST "$API/v1/server/worlds" -H "x-musubi-server-key: $KEY" -H 'content-type: application/json' -d "$WBODY" > "$OUT/world.json"
 CELL=$(python3 -c "import json,sys;d=json.load(open('$OUT/world.json'));print(int(d.get('config',d).get('cell_size',1000)))")
 echo "cell_size=$CELL"
@@ -241,6 +255,15 @@ S1G=$(grep "nitl: server pawn .* id=$ENTITY owned=0 role=" "$OUT/nitl-s1.log" | 
 if [ "$GHOSTROLE" = 1 ]; then
   if [ "$S1G" = "role=1 auth=0" ]; then echo "PASS nitl-s1: old owner became a ROLE_SimulatedProxy ghost after the handover ($S1G)"; else echo "FAIL nitl-s1: old owner became a ROLE_SimulatedProxy ghost after the handover (${S1G:-none})"; ok=0; fi
   case "$VER" in 5.8*) ;; *) chk "$S2LOG" "ghost PreReplication as SimulatedProxy";; esac
+fi
+if [ "$LEVELS" = 1 ]; then
+  # servers: the leased cell and the ring around it, nothing further; the client: the spawn cell, then the next one as it walks
+  chk nitl-s1 "cell level 0,0 loaded"; chk nitl-s1 "cell level 1,0 loaded"
+  if grep -q "cell level 3,0 loaded" "$OUT/nitl-s1.log"; then echo "FAIL nitl-s1: cell level 3,0 loaded (outside its ring)"; ok=0; else echo "PASS nitl-s1: no level outside the leased ring"; fi
+  chk "$S2LOG" "cell level 1,0 loaded"; chk "$S2LOG" "cell level 2,0 loaded"
+  chk nitl-c "cell levels: 12 entries (node)"; chk nitl-c "cell level 0,0 loaded"; chk nitl-c "cell level 1,0 loaded"
+  if grep -q "cell level 0,0 unloaded \[view\]" "$OUT/nitl-c.log"; then echo "PASS nitl-c: spawn cell level unloaded once out of range"; else echo "NOTE nitl-c: spawn cell level still in range at the end (walk shorter than 2 cells)"; fi
+  if grep -q "in-place rehome failed\|new owner runs level" "$OUT/nitl-c.log"; then echo "FAIL nitl-c: travelled on rehome with cell levels"; ok=0; else echo "PASS nitl-c: no travel with cell levels"; fi
 fi
 if [ "$WP" = 1 ] && [ "$CHAOS" != 1 ]; then
   # servers: WP streaming on, and the streamed-in markers follow the lease — s2 (cell 1,0 + margin) has 1,0 and not 11,0,

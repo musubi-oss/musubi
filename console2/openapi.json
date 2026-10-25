@@ -1761,6 +1761,9 @@
           "cell_size": {
             "type": "number"
           },
+          "levels": {
+            "type": "object"
+          },
           "contact_colocate_after_ticks": {
             "type": "integer"
           },

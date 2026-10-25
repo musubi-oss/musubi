@@ -37,6 +37,7 @@ void UMusubiSimulatorSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 
 void UMusubiSimulatorSubsystem::Deinitialize()
 {
+	CellLevels.UnloadAll();
 	Stop();
 	Super::Deinitialize();
 }
@@ -451,7 +452,7 @@ void UMusubiSimulatorSubsystem::HandleEvent(const FMusubiSimEvent& E)
 			FCell& C = Cells.FindOrAdd(E.CellAssigned->cell);
 			C.Id = E.CellAssigned->cell;
 			Leased.Add(C.Id);
-			LoadCellLevel(C);
+			RefreshCellLevels(TEXT("cell assigned"));
 			OnCellChanged.Broadcast(CellKey(C.Id), true);
 		}
 		break;
@@ -467,7 +468,7 @@ void UMusubiSimulatorSubsystem::HandleEvent(const FMusubiSimEvent& E)
 			TArray<FMusubiUuid> Ids = Gone.Owned.Array();
 			Ids.Append(Gone.Ghosts.Array());
 			for (const FMusubiUuid& Id : Ids) RemoveEntity(Id, TEXT("cell left"));
-			UnloadCellLevel(Gone);
+			RefreshCellLevels(TEXT("cell left"));
 			OnCellChanged.Broadcast(CellKey(Cell), false);
 		}
 		break;
@@ -914,37 +915,28 @@ uint64 UMusubiSimulatorSubsystem::HistoryFrom(const FMusubiUuid& Entity) const
 	return Min;
 }
 
-void UMusubiSimulatorSubsystem::LoadCellLevel(FCell& C)
+void UMusubiSimulatorSubsystem::RefreshCellLevels(const TCHAR* Why)
 {
 	const UMusubiSimulatorSettings* S = GetDefault<UMusubiSimulatorSettings>();
-	if (!S || !S->bStreamCellLevels || C.Level.IsValid()) return;
-	const TSoftObjectPtr<UWorld>* Level = S->CellLevels.Find(CellKey(C.Id));
-	if (!Level || Level->IsNull()) return;
 	UWorld* W = GetWorld();
-	if (!W) return;
-	bool bOk = false;
-	const FVector At = S->CellLevelStride > 0.f ? FVector((double)C.Id.x * S->CellLevelStride, (double)C.Id.y * S->CellLevelStride, 0.0) : FVector::ZeroVector;
-	// same signature on 5.3 and 5.7 (Engine/LevelStreamingDynamic.h); the name override keeps one instance per cell
-	ULevelStreamingDynamic* LS = ULevelStreamingDynamic::LoadLevelInstanceBySoftObjectPtr(W, *Level, At, FRotator::ZeroRotator, bOk, FString::Printf(TEXT("MusubiCell_%s"), *CellKey(C.Id).Replace(TEXT(","), TEXT("_"))));
-	if (!bOk || !LS) { UE_LOG(LogMusubiServer, Warning, TEXT("cell %s: level %s failed to load"), *CellKey(C.Id), *Level->ToString()); return; }
-	C.Level = LS;
-}
-
-void UMusubiSimulatorSubsystem::UnloadCellLevel(FCell& C)
-{
-	if (ULevelStreamingDynamic* LS = C.Level.Get())
-	{
-		LS->SetShouldBeLoaded(false);
-		LS->SetShouldBeVisible(false);
-		LS->SetIsRequestingUnloadAndRemoval(true);
-	}
-	C.Level.Reset();
+	if (!S || !S->bStreamCellLevels || !W) return;
+	CellLevels.SetFallbackLevels(S->CellLevels);
+	CellLevels.SetGrid(GridCellSize, S->CellLevelStride);
+	if (!CellLevels.HasLevels()) return;
+	TSet<FIntPoint> Owned;
+	for (const FMusubiCellId& C : Leased) Owned.Add(FIntPoint(C.x, C.y));
+	// the ring: our ghosts stand there and the next lease / an arriving handover lands there — loaded before it is needed
+	CellLevels.Want(W, FMusubiCellLevelStreamer::WithRing(Owned), Why);
 }
 
 ULevelStreamingDynamic* UMusubiSimulatorSubsystem::CellLevel(const FString& Cell) const
 {
-	for (const auto& KV : Cells) if (CellKey(KV.Key) == Cell) return KV.Value.Level.Get();
-	return nullptr;
+	int32 X = 0, Y = 0;
+	FString A, B;
+	if (!Cell.Split(TEXT(","), &A, &B)) return nullptr;
+	LexFromString(X, *A);
+	LexFromString(Y, *B);
+	return CellLevels.Instance(FIntPoint(X, Y));
 }
 
 // ---- queries / stats ----
@@ -1011,7 +1003,7 @@ void UMusubiSimulatorSubsystem::FetchWorldGrid()
 {
 	NextGridFetch = FPlatformTime::Seconds() + 5.0;
 	const UMusubiSimulatorSettings* S = GetDefault<UMusubiSimulatorSettings>();
-	if (!S || !S->bWorldPartitionStreaming) return;
+	if (!S || !(S->bWorldPartitionStreaming || S->bStreamCellLevels)) return;
 	FString Base = ApiBase;
 	Base.RemoveFromEnd(TEXT("/"));
 	TSharedRef<IHttpRequest, ESPMode::ThreadSafe> Req = FHttpModule::Get().CreateRequest();
@@ -1039,6 +1031,16 @@ void UMusubiSimulatorSubsystem::FetchWorldGrid()
 		(*Cfg)->TryGetNumberField(TEXT("ghost_margin"), Weak->GridGhostMargin);
 		(*Cfg)->TryGetBoolField(TEXT("three_d"), Weak->bGridThreeD);
 		UE_LOG(LogMusubiServer, Log, TEXT("world grid: cell_size=%.0f ghost_margin=%.0f three_d=%d"), Size, Weak->GridGhostMargin, (int)Weak->bGridThreeD);
+		const TSharedPtr<FJsonObject>* Lv = nullptr;
+		TMap<FString, FString> Levels;
+		if ((*Cfg)->TryGetObjectField(TEXT("levels"), Lv) && Lv)
+			for (const auto& KV : (*Lv)->Values) if (KV.Value.IsValid() && KV.Value->Type == EJson::String) Levels.Add(KV.Key, KV.Value->AsString());
+		if (Levels.Num() > 0)
+		{
+			UE_LOG(LogMusubiServer, Log, TEXT("world levels: %d entries from the node"), Levels.Num());
+			Weak->CellLevels.SetLevels(Levels);
+		}
+		Weak->RefreshCellLevels(TEXT("world config"));
 	});
 	Req->ProcessRequest();
 }

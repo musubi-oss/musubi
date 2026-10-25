@@ -593,6 +593,13 @@ pub enum ServerMessage {
         spawned: bool,
         x: f64,
         y: f64,
+        /// The world's grid (`WorldConfig::cell_size`); 0 from a node that predates the field.
+        #[serde(default)]
+        cell_size: f64,
+        /// `WorldConfig::levels`: the level per cell (`"x,y"` → asset path, `"*"` default) the
+        /// client streams around its avatar; empty when the engine's own config decides.
+        #[serde(default)]
+        levels: std::collections::BTreeMap<String, String>,
     },
     /// Server meshing: what changed inside the client's interest since the last delta.
     WorldDelta {

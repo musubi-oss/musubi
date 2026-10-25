@@ -1,5 +1,6 @@
 #pragma once
 
+#include "MusubiCellLevelStreamer.h"
 #include "CoreMinimal.h"
 #include "Engine/NetDriver.h"
 #include "Engine/NetworkDelegates.h"
@@ -60,6 +61,11 @@ public:
 	 *  has just adopted the entity (failover into a replacement) answers late; 1 s lost the identity there. */
 	UPROPERTY(Config)
 	float GuidTableTimeout = 3.f;
+	/** Client: radius (cm) around the view target within which the world's per-cell levels (`WorldConfig::levels`, sent
+	 *  with `world_joined`) are kept loaded as level instances; 0 = one cell size (the own cell plus the neighbours one
+	 *  cell away). Every server and client runs the same persistent map, so a rehome never needs a travel. */
+	UPROPERTY(Config)
+	float CellLevelRadius = 0.f;
 
 protected:
 	/** Client: the entity moved to another simulator. Default: travel to the same URL (`TRAVEL_Absolute`), i.e. a reconnect; projects override for an in-place restart. */
@@ -90,6 +96,9 @@ private:
 	// of spawning copies — the same AActor* survives the rehome
 	bool bGuidTableSeen = false, bJoinDeferred = false;
 	double WelcomeAt = 0;
+	FMusubiCellLevelStreamer CellLevels;
+	double NextCellLevelCheck = 0;
+	void StreamCellLevels();
 	FString PendingMap;
 	void ApplyGuidTable(const TArray<uint8>& Data);
 	void SendJoin(UNetConnection* Connection);

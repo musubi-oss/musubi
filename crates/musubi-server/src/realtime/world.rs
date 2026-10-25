@@ -5306,6 +5306,8 @@ impl WorldRegistry {
                 spawned: false,
                 x: e.pos.x,
                 y: e.pos.y,
+                cell_size: st.world.config().cell_size,
+                levels: st.world.config().levels.clone(),
             });
         }
         if self.is_split(name) {
@@ -5351,6 +5353,8 @@ impl WorldRegistry {
             spawned: true,
             x: pos.x,
             y: pos.y,
+            cell_size: st.world.config().cell_size,
+            levels: st.world.config().levels.clone(),
         })
     }
 

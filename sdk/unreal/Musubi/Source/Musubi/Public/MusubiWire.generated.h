@@ -1190,6 +1190,8 @@ struct MUSUBI_API FMusubiServerMessageWorldJoined
 	bool spawned = false;
 	double x = 0.0;
 	double y = 0.0;
+	double cell_size = 0.0;
+	TMap<FString, FString> levels;
 
 	static TSharedPtr<FJsonValue> ToJson(const FMusubiServerMessageWorldJoined& V);
 	static bool FromJson(const TSharedPtr<FJsonValue>& J, FMusubiServerMessageWorldJoined& Out);

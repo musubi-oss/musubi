@@ -3427,6 +3427,8 @@ TSharedPtr<FJsonValue> FMusubiServerMessageWorldJoined::ToJson(const FMusubiServ
 	O->SetField(TEXT("spawned"), MakeShared<FJsonValueBoolean>(V.spawned));
 	O->SetField(TEXT("x"), MakeShared<FJsonValueNumber>((double)V.x));
 	O->SetField(TEXT("y"), MakeShared<FJsonValueNumber>((double)V.y));
+	O->SetField(TEXT("cell_size"), MakeShared<FJsonValueNumber>((double)V.cell_size));
+	O->SetField(TEXT("levels"), MusubiJson::MapToJson<FString>(V.levels, [](const FString& V) { return MakeShared<FJsonValueString>(V); }));
 	return MakeShared<FJsonValueObject>(O);
 }
 
@@ -3441,6 +3443,8 @@ bool FMusubiServerMessageWorldJoined::FromJson(const TSharedPtr<FJsonValue>& J, 
 	if (TSharedPtr<FJsonValue> F = O.TryGetField(TEXT("spawned")); F.IsValid()) { { bool V0; if (F->TryGetBool(V0)) Out.spawned = V0; else bOk = false; } } else bOk = false;
 	if (TSharedPtr<FJsonValue> F = O.TryGetField(TEXT("x")); F.IsValid()) { { double V0; if (F->TryGetNumber(V0)) Out.x = V0; else bOk = false; } } else bOk = false;
 	if (TSharedPtr<FJsonValue> F = O.TryGetField(TEXT("y")); F.IsValid()) { { double V0; if (F->TryGetNumber(V0)) Out.y = V0; else bOk = false; } } else bOk = false;
+	if (TSharedPtr<FJsonValue> F = O.TryGetField(TEXT("cell_size")); F.IsValid() && !F->IsNull()) { { double V0; if (F->TryGetNumber(V0)) Out.cell_size = V0; else bOk = false; } }
+	if (TSharedPtr<FJsonValue> F = O.TryGetField(TEXT("levels")); F.IsValid() && !F->IsNull()) { { const TSharedPtr<FJsonObject>* V0O; if (F->TryGetObject(V0O)) { Out.levels.Reset(); for (const auto& V0P : (*V0O)->Values) { FString V0{}; { FString V1; if (V0P.Value->TryGetString(V1)) V0 = MoveTemp(V1); else bOk = false; } Out.levels.Add(FString(*V0P.Key), MoveTemp(V0)); } } else bOk = false; } }
 	return bOk;
 }
 
@@ -3451,6 +3455,8 @@ void FMusubiServerMessageWorldJoined::Write(FMusubiPostcardWriter& W, const FMus
 	W.Bool(V.spawned);
 	W.F64(V.x);
 	W.F64(V.y);
+	W.F64(V.cell_size);
+	W.Varint((uint64)V.levels.Num()); for (const auto& V0 : V.levels) { W.Str(V0.Key); W.Str(V0.Value); }
 }
 
 void FMusubiServerMessageWorldJoined::Read(FMusubiPostcardReader& R, FMusubiServerMessageWorldJoined& Out)
@@ -3460,6 +3466,8 @@ void FMusubiServerMessageWorldJoined::Read(FMusubiPostcardReader& R, FMusubiServ
 	Out.spawned = R.Bool();
 	Out.x = R.F64();
 	Out.y = R.F64();
+	Out.cell_size = R.F64();
+	{ uint64 V0N = R.Len(); Out.levels.Reset(); for (uint64 V0I = 0; V0I < V0N && R.Ok(); ++V0I) { FString V0K = R.Str(); FString V0{}; V0 = R.Str(); Out.levels.Add(MoveTemp(V0K), MoveTemp(V0)); } }
 }
 
 TSharedPtr<FJsonValue> FMusubiServerMessageWorldDelta::ToJson(const FMusubiServerMessageWorldDelta& V)

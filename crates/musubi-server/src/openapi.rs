@@ -2240,7 +2240,7 @@ pub fn schemas() -> Map<String, Value> {
     // worlds
     m.insert(
         "WorldConfig".into(),
-        obj(json!({ "cell_size": s("number"), "ghost_margin": s("number"), "hysteresis": s("number"), "lease_ttl_ticks": s("integer"), "handover_timeout_ticks": s("integer"), "remote_handover_timeout_ticks": s("integer"), "contact_colocate_after_ticks": s("integer"), "contact_colocate_ttl_ticks": s("integer") }), &[]),
+        obj(json!({ "cell_size": s("number"), "levels": s("object"), "ghost_margin": s("number"), "hysteresis": s("number"), "lease_ttl_ticks": s("integer"), "handover_timeout_ticks": s("integer"), "remote_handover_timeout_ticks": s("integer"), "contact_colocate_after_ticks": s("integer"), "contact_colocate_ttl_ticks": s("integer") }), &[]),
     );
     m.insert(
         "ControllerConfig".into(),

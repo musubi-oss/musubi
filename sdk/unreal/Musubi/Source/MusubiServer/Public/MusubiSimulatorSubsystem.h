@@ -6,6 +6,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "MusubiCellLevelStreamer.h"
 #include "Containers/Ticker.h"
 #include "Engine/EngineBaseTypes.h"
 #include "Subsystems/GameInstanceSubsystem.h"
@@ -145,7 +146,6 @@ private:
 		float TimeScale = 1.f;
 		bool bHibernated = false;
 		TSet<FMusubiUuid> Owned, Ghosts;
-		TWeakObjectPtr<class ULevelStreamingDynamic> Level;
 	};
 	struct FSnapshot
 	{
@@ -167,8 +167,9 @@ private:
 		const FSnapshot* Newest() const;
 	};
 	int32 HistoryTicks = 64;
-	void LoadCellLevel(FCell& C);
-	void UnloadCellLevel(FCell& C);
+	/** Level instances of the leased cells + the ring around them (node `levels`, else `CellLevels`). */
+	FMusubiCellLevelStreamer CellLevels;
+	void RefreshCellLevels(const TCHAR* Why);
 
 	TSharedPtr<FMusubiSimStream> Link;
 	FTSTicker::FDelegateHandle TickerHandle;

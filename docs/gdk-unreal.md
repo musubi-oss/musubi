@@ -222,7 +222,7 @@ simulator. It is the C++ port of `crates/musubi-sim-sdk`.
    steps Chaos with `dt × time_scale`.
 
 ### 6.2 Events → engine (`SimEvent`, all variants handled)
-`CellAssigned` (loads the cell's level instance: `UMusubiSimulatorSettings::CellLevels["x,y"]` via `ULevelStreamingDynamic::LoadLevelInstanceBySoftObjectPtr`, one instance per cell, optional `CellLevelStride` offset; unloaded with `SetIsRequestingUnloadAndRemoval` on revoke/release),
+`CellAssigned` (refreshes the cell levels — 6.2b: the leased cells plus the ring around them stay loaded as level instances; unloaded with `SetIsRequestingUnloadAndRemoval` when a revoke/release leaves them outside the ring),
 `CellRevoked/CellReleased` (unload, drop owned actors), `CellReloaded` (re-pull view), 
 `CellHibernated` (sleep: stop ticking that cell), `CellFull` (log + metric), `Queued/QueueUpdate/
 QueueAdmitted/QueueExpired` (login queue surface for ops HUD), `Decayed`, `TimeScale` (6.1.4),
@@ -255,6 +255,32 @@ headless by `UMusubiNitlWpMapCommandlet`; the servers' logs show which markers a
 uncooked `UnrealEditor -server`: it has no WP cell packages on disk and closes a client that reports a cell visible
 which the server has not streamed in itself (`MissingLevelPackage`) — cooked servers hold every cell package and
 accept any; the harness client therefore runs with `-MusubiNitlNoWpSource` (its controller is not a streaming source).
+
+### 6.2b Multi-map worlds as level instances (`WorldConfig::levels`)
+
+Different parts of a world can be different maps without a map travel anywhere: every server and
+client runs one persistent map (the empty `Entry` is enough) and the per-cell maps are loaded into it
+as level instances. The mapping lives on the node — `WorldConfig::levels` (`"x,y"` → asset path,
+`"*"` = every cell without its own entry; set at `POST /v1/server/worlds`) — so a build does not
+carry it: a simulator reads it with the grid (`GET /v1/server/worlds/{name}` → `config.levels`,
+`UMusubiSimulatorSettings::CellLevels` is the fallback while the node sends none), a client gets it
+with `world_joined` (`cell_size` + `levels`). `FMusubiCellLevelStreamer` (MusubiServer) does the
+loading on both sides with `ULevelStreamingDynamic::LoadLevelInstance` (one instance per cell,
+`MusubiCell_x_y`, optional `CellLevelStride` offset for maps authored at the origin):
+
+- simulator: wanted = leased cells + their 8 neighbours — the ring is where its ghosts stand and
+  where the next lease or an arriving handover lands, loaded before it is needed;
+- client (`UMusubiNetDriver::StreamCellLevels`, 4 Hz): wanted = the cells within
+  `CellLevelRadius` (default one cell size) of the possessed pawn / view target, first around the
+  `world_joined` spawn point. A handover or a rehome does not move the view, so nothing unloads under
+  the player; `NMT_Welcome` still compares persistent maps and only a genuinely different
+  persistent map falls back to a travel.
+
+Constraints are the engine's for level instances: the cell maps are sub-levels (no GameMode or
+WorldSettings logic of their own), lighting/navmesh live per instance, and references across cell
+maps go through Musubi entity handles, not level-local paths. NITL covers it with `NITL_LEVELS=1`
+(`MusubiNitlCellMap` commandlet builds one marker map per cell along x; the servers show only their
+ring loaded, the client streams the next cell in as it walks and never travels on the rehome).
 
 ### 6.3 Authority & handover of actors
 * Owned entity ⇄ `AActor` with `UMusubiAuthorityComponent` (id, components, `bOwned`).

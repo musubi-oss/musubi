@@ -1,9 +1,11 @@
 #include "MusubiNetDriver.h"
+#include "GameFramework/Pawn.h"
+#include "GameFramework/PlayerController.h"
+#include "MusubiSimulatorSettings.h"
 #include "Engine/NetworkDelegates.h"
 #include "Serialization/MemoryWriter.h"
 #include "Serialization/MemoryReader.h"
 #include "UObject/UObjectIterator.h"
-#include "GameFramework/PlayerController.h"
 #include "GameFramework/PlayerState.h"
 #include "Engine/PackageMapClient.h"
 #include "MusubiAuthorityComponent.h"
@@ -23,7 +25,6 @@
 #include "IPAddress.h"
 #include "MusubiNetConnection.h"
 #include "MusubiSimulatorSubsystem.h"
-#include "MusubiSimulatorSettings.h"
 #include "Runtime/Launch/Resources/Version.h"
 #include "MusubiSocket.h"
 #include "MusubiSubsystem.h"
@@ -160,6 +161,19 @@ void UMusubiNetDriver::OnWorldJoined(bool bOk, const FMusubiServerEnvelope& Repl
 	const FString Entity = J.entity.ToString();
 	ClientURL.AddOption(*FString::Printf(TEXT("entity=%s"), *Entity));
 	UE_LOG(LogMusubiNet, Log, TEXT("my avatar in %s is %s (%s) at %.1f,%.1f"), *J.world, *Entity, J.spawned ? TEXT("spawned") : TEXT("found"), J.x, J.y);
+	if (const UMusubiSimulatorSettings* S = GetDefault<UMusubiSimulatorSettings>())
+	{
+		CellLevels.SetFallbackLevels(S->CellLevels);
+		CellLevels.SetGrid(J.cell_size, S->CellLevelStride);
+	}
+	if (J.levels.Num() > 0) CellLevels.SetLevels(J.levels);
+	if (CellLevels.HasLevels())
+	{
+		UE_LOG(LogMusubiNet, Log, TEXT("cell levels: %d entries (%s), cell_size %.0f, radius %.0f"), J.levels.Num(), J.levels.Num() > 0 ? TEXT("node") : TEXT("CellLevels"), J.cell_size,
+			CellLevelRadius > 0.f ? CellLevelRadius : J.cell_size);
+		// the first set around the spawn point, before the pawn exists
+		CellLevels.Want(GetWorld(), CellLevels.CellsAround(FVector(J.x, J.y, 0.0), CellLevelRadius > 0.f ? CellLevelRadius : J.cell_size), TEXT("joined"));
+	}
 	OpenRelay(Entity);
 }
 
@@ -654,8 +668,28 @@ void UMusubiNetDriver::DrainInbox()
 			if (C->GetConnectionState() != USOCK_Closed && P.Value.Num() > 0) C->ReceivedRawPacket(P.Value.GetData(), P.Value.Num());
 }
 
+// client: keep the cell levels around the view target (the possessed pawn, else the camera) loaded; a handover / rehome
+// does not move the view, so nothing is unloaded under the player's feet
+void UMusubiNetDriver::StreamCellLevels()
+{
+	if (!ServerConnection || !CellLevels.HasLevels() || CellLevels.GetCellSize() <= 0) return;
+	const double Now = FPlatformTime::Seconds();
+	if (Now < NextCellLevelCheck) return;
+	NextCellLevelCheck = Now + 0.25;
+	UWorld* W = GetWorld();
+	APlayerController* PC = W ? W->GetFirstPlayerController() : nullptr;
+	if (!PC) return;
+	FVector At;
+	if (APawn* P = PC->GetPawn()) At = P->GetActorLocation();
+	else if (AActor* VT = PC->GetViewTarget()) At = VT->GetActorLocation();
+	else return;
+	const double R = CellLevelRadius > 0.f ? CellLevelRadius : CellLevels.GetCellSize();
+	CellLevels.Want(W, CellLevels.CellsAround(At, R), TEXT("view"));
+}
+
 void UMusubiNetDriver::TickDispatch(float DeltaTime)
 {
+	StreamCellLevels();
 	if (bJoinDeferred && ServerConnection && FPlatformTime::Seconds() - WelcomeAt > GuidTableTimeout)
 	{
 		UE_LOG(LogMusubiNet, Warning, TEXT("rehome: no NetGUID table from the new owner within %.1fs, joining without it (kept actors will be swapped)"), GuidTableTimeout);
