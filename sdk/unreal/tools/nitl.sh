@@ -218,10 +218,8 @@ if [ "${EXPC:-0}" -ge 1 ]; then echo "PASS nitl-s1: replicated components export
 GR=$(grep "nitl: server pawn .* id=$ENTITY owned=0 role=" "$OUT/$S2LOG.log" | grep -o "role=[0-9]* auth=[0-9]*" | tail -1)
 OR=$(grep "nitl: server pawn .* id=$ENTITY owned=1 role=" "$OUT/$S2LOG.log" | grep -o "role=[0-9]* auth=[0-9]*" | tail -1)
 S1R=$(grep "nitl: server pawn .* id=$ENTITY owned=1 role=" "$OUT/nitl-s1.log" | grep -o "role=[0-9]* auth=[0-9]*" | head -1)
-# on the Iris driver before 5.8 ghosts stay ROLE_Authority (the engine replicates authority actors only; EnableReplicationOfActorsWithAnyRole is 5.8+)
-GHOSTROLE=1; if [ "$IRIS" = 1 ]; then case "$VER" in 5.8*) ;; *) GHOSTROLE=0;; esac; fi
-if [ "$GHOSTROLE" = 0 ]; then echo "SKIP $S2LOG: ghost role checks (Iris driver before 5.8: ghosts keep ROLE_Authority)"
-elif [ -n "$GR" ]; then
+GHOSTROLE=1
+if [ -n "$GR" ]; then
   if [ "$GR" = "role=1 auth=0" ]; then echo "PASS $S2LOG: ghost is ROLE_SimulatedProxy without authority ($GR)"; else echo "FAIL $S2LOG: ghost is ROLE_SimulatedProxy without authority ($GR)"; ok=0; fi
 else echo "SKIP $S2LOG: ghost role check (no ghost phase)"; fi
 if [ "$OR" = "role=3 auth=1" ]; then echo "PASS $S2LOG: owner has ROLE_Authority after the handover ($OR)"; else echo "FAIL $S2LOG: owner has ROLE_Authority after the handover (${OR:-none})"; ok=0; fi

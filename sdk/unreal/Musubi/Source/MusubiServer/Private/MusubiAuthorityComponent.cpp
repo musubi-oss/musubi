@@ -122,15 +122,21 @@ bool UMusubiAuthorityComponent::GhostRoleDowngradeEnabled(const AActor* A)
 {
 	const UMusubiSimulatorSettings* S = GetDefault<UMusubiSimulatorSettings>();
 	if (!S || !S->bGhostsAsSimulatedProxy || !A) return false;
-#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION < 8
-	// before 5.8 the engine Iris bridge only replicates ROLE_Authority actors (no EnableReplicationOfActorsWithAnyRole)
-	const UWorld* W = A->GetWorld();
-	const UNetDriver* D = W ? W->GetNetDriver() : nullptr;
-#if UE_WITH_IRIS
-	if (D && D->GetReplicationSystem()) return false;
-#endif
-#endif
+	// before 5.8 the engine Iris bridge accepts only ROLE_Authority actors — but it checks once, in StartReplicatingActor
+	// (spawn / SetReplicates), so an actor that enters replication as authority and is downgraded afterwards keeps
+	// replicating (the simulator calls PreReplication for it, PreReplicateGhosts)
 	return true;
+}
+
+static bool IsIrisDriver(const AActor* A)
+{
+#if UE_WITH_IRIS
+	const UWorld* W = A ? A->GetWorld() : nullptr;
+	const UNetDriver* D = W ? W->GetNetDriver() : nullptr;
+	return D && D->GetReplicationSystem();
+#else
+	return false;
+#endif
 }
 
 // RemoteRole has no public setter (SetRemoteRoleForBackwardsCompat is protected, ExchangeNetRoles is one-way), so write the
@@ -145,11 +151,15 @@ void UMusubiAuthorityComponent::ApplyNetRole(bool bIsOwned)
 {
 	AActor* A = GetOwner();
 	if (!A || !A->GetIsReplicated() || !GhostRoleDowngradeEnabled(A)) return;
-	// ghost: Role=SimulatedProxy / RemoteRole=Authority — HasAuthority() is false for every Blueprint and plugin, and the swap on
-	// replicate sends it to this server's clients as (Role=Authority, RemoteRole=SimulatedProxy), the same as an owned actor
+	// ghost: Role=SimulatedProxy — HasAuthority() is false for every Blueprint and plugin. What this server's clients get as
+	// their Role is the wire RemoteRole: classic swaps the pair for the duration of ServerReplicateActors
+	// (SetRoleSwapOnReplicate, so the ghost's RemoteRole stays Authority as on any actor); Iris sends RemoteRole as is
+	// (FNetRoleNetSerializer dequantizes it into the client's Role, no swap) so there the ghost's RemoteRole must be
+	// SimulatedProxy — Authority would make the client's copy HasAuthority()
+	const bool bIris = IsIrisDriver(A);
 	A->SetRole(bIsOwned ? ROLE_Authority : ROLE_SimulatedProxy);
-	SetRemoteRoleOf(A, bIsOwned ? ROLE_SimulatedProxy : ROLE_Authority);
-	if (UNetDriver* D = A->GetNetDriver()) D->SetRoleSwapOnReplicate(A, !bIsOwned);
+	SetRemoteRoleOf(A, (bIsOwned || bIris) ? ROLE_SimulatedProxy : ROLE_Authority);
+	if (UNetDriver* D = A->GetNetDriver()) D->SetRoleSwapOnReplicate(A, !bIsOwned && !bIris);
 	A->ForceNetUpdate();
 }
 

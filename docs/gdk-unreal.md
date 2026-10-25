@@ -652,8 +652,13 @@ Module `MusubiNet` (runtime, all tiers: the driver uses only classic `UNetDriver
   calls `PreReplication` (ReplicatedMovement, Character's movement mode/base) only on authority, so the
   simulator calls it itself for ghosts after the actor tick (`OnWorldPostActorTick`, before `TickFlush`);
   5.8+ enables `EnableReplicationOfActorsWithAnyRole` on the server driver instead, which also makes the
-  Iris GameNetDriver accept ghosts — on 5.3–5.7 an Iris GameNetDriver keeps ghosts at `ROLE_Authority` (the
-  engine bridge drops non-authority actors), as does `bGhostsAsSimulatedProxy = false`. Replicated
+  Iris GameNetDriver accept ghosts; on 5.5–5.7 the Iris bridge checks `ROLE_Authority` only once, in
+  `StartReplicatingActor` (spawn / `SetReplicates`), so a ghost enters replication as authority and is downgraded
+  right after (the Musubi Iris factory finishes the spawn before `Bind` for that reason) and keeps replicating.
+  Roles on the wire differ per system: classic swaps the pair for the send, so a ghost keeps
+  `RemoteRole = Authority`; Iris sends `RemoteRole` as is and `FNetRoleNetSerializer` dequantizes it into the
+  client's `Role` (no swap), so under Iris a ghost is `(SimulatedProxy, SimulatedProxy)` — with `Authority` the
+  client's copy would claim authority. `bGhostsAsSimulatedProxy = false` keeps ghosts authority everywhere. Replicated
   subobjects are registered before the role drops (`AddReplicatedSubObject` checks `HasAuthority()`;
   BeginPlay runs inside SpawnActor, before Bind). Simulation authority is still what
   `UMusubiAuthorityComponent::IsOwned()` / `IsGhost()` say; clients get the same answer from the replicated

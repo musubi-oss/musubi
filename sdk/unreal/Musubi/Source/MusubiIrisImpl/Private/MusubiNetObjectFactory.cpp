@@ -104,15 +104,16 @@ void UMusubiNetObjectFactory::PostInstantiation(const FPostInstantiationContext&
 {
 	const FMusubiCreationHeader* H = static_cast<const FMusubiCreationHeader*>(Context.Header);
 	if (!Context.Instance || !H) return;
+	// finish the spawn first: before 5.8 the engine Iris bridge only starts replicating ROLE_Authority actors, Bind drops a ghost to SimulatedProxy
+	if (AActor* A = Cast<AActor>(Context.Instance))
+		if (A->IsActorInitialized() == false)
+			A->FinishSpawning(A->GetActorTransform(), true);
 	if (UMusubiAuthorityComponent* Auth = AuthorityOf(Context.Instance))
 	{
 		UWorld* World = Context.Instance->GetWorld();
 		UMusubiSimulatorSubsystem* Sim = (World && World->GetGameInstance()) ? World->GetGameInstance()->GetSubsystem<UMusubiSimulatorSubsystem>() : nullptr;
 		Auth->Bind(Sim, H->Entity, FMusubiCellId(), /*bIsOwned*/ false); // ghost until Musubi hands authority over
 	}
-	if (AActor* A = Cast<AActor>(Context.Instance))
-		if (A->IsActorInitialized() == false)
-			A->FinishSpawning(A->GetActorTransform(), true);
 }
 
 // Iris says the remote object is gone; the Musubi side mirrors despawn through the bridge's detach path.
