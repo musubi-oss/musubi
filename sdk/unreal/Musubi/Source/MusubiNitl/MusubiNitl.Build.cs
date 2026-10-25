@@ -8,7 +8,7 @@ public class MusubiNitl : ModuleRules
 	public MusubiNitl(ReadOnlyTargetRules Target) : base(Target)
 	{
 		PCHUsage = PCHUsageMode.UseExplicitOrSharedPCHs;
-		PublicDependencyModuleNames.AddRange(new string[] { "Core", "CoreUObject", "Engine", "Musubi", "MusubiServer", "MusubiNet" });
+		PublicDependencyModuleNames.AddRange(new string[] { "Core", "CoreUObject", "Engine", "PhysicsCore", "Musubi", "MusubiServer", "MusubiNet" });
 		PrivateDependencyModuleNames.AddRange(new string[] { "NetCore", "Json" });
 		// The inventory FastArray needs the UHT-generated Iris binding (UE_NET_HAS_IRIS_FASTARRAY_BINDING) or the descriptor
 		// builder drops it ("FFastArray property not registered"); same tier gate as MusubiIris.

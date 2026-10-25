@@ -112,7 +112,9 @@ S2SPAWN=""; if [ "$CHAOS" = 1 ]; then
 fi
 SZ=""; [ -n "${NITL_SPAWN_Z:-}" ] && SZ=",$NITL_SPAWN_Z" # a map with a floor (the demo): spawn height, the Entry map has none
 S1SPAWN="-MusubiNitlSpawn=$X0,100$SZ"; [ "$JOIN" = 1 ] && S1SPAWN="" # join: the node spawns the avatar from the policy
-ue nitl-s1 -server ${NITL_SERVER_EXTRA:-} -MusubiNitl=server -MusubiCells="0,0" $S1SPAWN -MusubiNitlWalk="$WALK"
+# NITL_RAGDOLL=1: s1 also spawns a server-only ragdoll (engine TutorialTPP + physics asset) 100 units before the border, kicked across it
+RAGDOLL="${NITL_RAGDOLL:-0}"; RAGARG=""; [ "$RAGDOLL" = 1 ] && RAGARG="-MusubiNitlRagdoll=$((CELL - 100)),100"
+ue nitl-s1 -server ${NITL_SERVER_EXTRA:-} -MusubiNitl=server -MusubiCells="0,0" $S1SPAWN -MusubiNitlWalk="$WALK" $RAGARG
 ue nitl-s2 -server ${NITL_SERVER_EXTRA:-} -MusubiNitl=server -MusubiCells="1,0" -MusubiNitlWalk="$WALK" $S2SPAWN
 # chaos: the second client sits on s2 (its entity is parked in cell 1,0) and must be re-homed to s2b when s2 dies. It has
 # to be connected *before* the kill, so in join mode it starts before the walking client (a cold editor takes 10-20 s to
@@ -236,7 +238,7 @@ if [ -z "$SW" ]; then echo "PASS nitl-c: no actor swapped for the new owner's co
 H=$(grep "nitl: handle " "$OUT/nitl-c.log" | tail -1 | sed 's/.*nitl: handle //')
 case "$H" in *"changes=0 live=1") echo "PASS nitl-c: entity handle resolves to the live pawn after the rehome, no actor change ($H)";; *) echo "FAIL nitl-c: entity handle resolves to the live pawn after the rehome, no actor change ($H)"; ok=0;; esac
 # replicated components in the binary iris state: the ghost on s2 saw the inventory before owning, the new owner carried on from it
-EXPC=$(grep -o "first binary iris state exported ([0-9]* component" "$OUT/nitl-s1.log" | head -1 | grep -o "[0-9]*")
+EXPC=$(grep -o "first binary iris state exported ([0-9]* component" "$OUT/nitl-s1.log" | grep -o "[0-9]*" | sort -n | tail -1) # the pawn's export; a server-only prop (NITL_RAGDOLL) exports none
 if [ "${EXPC:-0}" -ge 1 ]; then echo "PASS nitl-s1: replicated components exported in the iris state ($EXPC)"; else echo "FAIL nitl-s1: replicated components exported in the iris state (${EXPC:-0})"; ok=0; fi
 # ghost roles: on the receiving server the entity is a ghost first (ROLE_SimulatedProxy=1, HasAuthority()=0), then the owner (ROLE_Authority=3, 1); on s1 the owner has authority
 GR=$(grep "nitl: server pawn .* id=$ENTITY owned=0 role=" "$OUT/$S2LOG.log" | grep -o "role=[0-9]* auth=[0-9]*" | tail -1)
@@ -255,6 +257,16 @@ S1G=$(grep "nitl: server pawn .* id=$ENTITY owned=0 role=" "$OUT/nitl-s1.log" | 
 if [ "$GHOSTROLE" = 1 ]; then
   if [ "$S1G" = "role=1 auth=0" ]; then echo "PASS nitl-s1: old owner became a ROLE_SimulatedProxy ghost after the handover ($S1G)"; else echo "FAIL nitl-s1: old owner became a ROLE_SimulatedProxy ghost after the handover (${S1G:-none})"; ok=0; fi
   case "$VER" in 5.8*) ;; *) chk "$S2LOG" "ghost PreReplication as SimulatedProxy";; esac
+fi
+if [ "$RAGDOLL" = 1 ]; then
+  chk nitl-s1 "nitl: ragdoll .* kicked +x"
+  chk nitl-s1 "nitl: ragdoll .* owned=1 sim=[1-9]"
+  chk "$S2LOG" "bodies restored"
+  RERR=$(grep -o "bodies restored [0-9]* of [0-9]*, max pose err [0-9.]*" "$OUT/$S2LOG.log" | tail -1)
+  RN=$(echo "$RERR" | sed -n 's/bodies restored \([0-9]*\) of \([0-9]*\).*/\1 \2/p'); RE=$(echo "$RERR" | sed -n 's/.*err \([0-9.]*\)/\1/p')
+  if [ -n "$RN" ] && [ "${RN% *}" = "${RN#* }" ] && [ "${RN% *}" -gt 1 ] && awk "BEGIN{exit !($RE <= 2.0)}"; then echo "PASS $S2LOG: every ragdoll body resumed ($RERR)"; else echo "FAIL $S2LOG: ragdoll bodies ($RERR)"; ok=0; fi
+  chk "$S2LOG" "nitl: ragdoll .* owned=1 sim=[1-9]"
+  if grep -q "ragdoll assets missing" "$OUT/nitl-s1.log"; then echo "FAIL nitl-s1: ragdoll assets missing in this engine image"; ok=0; fi
 fi
 if [ "$LEVELS" = 1 ]; then
   # servers: the leased cell and the ring around it, nothing further; the client: the spawn cell, then the next one as it walks

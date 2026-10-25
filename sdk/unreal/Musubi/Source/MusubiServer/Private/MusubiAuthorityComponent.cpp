@@ -1,4 +1,5 @@
 #include "MusubiAuthorityComponent.h"
+#include "MusubiServerModule.h"
 #include "MusubiEntityRegistry.h"
 #include "MusubiSimulatorSubsystem.h"
 #include "MusubiJson.h"
@@ -9,6 +10,10 @@
 #include "Engine/World.h"
 #include "MusubiSimulatorSettings.h"
 #include "Runtime/Launch/Resources/Version.h"
+#include "Components/SkeletalMeshComponent.h"
+#include "PhysicsEngine/BodyInstance.h"
+#include "PhysicsEngine/BodySetup.h"
+#include "PhysicsEngine/ConstraintInstance.h"
 #include "PhysicsEngine/PhysicsConstraintComponent.h"
 
 UMusubiAuthorityComponent::FMusubiOnClientEntityIdentified UMusubiAuthorityComponent::OnClientEntityIdentified;
@@ -242,6 +247,88 @@ static bool QuatFromJson(const TSharedPtr<FJsonValue>& J, FQuat& Out)
 	return true;
 }
 
+
+// Multi-body actors (a ragdoll: one FBodyInstance per bone of a USkeletalMeshComponent; a compound prop: several simulating
+// primitives): every simulating body beyond the root goes over as [name, p(3), q(4), v(3), w(3), awake], pose relative to
+// the root body so the node's position of the entity stays the anchor; quantised to 0.01 cm / 1e-4 / 0.1 cm/s.
+static TSharedPtr<FJsonValue> Num(double D, double Step) { return MakeShared<FJsonValueNumber>(FMath::RoundToDouble(D / Step) * Step); }
+
+static void ForEachBody(AActor* A, UPrimitiveComponent* Root, TFunctionRef<void(const FString&, FBodyInstance*, USkeletalMeshComponent*)> Fn)
+{
+	for (UActorComponent* C : A->GetComponents())
+	{
+		if (USkeletalMeshComponent* SK = Cast<USkeletalMeshComponent>(C))
+		{
+			for (FBodyInstance* BI : SK->Bodies)
+				if (BI && BI->IsValidBodyInstance() && BI->BodySetup.IsValid()) Fn(SK->GetName() + TEXT(":") + BI->BodySetup->BoneName.ToString(), BI, SK);
+		}
+		else if (UPrimitiveComponent* PC = Cast<UPrimitiveComponent>(C); PC && PC != Root)
+			if (FBodyInstance* BI = PC->GetBodyInstance(); BI && BI->IsValidBodyInstance()) Fn(PC->GetName(), BI, nullptr);
+	}
+}
+
+static void CaptureBodies(AActor* A, UPrimitiveComponent* Root, const TSharedPtr<FJsonObject>& P, TArray<TSharedPtr<FJsonValue>>& Broken)
+{
+	const FTransform RootXf = Root->GetComponentTransform();
+	TArray<TSharedPtr<FJsonValue>> Bodies;
+	ForEachBody(A, Root, [&](const FString& Name, FBodyInstance* BI, USkeletalMeshComponent*)
+	{
+		if (!BI->IsInstanceSimulatingPhysics()) return;
+		const FTransform Rel = BI->GetUnrealWorldTransform().GetRelativeTransform(RootXf);
+		const FVector L = Rel.GetLocation(), V = BI->GetUnrealWorldVelocity(), W = BI->GetUnrealWorldAngularVelocityInRadians();
+		const FQuat Q = Rel.GetRotation();
+		TArray<TSharedPtr<FJsonValue>> R;
+		R.Add(MakeShared<FJsonValueString>(Name));
+		for (double D : { L.X, L.Y, L.Z }) R.Add(Num(D, 0.01));
+		for (double D : { Q.X, Q.Y, Q.Z, Q.W }) R.Add(Num(D, 0.0001));
+		for (double D : { V.X, V.Y, V.Z, W.X, W.Y, W.Z }) R.Add(Num(D, 0.1));
+		R.Add(MakeShared<FJsonValueBoolean>(BI->IsInstanceAwake()));
+		Bodies.Add(MakeShared<FJsonValueArray>(R));
+	});
+	if (Bodies.Num()) P->SetArrayField(TEXT("bodies"), Bodies);
+	for (UActorComponent* C : A->GetComponents())
+		if (USkeletalMeshComponent* SK = Cast<USkeletalMeshComponent>(C))
+			for (FConstraintInstance* CI : SK->Constraints)
+				if (CI && CI->IsTerminated()) Broken.Add(MakeShared<FJsonValueString>(SK->GetName() + TEXT(":") + CI->JointName.ToString()));
+}
+
+static void RestoreBodies(AActor* A, UPrimitiveComponent* Root, const TArray<TSharedPtr<FJsonValue>>& Bodies)
+{
+	const FTransform RootXf = Root->GetComponentTransform();
+	TMap<FString, FBodyInstance*> ByName;
+	TSet<USkeletalMeshComponent*> Meshes;
+	ForEachBody(A, Root, [&](const FString& Name, FBodyInstance* BI, USkeletalMeshComponent* SK) { ByName.Add(Name, BI); if (SK) Meshes.Add(SK); });
+	// a skeletal mesh switches all its bodies on at once (a ragdoll that was simulating on the old owner simulates here)
+	for (USkeletalMeshComponent* SK : Meshes)
+		for (const TSharedPtr<FJsonValue>& B : Bodies)
+		{
+			const TArray<TSharedPtr<FJsonValue>>* R = nullptr;
+			if (B.IsValid() && B->TryGetArray(R) && R && R->Num() >= 15 && (*R)[0]->AsString().StartsWith(SK->GetName() + TEXT(":"))) { if (!SK->IsSimulatingPhysics()) SK->SetAllBodiesSimulatePhysics(true); break; }
+		}
+	int32 Applied = 0;
+	double MaxErr = 0;
+	for (const TSharedPtr<FJsonValue>& B : Bodies)
+	{
+		const TArray<TSharedPtr<FJsonValue>>* R = nullptr;
+		if (!B.IsValid() || !B->TryGetArray(R) || !R || R->Num() < 15) continue;
+		FBodyInstance** Found = ByName.Find((*R)[0]->AsString());
+		if (!Found || !*Found) continue;
+		FBodyInstance* BI = *Found;
+		auto N = [&](int32 i) { return (*R)[i]->AsNumber(); };
+		const FTransform Rel(FQuat(N(4), N(5), N(6), N(7)).GetNormalized(), FVector(N(1), N(2), N(3)));
+		const FVector V(N(8), N(9), N(10)), W(N(11), N(12), N(13));
+		const FTransform Target = Rel * RootXf;
+		if (!BI->IsInstanceSimulatingPhysics()) BI->SetInstanceSimulatePhysics(true);
+		BI->SetBodyTransform(Target, ETeleportType::TeleportPhysics);
+		BI->SetLinearVelocity(V, false);
+		BI->SetAngularVelocityInRadians(W, false);
+		if ((*R)[14]->AsBool()) BI->WakeInstance(); else BI->PutInstanceToSleep();
+		MaxErr = FMath::Max(MaxErr, FVector::Dist(BI->GetUnrealWorldTransform().GetLocation(), Target.GetLocation()));
+		++Applied;
+	}
+	UE_LOG(LogMusubiServer, Log, TEXT("%s: bodies restored %d of %d, max pose err %.2f cm"), *A->GetName(), Applied, Bodies.Num(), MaxErr);
+}
+
 void UMusubiAuthorityComponent::CapturePhysicsIntoComponents()
 {
 	UPrimitiveComponent* B = Body();
@@ -267,6 +354,7 @@ void UMusubiAuthorityComponent::CapturePhysicsIntoComponents()
 		for (UActorComponent* C : A->GetComponents())
 			if (UPhysicsConstraintComponent* K = Cast<UPhysicsConstraintComponent>(C))
 				if (K->IsBroken()) Broken.Add(MakeShared<FJsonValueString>(K->GetName()));
+	if (AActor* A = GetOwner()) CaptureBodies(A, B, P, Broken);
 	if (Broken.Num()) P->SetArrayField(TEXT("broken"), Broken);
 	FMusubiJson Phys; Phys.Value = MakeShared<FJsonValueObject>(P);
 	Components.FindOrAdd(PhysicsComponent()).Value = Phys;
@@ -307,6 +395,8 @@ void UMusubiAuthorityComponent::RestorePhysicsFromComponents()
 		(*P)->TryGetBoolField(TEXT("sleep"), bSleep);
 		if (bSleep) B->PutRigidBodyToSleep(); else B->WakeRigidBody();
 	}
+	const TArray<TSharedPtr<FJsonValue>>* Bodies = nullptr;
+	if ((*P)->TryGetArrayField(TEXT("bodies"), Bodies) && Bodies && GetOwner()) RestoreBodies(GetOwner(), B, *Bodies);
 	const TArray<TSharedPtr<FJsonValue>>* Broken = nullptr;
 	if ((*P)->TryGetArrayField(TEXT("broken"), Broken) && Broken)
 		if (AActor* A = GetOwner())
@@ -315,6 +405,15 @@ void UMusubiAuthorityComponent::RestorePhysicsFromComponents()
 					if (!K->IsBroken())
 						for (const TSharedPtr<FJsonValue>& N : *Broken)
 							if (N.IsValid() && N->AsString() == K->GetName()) { K->BreakConstraint(); break; }
+	if ((*P)->TryGetArrayField(TEXT("broken"), Broken) && Broken)
+		if (AActor* A = GetOwner())
+			for (UActorComponent* C : A->GetComponents())
+				if (USkeletalMeshComponent* SK = Cast<USkeletalMeshComponent>(C))
+					for (const TSharedPtr<FJsonValue>& N : *Broken)
+					{
+						FString Mesh, Joint;
+						if (N.IsValid() && N->AsString().Split(TEXT(":"), &Mesh, &Joint) && Mesh == SK->GetName()) SK->BreakConstraint(FVector::ZeroVector, SK->GetComponentLocation(), *Joint);
+					}
 }
 
 bool UMusubiAuthorityComponent::GetPhysicsRotation(FQuat& Out) const

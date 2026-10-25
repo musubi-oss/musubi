@@ -33,7 +33,7 @@ private:
 	bool Report(float Dt);
 
 	FString Mode;
-	bool bTravelled = false, bSpawned = false;
+	bool bTravelled = false, bSpawned = false, bRagdollSpawned = false;
 	TWeakObjectPtr<class UMusubiSimulatorSubsystem> Sim;
 	TWeakObjectPtr<class UMusubiSubsystem> Client;
 	FDelegateHandle IdentifiedHandle;

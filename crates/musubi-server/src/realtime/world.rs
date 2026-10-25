@@ -266,6 +266,10 @@ struct WorldState {
     sub_cmds: HashMap<SessionId, WorldCmd>,
     /// simulator → pending events (handover requests, inputs, …)
     sim_events: HashMap<Uuid, Vec<Value>>,
+    /// Local handovers whose `handover_request` to the receiver waits for the owner's release
+    /// (its final `apply` + `handover_ack`) or `HANDOVER_RELEASE_TICKS`, so the state the
+    /// receiver resumes from is the owner's last word (velocities, per-body physics).
+    pending_requests: Vec<PendingRequest>,
     /// Engine connections relayed on an entity: (conn, client session). Learned from `net_open`
     /// and from routed packets, so the shard an entity lands on knows whom to re-home.
     net_sessions: HashMap<EntityId, Vec<(u64, SessionId)>>,
@@ -1287,6 +1291,7 @@ impl WorldRegistry {
                     controller: Controller::new(ctl),
                     subs: HashMap::new(),
                     sim_events: HashMap::new(),
+                    pending_requests: Vec::new(),
                     net_sessions: HashMap::new(),
                     net_owner: HashMap::new(),
                     net_pending: Vec::new(),
@@ -2209,6 +2214,7 @@ impl WorldRegistry {
                     controller: Controller::new(ctl),
                     subs: HashMap::new(),
                     sim_events: HashMap::new(),
+                    pending_requests: Vec::new(),
                     net_sessions: HashMap::new(),
                     net_owner: HashMap::new(),
                     net_pending: Vec::new(),
@@ -2812,6 +2818,7 @@ impl WorldRegistry {
                 controller: Controller::new(ctl),
                 subs: HashMap::new(),
                 sim_events: HashMap::new(),
+                pending_requests: Vec::new(),
                 net_sessions: HashMap::new(),
                 net_owner: HashMap::new(),
                 net_pending: Vec::new(),
@@ -5069,6 +5076,24 @@ impl WorldRegistry {
             .world
             .get(id)
             .and_then(|e| e.transit.as_ref().map(|t| (t.from, t.requested_tick)));
+        if let Some(i) = st
+            .pending_requests
+            .iter()
+            .position(|p| p.entity == id && p.from == sim && !p.released)
+        {
+            // the owner's release: its final state is in, ask the receiver now
+            push_request(st, name, i, "owner released");
+            let p = &st.pending_requests[i];
+            return Ok(HandoverAckResult {
+                outcome: HandoverOutcome::Started {
+                    entity: id,
+                    from: sim,
+                    to: p.to,
+                    group: p.group.clone(),
+                },
+                buffered_inputs: vec![],
+            });
+        }
         let (outcome, inputs) = st.world.handover_ack(sim, id).map_err(mesh_err)?;
         if let Some((from, asked)) = from {
             metrics::counter!("musubi_world_handovers_total", "world" => name.to_string())
@@ -5939,6 +5964,7 @@ impl WorldRegistry {
                 }
                 tracing::info!(world = %name, ?cell, scale, "cell time scale changed");
             }
+            flush_pending_requests(st, &name);
             for o in outcomes {
                 match o {
                     HandoverOutcome::Started {
@@ -5955,21 +5981,16 @@ impl WorldRegistry {
                             "local",
                             format!("{from} -> {to}, group {}", group.len()),
                         );
-                        let full = st.world.get(entity).map(to_wire);
-                        let parts: Vec<_> = group
-                            .iter()
-                            .filter_map(|m| st.world.get(*m).map(to_wire))
-                            .collect();
-                        push_event(
-                            st,
+                        // the receiver is asked once the owner released the entity (or after
+                        // HANDOVER_RELEASE_TICKS), so it resumes from the owner's final state
+                        st.pending_requests.push(PendingRequest {
+                            entity,
+                            from,
                             to,
-                            SimEvent::HandoverRequest {
-                                entity,
-                                from,
-                                state: full,
-                                group: parts,
-                            },
-                        );
+                            group: group.clone(),
+                            due_tick: st.world.tick + HANDOVER_RELEASE_TICKS,
+                            released: false,
+                        });
                         push_event(
                             st,
                             from,
@@ -6796,6 +6817,69 @@ fn net_rehome(st: &mut WorldState, name: &str, id: EntityId, from: Uuid, to: Opt
 fn queue_interest(q: &mut Vec<PendingInterest>, p: PendingInterest) {
     q.retain(|x| x.sid != p.sid);
     q.push(p);
+}
+
+/// Ticks the owner gets after `handover_started` to push its final state and release the entity
+/// before the receiver is asked anyway (2 ≈ 66 ms at 30 Hz: one poll of a simulator's stream).
+const HANDOVER_RELEASE_TICKS: u64 = 2;
+
+struct PendingRequest {
+    entity: EntityId,
+    from: Uuid,
+    to: Uuid,
+    group: Vec<EntityId>,
+    due_tick: u64,
+    released: bool,
+}
+
+/// `handover_request` to the receiver with the entity's current (= the owner's final) state.
+fn push_request(st: &mut WorldState, name: &str, i: usize, why: &'static str) {
+    let p = &mut st.pending_requests[i];
+    p.released = true;
+    let (entity, from, to) = (p.entity, p.from, p.to);
+    let group = p.group.clone();
+    hoj(
+        name,
+        entity,
+        st.world.tick,
+        "requested",
+        why,
+        format!("{from} -> {to}"),
+    );
+    let full = st.world.get(entity).map(to_wire);
+    let parts: Vec<_> = group
+        .iter()
+        .filter_map(|m| st.world.get(*m).map(to_wire))
+        .collect();
+    push_event(
+        st,
+        to,
+        SimEvent::HandoverRequest {
+            entity,
+            from,
+            state: full,
+            group: parts,
+        },
+    );
+}
+
+/// Pending requests whose owner did not release in time go out now; entries of handovers that
+/// ended meanwhile (ack, cancel) are dropped.
+fn flush_pending_requests(st: &mut WorldState, name: &str) {
+    let tick = st.world.tick;
+    let world = &st.world;
+    st.pending_requests.retain(|p| {
+        world
+            .get(p.entity)
+            .and_then(|e| e.transit.as_ref())
+            .is_some_and(|t| t.to == p.to)
+    });
+    for i in 0..st.pending_requests.len() {
+        let p = &st.pending_requests[i];
+        if !p.released && tick >= p.due_tick {
+            push_request(st, name, i, "release timeout");
+        }
+    }
 }
 
 fn push_event(st: &mut WorldState, sim: Uuid, ev: impl Into<Value>) {

@@ -25,6 +25,7 @@
 #include "Subsystems/SubsystemCollection.h"
 
 #include "MusubiNitlLog.h"
+#include "MusubiNitlRagdoll.h"
 
 bool UMusubiNitlSubsystem::ShouldCreateSubsystem(UObject* Outer) const
 {
@@ -43,6 +44,19 @@ void UMusubiNitlSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 		if (!S) { UE_LOG(LogMusubiNitl, Error, TEXT("nitl: no simulator subsystem")); return; }
 		Sim = S;
 		S->OnHandover.AddDynamic(this, &UMusubiNitlSubsystem::OnHandover);
+		// NITL_RAGDOLL: entities tagged `nitl.ragdoll` get the ragdoll actor, everything else the configured class
+		S->SpawnEntityActor.BindWeakLambda(this, [this](const FMusubiWorldEntity& E, bool, const FTransform& T) -> AActor*
+		{
+			UWorld* W = GetWorld();
+			if (!W) return nullptr;
+			bool bRagdoll = false;
+			for (const FMusubiWorldComponent& C : E.components) bRagdoll |= C.name == TEXT("nitl.ragdoll");
+			if (!bRagdoll) return nullptr;
+			FActorSpawnParameters SP;
+			SP.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+			SP.ObjectFlags |= RF_Transient;
+			return W->SpawnActor<AMusubiNitlRagdoll>(AMusubiNitlRagdoll::StaticClass(), T, SP);
+		});
 		S->OnCellChanged.AddDynamic(this, &UMusubiNitlSubsystem::OnCellChanged);
 	}
 	else if (Mode == TEXT("client"))
@@ -123,6 +137,26 @@ void UMusubiNitlSubsystem::OnCellChanged(const FString& Cell, bool bAssigned)
 void UMusubiNitlSubsystem::OnSimStarted()
 {
 	FString At;
+	// -MusubiNitlRagdoll=x,y (NITL_RAGDOLL=1): a server-only ragdoll kicked towards +x at twice the walk speed
+	if (FString R; FParse::Value(FCommandLine::Get(), TEXT("MusubiNitlRagdoll="), R, false) && Sim.IsValid() && !bRagdollSpawned)
+	{
+		bRagdollSpawned = true;
+		FString RX, RY;
+		float Walk = 60.f;
+		FParse::Value(FCommandLine::Get(), TEXT("MusubiNitlWalk="), Walk);
+		if (R.Split(TEXT(","), &RX, &RY))
+		{
+			TSharedRef<FJsonObject> Obj = MakeShared<FJsonObject>();
+			Obj->SetNumberField(TEXT("nitl.ragdoll"), 1);
+			Obj->SetNumberField(TEXT("nitl.kick"), 2.0 * Walk);
+			FMusubiJson Components;
+			Components.Value = MakeShared<FJsonValueObject>(Obj);
+			Sim->Spawn(FCString::Atod(*RX), FCString::Atod(*RY), Components, false, false, false, TOptional<uint64>(), [](bool bOk, const TSharedPtr<FJsonObject>& Rep)
+			{
+				UE_LOG(LogMusubiNitl, Log, TEXT("nitl: ragdoll spawn ok=%d"), (int)bOk);
+			});
+		}
+	}
 	UE_LOG(LogMusubiNitl, Log, TEXT("nitl: sim started, spawn arg present=%d"), (int)FParse::Value(FCommandLine::Get(), TEXT("MusubiNitlSpawn="), At, false));
 	if (!FParse::Value(FCommandLine::Get(), TEXT("MusubiNitlSpawn="), At, false) || !Sim.IsValid() || bSpawned) return;
 	bSpawned = true;

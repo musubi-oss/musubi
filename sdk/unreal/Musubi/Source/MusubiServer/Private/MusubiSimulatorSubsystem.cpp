@@ -395,6 +395,13 @@ void UMusubiSimulatorSubsystem::UpsertEntity(const FMusubiWorldEntity& E, const 
 		if (Auth && !bOwned && Auth->GetPhysicsRotation(Q)) A->SetActorRotation(Q, ETeleportType::TeleportPhysics);
 		if (Auth) Auth->LastSentPos = P;
 	}
+	// a local handover ends with the frame listing the entity as ours (handover_arrived is the cross-node path):
+	// resume the rigid-body state the old owner captured — root pose/velocities/sleep and every body beyond the root
+	if (Auth && bOwned && bOwnershipChanged && !Auth->GetComponentJson(TEXT("musubi.phys")).IsEmpty())
+	{
+		Auth->SetInHandover(false);
+		Auth->RestorePhysicsFromComponents();
+	}
 	if (bNew)
 	{
 		if (bOwned) OnEntitySpawned.Broadcast(E.id.ToString(), A);
@@ -523,24 +530,9 @@ void UMusubiSimulatorSubsystem::HandleEvent(const FMusubiSimEvent& E)
 			const bool bAllow = !Auth || Auth->CanRelease();
 			OnHandover.Broadcast(Id.ToString(), TEXT("request"), bAllow ? TEXT("ack") : TEXT("refused"));
 			if (!bAllow) break;
-			if (Auth)
-			{
-				// final authoritative state (incl. velocity) goes out before the ack so the receiver resumes from it
-				Auth->CapturePhysicsIntoComponents();
-				if (FEntity* En = Entities.Find(Id); En && En->Actor.IsValid())
-				{
-					FMusubiSimCommand Cmd;
-					Cmd.Tag = EMusubiSimCommandTag::Apply;
-					FMusubiSimCommandApply Ap;
-					Ap.entity = Id.ToString();
-					const FVector P = En->Actor->GetActorLocation();
-					Ap.x = P.X; Ap.y = P.Y;
-					Auth->LastSentPos = P;
-					if (TSharedPtr<FJsonObject> D = Auth->TakeDirty()) { FMusubiJson J; J.Value = MakeShared<FJsonValueObject>(D); Ap.components = J; }
-					Cmd.Apply = MoveTemp(Ap);
-					SendCommand(MoveTemp(Cmd));
-				}
-			}
+			// the request reaches the receiver (its copy is a ghost): nothing to capture here — the owner's final state
+			// comes with `handover_started` → PushFinalState → release, which the node waits for before asking us
+			if (Auth && Auth->IsOwned()) PushFinalState(Id, Auth);
 			FMusubiSimCommand Ack;
 			Ack.Tag = EMusubiSimCommandTag::HandoverAck;
 			FMusubiSimCommandHandoverAck H; H.entity = Id.ToString();
@@ -567,7 +559,22 @@ void UMusubiSimulatorSubsystem::HandleEvent(const FMusubiSimEvent& E)
 	case EMusubiSimEventTag::HandoverStarted:
 		if (E.HandoverStarted.IsSet())
 		{
-			if (UMusubiAuthorityComponent* A = FindAuthority(E.HandoverStarted->entity)) { A->CapturePhysicsIntoComponents(); A->SetInHandover(true); A->SetPhysicsEnabled(false); }
+			{
+				// our last word on the entity (pose, velocities, per-body state) goes to the node, then the release ack:
+				// the node forwards the request to the receiver only after it (or a short timeout), so the arrival state has it
+				const FMusubiUuid Id = E.HandoverStarted->entity;
+				if (UMusubiAuthorityComponent* A = FindAuthority(Id)) { PushFinalState(Id, A); A->SetInHandover(true); A->SetPhysicsEnabled(false); }
+				FMusubiSimCommand Rel;
+				Rel.Tag = EMusubiSimCommandTag::HandoverAck;
+				FMusubiSimCommandHandoverAck H; H.entity = Id.ToString();
+				Rel.HandoverAck = H;
+				SendCommand(MoveTemp(Rel), [Id](bool bOk, const TSharedPtr<FJsonObject>& R)
+				{
+					FString Err; if (!bOk && R.IsValid()) R->TryGetStringField(TEXT("error"), Err);
+					if (bOk) { UE_LOG(LogMusubiServer, Verbose, TEXT("handover release for %s: ok"), *Id.ToString()); }
+					else { UE_LOG(LogMusubiServer, Log, TEXT("handover release for %s refused: %s (node without release support?)"), *Id.ToString(), *Err); }
+				});
+			}
 			OnHandover.Broadcast(E.HandoverStarted->entity.ToString(), TEXT("started"), E.HandoverStarted->to.ToString());
 		}
 		break;
@@ -915,6 +922,26 @@ uint64 UMusubiSimulatorSubsystem::HistoryFrom(const FMusubiUuid& Entity) const
 	return Min;
 }
 
+
+void UMusubiSimulatorSubsystem::PushFinalState(const FMusubiUuid& Id, UMusubiAuthorityComponent* Auth)
+{
+	// final authoritative state (incl. velocity) goes out before the ack so the receiver resumes from it
+	Auth->CapturePhysicsIntoComponents();
+	if (FEntity* En = Entities.Find(Id); En && En->Actor.IsValid())
+	{
+		FMusubiSimCommand Cmd;
+		Cmd.Tag = EMusubiSimCommandTag::Apply;
+		FMusubiSimCommandApply Ap;
+		Ap.entity = Id.ToString();
+		const FVector P = En->Actor->GetActorLocation();
+		Ap.x = P.X; Ap.y = P.Y;
+		Auth->LastSentPos = P;
+		if (TSharedPtr<FJsonObject> D = Auth->TakeDirty()) { FMusubiJson J; J.Value = MakeShared<FJsonValueObject>(D); Ap.components = J; }
+		Cmd.Apply = MoveTemp(Ap);
+		SendCommand(MoveTemp(Cmd));
+	}
+}
+
 void UMusubiSimulatorSubsystem::RefreshCellLevels(const TCHAR* Why)
 {
 	const UMusubiSimulatorSettings* S = GetDefault<UMusubiSimulatorSettings>();
@@ -1034,7 +1061,7 @@ void UMusubiSimulatorSubsystem::FetchWorldGrid()
 		const TSharedPtr<FJsonObject>* Lv = nullptr;
 		TMap<FString, FString> Levels;
 		if ((*Cfg)->TryGetObjectField(TEXT("levels"), Lv) && Lv)
-			for (const auto& KV : (*Lv)->Values) if (KV.Value.IsValid() && KV.Value->Type == EJson::String) Levels.Add(KV.Key, KV.Value->AsString());
+			for (const auto& KV : (*Lv)->Values) if (KV.Value.IsValid() && KV.Value->Type == EJson::String) Levels.Add(FString(KV.Key), KV.Value->AsString()); // 5.8: FJsonObject keys are FStringType
 		if (Levels.Num() > 0)
 		{
 			UE_LOG(LogMusubiServer, Log, TEXT("world levels: %d entries from the node"), Levels.Num());

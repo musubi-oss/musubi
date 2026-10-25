@@ -170,6 +170,7 @@ private:
 	/** Level instances of the leased cells + the ring around them (node `levels`, else `CellLevels`). */
 	FMusubiCellLevelStreamer CellLevels;
 	void RefreshCellLevels(const TCHAR* Why);
+	void PushFinalState(const FMusubiUuid& Id, class UMusubiAuthorityComponent* Auth);
 
 	TSharedPtr<FMusubiSimStream> Link;
 	FTSTicker::FDelegateHandle TickerHandle;

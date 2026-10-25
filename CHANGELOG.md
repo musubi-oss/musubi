@@ -5,6 +5,14 @@ All notable changes to Musubi. The format follows [Keep a Changelog](https://kee
 ## Unreleased
 
 ### Unreal GDK
+- Handover protocol: the node asks the receiving simulator only after the owner released the entity (its final
+  `apply` + `handover_ack`, or 2 ticks), so the receiver resumes from the owner's last state; the GDK no longer
+  captures physics from its ghost on `handover_request`, and restores it on the ownership flip of a local handover
+  (previously only the cross-node `handover_arrived` path did).
+- Ragdolls across the border: `musubi.phys.bodies` carries every simulating body beyond the root (each bone of a
+  `USkeletalMeshComponent`, every simulating primitive) — pose relative to the root, velocities, awake flag,
+  quantised — and broken skeletal constraints; the new owner re-enables the bodies and applies them with
+  `SetBodyTransform` + velocities, so a ragdoll keeps falling instead of resetting. `NITL_RAGDOLL=1` covers it.
 - Multi-map worlds without travel: `WorldConfig::levels` (`"x,y"` → map asset, `"*"` default) names a level per cell; simulators stream their leased cells + the ring around them and clients the cells around their pawn (`UMusubiNetDriver::CellLevelRadius`) as level instances of one shared persistent map (`FMusubiCellLevelStreamer`), so a handover or a rehome never changes maps. `world_joined` now carries `cell_size` and `levels`; `UMusubiSimulatorSettings::CellLevels` stays as the fallback. NITL: `NITL_LEVELS=1`.
 - Client rehome: `GuidTableTimeout` (how long `NMT_Join` waits for the new owner's NetGUID table so the kept actors are reused instead of swapped) defaults to 3 s instead of 1 s — a server that has just adopted the entity after a failover answers late. NITL chaos mode (`NITL_CHAOS=1`) is green again: the second client now connects before the kill, the harness no longer dies on an empty log window, and it cleans up `nitl-c2`/`nitl-s2b`.
 - Iris on the relay driver (5.7+): with `bCanUseIris=true` + `net.Iris.UseIrisReplication=1` the client ↔ owning-server driver replicates through the engine's Iris bridge, and an in-place rehome keeps the client's objects — `UMusubiActorFactory`/`UMusubiSubObjectFactory` (engine factories + entity id) hand the new owner's pawn, PlayerController, PlayerState and dynamic subobjects to the instances the client already has instead of spawning twins; the client's `UReplicationSystem` restarts per owner (`RestartIrisSystem`). Set as the bridge's default factories by the plugin config (opt-in per actor via `FillReplicationParams` → `UMusubiEntityRegistry::IrisNetFactoryName`). `NITL_IRIS=1` runs the harness on Iris (docs/gdk-unreal.md 9.2).

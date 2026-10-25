@@ -666,8 +666,23 @@ Module `MusubiNet` (runtime, all tiers: the driver uses only classic `UNetDriver
   `RestorePhysicsFromComponents` (arrival and cancel) applies it in the order Chaos needs: rotation while still
   kinematic (`SetWorldRotation`, `TeleportPhysics`), `SetSimulatePhysics(sim)`, then velocities (ignored on a
   kinematic body, hence after), `PutRigidBodyToSleep`/`WakeRigidBody`, `BreakConstraint` for the broken ones.
-  Ghosts apply `q` with the position every frame they are updated. Welded children ride in the root; per-bone
-  states of skeletal bodies are out of scope (the root body is what crosses the border).
+  Ghosts apply `q` with the position every frame they are updated. Welded children ride in the root.
+  Protocol: `handover_started` reaches the owner, which pushes its final `apply` (position + the captured
+  components) and then a `handover_ack` as its *release*; the node forwards `handover_request` to the receiver
+  only after that release (or 2 ticks), so the state the receiver gets is the owner's last word. The receiver's
+  copy is a ghost until the frame lists the entity as owned — that ownership flip (not `handover_arrived`, which
+  is the cross-node path) runs `RestorePhysicsFromComponents`.
+- Per-bone physics (done): every simulating body beyond the root — each `FBodyInstance` of a
+  `USkeletalMeshComponent` (a ragdoll) and every other simulating primitive of the actor — goes into
+  `musubi.phys.bodies` as `[name, p(3), q(4), v(3), w(3), awake]`, `name` = `Mesh:bone` or the component name, the
+  pose relative to the root body (the node's entity position stays the anchor), quantised to 0.01 cm / 1e-4 /
+  0.1 cm/s like `FRepMovement` does. On arrival the skeletal mesh switches all its bodies on
+  (`SetAllBodiesSimulatePhysics`) and each body gets `SetBodyTransform(TeleportPhysics)` + both velocities +
+  wake/sleep; broken skeletal constraints travel as `Mesh:JointName` in `broken` and are broken again with
+  `BreakConstraint`. Chaos re-solves the joints from the restored poses, so the ragdoll continues instead of
+  snapping to the reference pose. `NITL_RAGDOLL=1` kicks the engine's TutorialTPP ragdoll across the border and
+  checks that the new owner resumed every body within 2 cm and keeps simulating it. Exact determinism is not a
+  goal (Epic replicates only the root body); cloth and vehicles are not covered.
 - Roles: an owned actor is `ROLE_Authority`; a ghost is `ROLE_SimulatedProxy` with `RemoteRole =
   ROLE_Authority` (`UMusubiAuthorityComponent::ApplyNetRole`, on bind and on every ownership flip), so
   `AActor::HasAuthority()` is false on it for every Blueprint and third-party plugin, CharacterMovement runs

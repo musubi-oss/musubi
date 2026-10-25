@@ -2351,6 +2351,161 @@ async fn matchmaker_allocates_a_dedicated_server_when_tickets_ask_for_a_fleet() 
         .unwrap();
 }
 
+/// `handover_request` reaches the receiver only after the owner released the entity (its
+/// final `apply` + `handover_ack`), so the state in the request is the owner's last word; the
+/// release itself answers `started`, the receiver's ack still completes the handover.
+#[tokio::test]
+async fn handover_request_waits_for_the_owners_release() {
+    let Some(state) = build_state(true, &test_group()).await else {
+        return;
+    };
+    let router = musubi_server::http::router(state.clone());
+    let k = "defaultkey";
+    let world = format!("w{}", uuid::Uuid::now_v7().simple());
+    let post = |path: String, body: Value| {
+        let router = router.clone();
+        async move {
+            let req = Request::post(&path)
+                .header("x-musubi-server-key", k)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap();
+            let res = router.oneshot(req).await.unwrap();
+            let st = res.status().as_u16();
+            let v: Value =
+                serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes())
+                    .unwrap_or(Value::Null);
+            (st, v)
+        }
+    };
+    let events = |sim: uuid::Uuid| {
+        let router = router.clone();
+        let world = world.clone();
+        async move {
+            let req = Request::get(format!("/v1/server/worlds/{world}/events?sim={sim}"))
+                .header("x-musubi-server-key", k)
+                .body(Body::empty())
+                .unwrap();
+            let res = router.oneshot(req).await.unwrap();
+            let v: Value =
+                serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes())
+                    .unwrap_or(Value::Null);
+            v["events"].as_array().cloned().unwrap_or_default()
+        }
+    };
+    let (st, _) = post(
+        "/v1/server/worlds".into(),
+        json!({"name": world, "config": {"cell_size": 100.0, "ghost_margin": 10.0, "hysteresis": 5.0, "lease_ttl_ticks": 600}}),
+    )
+    .await;
+    assert_eq!(st, 200);
+    let s1 = uuid::Uuid::now_v7();
+    let s2 = uuid::Uuid::now_v7();
+    for (sim, x) in [(s1, 0), (s2, 1)] {
+        let (st, _) = post(
+            format!("/v1/server/worlds/{world}/lease"),
+            json!({"sim": sim, "cells": [{"x": x, "y": 0}]}),
+        )
+        .await;
+        assert_eq!(st, 200);
+    }
+    // the release races a 2-tick timeout (66 ms); a loaded runner may lose it, so try a few
+    // entities and judge the one whose release was accepted
+    let mut released = None;
+    for attempt in 0..5 {
+        let (st, e) = post(
+            format!("/v1/server/worlds/{world}/spawn"),
+            json!({"sim": s1, "x": 50.0, "y": 50.0, "components": {"hp": 100}}),
+        )
+        .await;
+        assert_eq!(st, 200, "{e}");
+        let eid: uuid::Uuid = e["id"].as_str().unwrap().parse().unwrap();
+        let (st, _) = post(
+            format!("/v1/server/worlds/{world}/apply"),
+            json!({"sim": s1, "entity": eid, "x": 110.0, "y": 50.0}),
+        )
+        .await;
+        assert_eq!(st, 200);
+        let mut started = false;
+        for _ in 0..200 {
+            if events(s1)
+                .await
+                .iter()
+                .any(|e| e["type"] == "handover_started" && e["entity"] == eid.to_string())
+            {
+                started = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(started, "s1 never got handover_started (attempt {attempt})");
+        // the owner's last word, then its release
+        let (st, _) = post(
+            format!("/v1/server/worlds/{world}/apply"),
+            json!({"sim": s1, "entity": eid, "x": 112.0, "y": 50.0, "components": {"final": attempt}}),
+        )
+        .await;
+        assert_eq!(st, 200, "the owner still applies until the receiver acks");
+        let (st, a) = post(
+            format!("/v1/server/worlds/{world}/handover/ack"),
+            json!({"sim": s1, "entity": eid}),
+        )
+        .await;
+        if st == 200 {
+            assert!(a["outcome"].get("Started").is_some(), "{a}");
+            released = Some((eid, attempt));
+            break;
+        }
+        // lost the race: the request already went out on the timeout; the receiver owns it next
+        let (st, _) = post(
+            format!("/v1/server/worlds/{world}/handover/ack"),
+            json!({"sim": s2, "entity": eid}),
+        )
+        .await;
+        assert_eq!(st, 200);
+    }
+    let Some((eid, attempt)) = released else {
+        panic!("the owner's release never beat the 2-tick timeout in 5 attempts");
+    };
+    let mut req = None;
+    for _ in 0..40 {
+        if let Some(r) = events(s2)
+            .await
+            .into_iter()
+            .find(|e| e["type"] == "handover_request" && e["entity"] == eid.to_string())
+        {
+            req = Some(r);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    let req = req.expect("s2 never got the handover request after the release");
+    let comps = req["state"]["components"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        comps
+            .iter()
+            .any(|c| c["name"] == "final" && c["value"] == json!(attempt)),
+        "the request carries the owner's final state: {req}"
+    );
+    assert_eq!(req["state"]["x"], json!(112.0), "{req}");
+    let (st, a) = post(
+        format!("/v1/server/worlds/{world}/handover/ack"),
+        json!({"sim": s2, "entity": eid}),
+    )
+    .await;
+    assert_eq!(st, 200, "{a}");
+    assert!(a["outcome"].get("Completed").is_some(), "{a}");
+    let (st, _) = post(
+        format!("/v1/server/worlds/{world}/apply"),
+        json!({"sim": s2, "entity": eid, "x": 120.0, "y": 50.0}),
+    )
+    .await;
+    assert_eq!(st, 200, "the receiver owns it after its ack");
+}
+
 #[tokio::test]
 async fn world_meshing_sim_api_and_client_deltas() {
     let Some(state) = build_state(true, &test_group()).await else {
