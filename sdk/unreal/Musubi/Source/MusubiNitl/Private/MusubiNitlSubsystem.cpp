@@ -1,4 +1,5 @@
 #include "MusubiNitlSubsystem.h"
+#include "Engine/NetworkDelegates.h"
 #include "MusubiNitlPawn.h"
 #include "MusubiNitlLoadout.h"
 #include "MusubiNitlInventoryComponent.h"
@@ -57,6 +58,32 @@ void UMusubiNitlSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 			if (!Handle.IsSet()) Handle = UMusubiEntityRegistry::HandleOf(A);
 		});
 		C->AuthenticateDevice(FGuid::NewGuid().ToString(EGuidFormats::Digits));
+	}
+	// -MusubiNitlEncrypt: a fixed AES-256-GCM key on both ends, the way a game's key provider would answer the engine's
+	// encryption handshake (client sends ?EncryptionToken=, the owner — and every new owner after a rehome — acks it)
+	if (FParse::Param(FCommandLine::Get(), TEXT("MusubiNitlEncrypt")))
+	{
+		static const auto TestKey = []
+		{
+			FEncryptionData D;
+			D.Identifier = TEXT("nitl");
+			for (int32 i = 0; i < 32; ++i) D.Key.Add((uint8)(0x5a ^ i));
+			return D;
+		};
+		FNetDelegates::OnReceivedNetworkEncryptionToken.BindLambda([](const FString& Token, const FOnEncryptionKeyResponse& Delegate)
+		{
+			UE_LOG(LogMusubiNitl, Log, TEXT("nitl: encryption token '%s' -> keying the connection"), *Token);
+			FEncryptionKeyResponse R(EEncryptionResponse::Success, TEXT(""));
+			R.EncryptionData = TestKey();
+			Delegate.ExecuteIfBound(R);
+		});
+		FNetDelegates::OnReceivedNetworkEncryptionAck.BindLambda([](const FOnEncryptionKeyResponse& Delegate)
+		{
+			UE_LOG(LogMusubiNitl, Log, TEXT("nitl: encryption ack -> keying the connection"));
+			FEncryptionKeyResponse R(EEncryptionResponse::Success, TEXT(""));
+			R.EncryptionData = TestKey();
+			Delegate.ExecuteIfBound(R);
+		});
 	}
 	Ticker = FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateUObject(this, &UMusubiNitlSubsystem::Report), 1.f);
 	if (Mode == TEXT("client")) TickHandle = FWorldDelegates::OnWorldTickStart.AddUObject(this, &UMusubiNitlSubsystem::OnWorldTick);
@@ -140,7 +167,8 @@ void UMusubiNitlSubsystem::OnSocketConnected()
 	const bool bJoin = FParse::Param(FCommandLine::Get(), TEXT("MusubiNitlJoin"));
 	if (W.IsEmpty() || (E.IsEmpty() && !bJoin) || !World || !GEngine) { UE_LOG(LogMusubiNitl, Error, TEXT("nitl: need -MusubiWorld= and -MusubiEntity= (or -MusubiNitlJoin)")); return; }
 	bTravelled = true;
-	const FString URL = bJoin ? FString::Printf(TEXT("musubi://%s:0"), *W) : FString::Printf(TEXT("musubi://%s:0?entity=%s"), *W, *E);
+	FString URL = bJoin ? FString::Printf(TEXT("musubi://%s:0"), *W) : FString::Printf(TEXT("musubi://%s:0?entity=%s"), *W, *E);
+	if (FParse::Param(FCommandLine::Get(), TEXT("MusubiNitlEncrypt"))) URL += TEXT("?EncryptionToken=nitl"); // FURL options are all ?-separated
 	UE_LOG(LogMusubiNitl, Log, TEXT("nitl: travelling to %s"), *URL);
 	GEngine->SetClientTravel(World, *URL, TRAVEL_Absolute);
 }

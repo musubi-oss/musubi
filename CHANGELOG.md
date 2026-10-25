@@ -2,6 +2,11 @@
 
 All notable changes to Musubi. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow SemVer with the `0.x` caveat that shapes may change between minor versions until `1.0`.
 
+## Unreleased
+
+### Unreal GDK
+- Relayed engine connections now run the engine's `PacketHandler` chain: `UMusubiNetConnection::InitHandler` builds it like `UNetConnection::InitHandler` with `FMusubiRelayHandshakeComponent` in place of the stateless-connect cookie exchange (the node has already authenticated both ends), so `[PacketHandlerComponents]` (AES-GCM encryption, Oodle compression) apply to Musubi connections and the engine's `EncryptionToken` handshake works, including a re-key by the new owner on an in-place rehome (`NMT_EncryptionAck` handled by the driver). NITL: `NITL_ENCRYPT=1`.
+
 ## 0.2.0 — 2026-10-25
 
 Full backend security and modernization audit: every crate, every file of the node and all 220 migrations were reviewed against one checklist (authn/authz per route, IDOR, constant-time secret comparison, token entropy, SQL, races, limits, SSRF, panics, crypto, leakage). Highlights below; the per-area detail is in the commit history (`audit(<area>)`).

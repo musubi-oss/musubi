@@ -3,6 +3,9 @@
 
 #include "MusubiNetDriver.h"
 #include "Net/DataChannel.h"
+#include "Net/NetConnectionFaultRecovery.h"
+#include "Misc/CommandLine.h"
+#include "Misc/Parse.h"
 
 UMusubiNetConnection::UMusubiNetConnection(const FObjectInitializer& ObjectInitializer)
 	: Super(ObjectInitializer)
@@ -48,14 +51,56 @@ void UMusubiNetConnection::Opened(uint64 InConnId, int32 InMaxPacket)
 		for (const TArray<uint8>& P : Out) D->SendPacket(this, P.GetData(), P.Num());
 }
 
+/**
+ * The relay's stand-in for StatelessConnectHandlerComponent. The engine's PacketHandler only fires its handshake-complete
+ * delegate (UPendingNetGame::SendInitialJoin → NMT_Hello) from a component that `RequiresHandshake`, and the only such
+ * engine component answers an address-based cookie exchange through connectionless sends a relay has none of. The node has
+ * already authenticated both ends of a relay, so this component completes the handshake on the spot: the server side is
+ * initialized as soon as it exists, the client side when the engine calls BeginHandshaking. It reserves no bits and never
+ * touches a packet; it only lets the standard component chain ([PacketHandlerComponents]: Oodle, AES-GCM, ...) run on
+ * relayed connections exactly as it does on UDP ones.
+ */
+class FMusubiRelayHandshakeComponent : public HandlerComponent
+{
+public:
+	FMusubiRelayHandshakeComponent() : HandlerComponent(FName(TEXT("MusubiRelayHandshake"))) { bRequiresHandshake = true; }
+	virtual bool IsValid() const override { return true; }
+	virtual int32 GetReservedPacketBits() const override { return 0; }
+	virtual void Initialize() override
+	{
+		SetActive(true);
+		if (Handler && Handler->Mode == UE::Handler::Mode::Server) Initialized();
+	}
+	virtual void NotifyHandshakeBegin() override
+	{
+		if (!IsInitialized()) Initialized();
+	}
+};
+
 void UMusubiNetConnection::InitHandler()
 {
-	// No PacketHandler at all (the engine's -NoPacketHandler path, here in every configuration): with the stateless-connect
-	// component the cookie exchange needs connectionless sends a relay has none of, and without any component
-	// PacketHandler::BeginHandshaking never fires its completion delegate, so UPendingNetGame would never send NMT_Hello.
-	// The relay is already authenticated by the node and encrypted/compressed by the transport, so nothing is lost.
+	// UNetConnection::InitHandler with FMusubiRelayHandshakeComponent in place of the stateless-connect component: the
+	// chain, reserved-bits accounting and [PacketHandlerComponents] loading are the engine's.
 	check(!Handler.IsValid());
 	MaxPacketHandlerBits = 0;
+#if !UE_BUILD_SHIPPING
+	if (FParse::Param(FCommandLine::Get(), TEXT("NoPacketHandler"))) return;
+#endif
+	Handler = MakeUnique<PacketHandler>();
+	const UE::Handler::Mode Mode = Driver->ServerConnection != nullptr ? UE::Handler::Mode::Client : UE::Handler::Mode::Server;
+	FPacketHandlerNotifyAddHandler NotifyAddHandler;
+	NotifyAddHandler.BindLambda([this](TSharedPtr<HandlerComponent>& NewHandler)
+	{
+		if (NewHandler.IsValid()) NewHandler->InitFaultRecovery(GetFaultRecovery());
+	});
+	Handler->InitializeDelegates(FPacketHandlerLowLevelSendTraits::CreateUObject(this, &UNetConnection::LowLevelSend), MoveTemp(NotifyAddHandler));
+	Handler->NotifyAnalyticsProvider(Driver->AnalyticsProvider, Driver->AnalyticsAggregator);
+	Handler->Initialize(Mode, MaxPacket * 8, false, nullptr, nullptr, Driver->GetNetDriverDefinition());
+	TSharedPtr<HandlerComponent> Relay = MakeShared<FMusubiRelayHandshakeComponent>();
+	Handler->AddHandler(Relay, true);
+	Handler->InitializeComponents();
+	MaxPacketHandlerBits = Handler->GetTotalReservedPacketBits();
+	UE_LOG(LogNet, Log, TEXT("relay PacketHandler up (%s): %d reserved bits, encryption component %s"), Mode == UE::Handler::Mode::Server ? TEXT("server") : TEXT("client"), MaxPacketHandlerBits, Handler->GetEncryptionComponent().IsValid() ? TEXT("present") : TEXT("none"));
 }
 
 void UMusubiNetConnection::LowLevelSend(void* Data, int32 CountBits, FOutPacketTraits& Traits)

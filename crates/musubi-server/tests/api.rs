@@ -7488,6 +7488,15 @@ async fn http_hooks_rewrite_and_reject_calls_by_nakama_names() {
     // other routes are untouched
     let (st, v) = call(&app, "GET", "/v1/notifications", Some(tok), None).await;
     assert_eq!(st, StatusCode::OK, "{v}");
+
+    // uninstall: modules persist in the DB and load on every node start, so a leftover
+    // before-hook would redirect every device login on a shared dev database
+    let req = Request::delete("/v1/admin/runtime/modules/hooks")
+        .header("x-musubi-server-key", "defaultkey")
+        .body(Body::empty())
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
 }
 
 fn balance_of(v: &Value, cur: &str) -> i64 {

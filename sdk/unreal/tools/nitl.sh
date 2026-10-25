@@ -19,6 +19,9 @@ DB="${MUSUBI_TEST_DATABASE_URL:-postgres://musubi:musubi@localhost:5433/musubi}"
 # NITL_JOIN=1: the world carries a player_spawn policy and s1 spawns nothing; the client travels to musubi://<world>:0
 # without an entity and the node spawns its avatar on world_join (owner = the client's account); s1 walks it.
 JOIN="${NITL_JOIN:-0}"
+# NITL_ENCRYPT=1: AES-256-GCM on the relayed engine connections through the standard PacketHandler chain (-MusubiNitlEncrypt
+# keys both ends; the client travels with ?EncryptionToken=, every owner acks it, the rehome re-keys with the new owner).
+ENCRYPT="${NITL_ENCRYPT:-0}"; ENCARG=""; [ "$ENCRYPT" = 1 ] && ENCARG="-MusubiNitlEncrypt"
 CHAOS="${NITL_CHAOS:-0}"; NAMES="nitl-s1 nitl-s2 nitl-c"; [ "$CHAOS" = 1 ] && NAMES="nitl-s1 nitl-s2 nitl-c nitl-c2 nitl-s2b"
 # NITL_PROJECT=<dir of a built project incl. Plugins/Musubi> + NITL_MAP=<map>: run the same scenario on another project
 # (the Third Person demo, phase 9g-9: `tools/demo-build.sh <ver>` then NITL_PROJECT=target/ue/demo-<ver>/MusubiThirdPerson).
@@ -65,7 +68,7 @@ ue() { # name, extra args...
   docker run -d --name "$N" --network host -u "$(id -u):$(id -g)" -e HOME="/out/home-$N" -v "$OUT:/out" "${MOUNT[@]}" "$IMG" \
     /home/ue4/UnrealEngine/Engine/Binaries/Linux/UnrealEditor "$UPATH" "$MAP" \
     -unattended -nosplash -nullrhi -NoSound -stdout -FullStdOutLogOutput -log -LogCmds="LogMusubiServer VeryVerbose, LogMusubiNet Verbose, LogMusubiMesh Verbose, LogNet Verbose${NITL_LOGCMDS_EXTRA:-}" \
-    -MusubiApi="$API" -MusubiKey="$KEY" -MusubiWorld="$WORLD" "$@" >/dev/null
+    -MusubiApi="$API" -MusubiKey="$KEY" -MusubiWorld="$WORLD" $ENCARG "$@" >/dev/null
 }
 echo "== servers"
 S2SPAWN=""; if [ "$CHAOS" = 1 ]; then
@@ -134,6 +137,16 @@ chk $S2LOG "nitl: handover $ENTITY request ack"
 chk nitl-c  "nitl: travelling to musubi://"
 if [ "$JOIN" = 1 ]; then chk nitl-c "my avatar in $WORLD is $ENTITY (spawned)"; chk nitl-c "relay .* open on $ENTITY" ; fi
 chk nitl-c  "Welcomed by server"
+# the relay PacketHandler: the engine's component chain is up on both ends (reserved bits / encryption component as configured)
+chk nitl-c  "relay PacketHandler up (client)"
+chk nitl-s1 "relay PacketHandler up (server)"
+if [ "$ENCRYPT" = 1 ]; then
+  chk nitl-c  "encryption component present"
+  chk nitl-s1 "nitl: encryption token 'nitl'"
+  chk $S2LOG  "nitl: encryption token 'nitl'"   # the new owner keyed the rehomed connection again
+  chk nitl-c  "nitl: encryption ack"
+  NE=$(grep -c "UNetConnection::EnableEncryption" "$OUT/nitl-c.log"); if [ "${NE:-0}" -ge 2 ]; then echo "PASS nitl-c: connection keyed by both owners ($NE)"; else echo "FAIL nitl-c: connection keyed by both owners ($NE)"; ok=0; fi
+fi
 chk nitl-c  "rehoming in place"
 chk nitl-c  "rehomed in place"
 LASTP=$(grep "client pawns=" "$OUT/nitl-c.log" | tail -1); case "$LASTP" in *"pawns=$PAWNS "*) echo "PASS nitl-c: $PAWNS pawn(s) at the end";; *) echo "FAIL nitl-c: $PAWNS pawn(s) at the end ($LASTP)"; ok=0;; esac

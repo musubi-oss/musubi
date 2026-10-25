@@ -382,17 +382,23 @@ is. Phase 9 makes the engine use it.
   `UNetDriver::ForwardRemoteFunction` (`:8420`, bound as `Params.ForwardNetRPCCallDelegate`) hands every
   server-side RPC to *every other active driver of the world context* whose `ShouldReplicateFunction` says yes.
   That is the hook for cross-server RPCs: a second, replication-less driver receives them.
-- Handshake: the UDP stateless-connect challenge lives in `PacketHandler` /
-  `StatelessConnectHandlerComponent`; `UWebSocketNetDriver` accepts connections without it when
-  `-NoPacketHandler` is set (`WebSocketNetDriver.cpp:240`, `bChallengeHandshake=false`). Our sessions are already
-  authenticated by the node (JWT), so the challenge is skipped by design: `UMusubiNetConnection::InitHandler` creates
-  no `PacketHandler` at all (the engine's `-NoPacketHandler` path, in every configuration). Leaving the component in is
-  not an option — it answers the cookie exchange through connectionless `UNetDriver::LowLevelSend(Address)`, which a relay
-  has no equivalent of (observed live: the server-side component rejected every packet with "invalid session id /
-  connection id"); a `PacketHandler` with no components is not either — `PacketHandler::BeginHandshaking` only fires
-  its completion delegate from a component, so `UPendingNetGame` would never send `NMT_Hello` (also observed live).
-  Consequence: `[PacketHandlerComponents]` (encryption, Oodle) do not apply to relayed connections — the transport to
-  the node is already TLS/QUIC-encrypted and compressed.
+- Handshake: the UDP stateless-connect challenge lives in `PacketHandler` / `StatelessConnectHandlerComponent`
+  (`UNetConnection::InitHandler`, `NetConnection.cpp:753`); it answers an address-based cookie exchange through
+  connectionless `UNetDriver::LowLevelSend(Address)`, which a relay has no equivalent of (observed live: the server-side
+  component rejected every packet with "invalid session id / connection id"). A `PacketHandler` without it does not work
+  either: `PacketHandler::BeginHandshaking` only fires its completion delegate (`UPendingNetGame::SendInitialJoin` →
+  `NMT_Hello`) from a component that `RequiresHandshake` (`PacketHandler.cpp:339-352, 1143-1149`). Our sessions are
+  already authenticated by the node (JWT), so `UMusubiNetConnection::InitHandler` builds the engine's handler the same
+  way `UNetConnection::InitHandler` does but with `FMusubiRelayHandshakeComponent` in place of the stateless one: it
+  requires a handshake, reserves no bits, and completes it on the spot (server side in `Initialize()`, client side in
+  `NotifyHandshakeBegin()`), so the standard chain runs on relayed connections: `[PacketHandlerComponents]`
+  (`EncryptionComponent=AESGCMHandlerComponent`, `Components=OodleNetworkHandlerComponent`, ...) apply exactly as on UDP,
+  and the engine's encryption handshake (`?EncryptionToken=` on the travel URL → `FNetDelegates::OnReceivedNetworkEncryptionToken`
+  on the server → `NMT_EncryptionAck` → `OnReceivedNetworkEncryptionAck` on the client) is unchanged. The in-place rehome
+  repeats it with the new owner: the driver calls `BeginHandshaking()` on the fresh connection, sends `NMT_Hello` with the
+  URL's token again and answers the owner's `NMT_EncryptionAck` through the same delegate (`UMusubiNetDriver::NotifyControlMessage`).
+  The transport to the node is TLS/QUIC on top of that; `-NoPacketHandler` still disables the chain in non-shipping builds.
+  NITL: `NITL_ENCRYPT=1` keys both ends with a fixed AES-256-GCM key and checks that both owners keyed the connection.
 
 ### 9.2 Path A — client ↔ owning server over the node (`UMusubiNetDriver`, `UMusubiNetConnection`)
 
@@ -447,7 +453,7 @@ Module `MusubiNet` (runtime, all tiers: the driver uses only classic `UNetDriver
 - **Server side.** `InitListen` opens nothing; it subscribes to `UMusubiSimulatorSubsystem` for `NetOpen`
   events. Each event → `UMusubiNetConnection` (`InitRemoteConnection` with a synthesized
   `FMusubiInternetAddr : FInternetAddr` = `musubi:<conn>`, `USOCK_Open`), `AddClientConnection`,
-  `bChallengeHandshake=false`, `PacketHandler` begins handshaking immediately (`Handler->BeginHandshaking()`).
+  `PacketHandler` with `FMusubiRelayHandshakeComponent` begins handshaking immediately (`Handler->BeginHandshaking()`).
   `NetPacket` → `ReceivedRawPacket`; `LowLevelSend` → `SimCommand::NetPacket`. `GetSocketSubsystem` returns the
   platform subsystem (only for `FInternetAddr` factories, as `UWebSocketNetDriver` does).
 - **Rehome (the seamless-world part).** The simulator opens an engine connection implicitly on the first

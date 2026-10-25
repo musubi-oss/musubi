@@ -1,4 +1,5 @@
 #include "MusubiNetDriver.h"
+#include "Engine/NetworkDelegates.h"
 #include "Serialization/MemoryWriter.h"
 #include "Serialization/MemoryReader.h"
 #include "UObject/UObjectIterator.h"
@@ -335,10 +336,13 @@ void UMusubiNetDriver::OnRehome(const FMusubiServerMessageNetRehome& Msg)
 	CreateInitialClientChannels();
 	WorldNotify = Notify;
 	Notify = this;
-	// 3. the login handshake the engine normally runs in UPendingNetGame, without the map load
+	// 3. the login handshake the engine normally runs in UPendingNetGame, without the map load: the relay PacketHandler
+	// completes its handshake synchronously, then NMT_Hello carries the travel URL's EncryptionToken again so the new
+	// owner re-keys the connection (NMT_EncryptionAck below) the same way the first owner did
+	if (Conn->Handler.IsValid()) Conn->Handler->BeginHandshaking();
 	uint8 IsLittleEndian = uint8(PLATFORM_LITTLE_ENDIAN);
 	uint32 LocalNetworkVersion = FNetworkVersion::GetLocalNetworkVersion();
-	FString EncryptionToken;
+	FString EncryptionToken = ClientURL.GetOption(TEXT("EncryptionToken="), TEXT(""));
 #if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION <= 3
 	uint16 LocalNetworkFeatures = static_cast<uint16>(GetNetworkRuntimeFeatures()); // NMT_Hello carries a uint16 in 5.3
 #else
@@ -398,6 +402,21 @@ void UMusubiNetDriver::NotifyControlMessage(UNetConnection* Connection, uint8 Me
 	}
 	case NMT_Upgrade:
 		FinishRehome(false, TEXT("NMT_Upgrade"));
+		break;
+	case NMT_EncryptionAck:
+		// as UPendingNetGame::NotifyControlMessage: the game's key provider answers, the connection switches to the new key
+		if (FNetDelegates::OnReceivedNetworkEncryptionAck.IsBound())
+		{
+			TWeakObjectPtr<UNetConnection> Weak(Connection);
+			FNetDelegates::OnReceivedNetworkEncryptionAck.Execute(FOnEncryptionKeyResponse::CreateLambda([Weak](const FEncryptionKeyResponse& Response)
+			{
+				UNetConnection* C = Weak.Get();
+				if (!C || C->GetConnectionState() == USOCK_Closed) return;
+				if (Response.Response == EEncryptionResponse::Success) C->EnableEncryption(Response.EncryptionData);
+				else UE_LOG(LogMusubiNet, Warning, TEXT("rehome: encryption key provider failed [%s] %s"), LexToString(Response.Response), *Response.ErrorMsg);
+			}));
+		}
+		else FinishRehome(false, TEXT("NMT_EncryptionAck without a key provider (FNetDelegates::OnReceivedNetworkEncryptionAck)"));
 		break;
 	default:
 		if (WorldNotify) WorldNotify->NotifyControlMessage(Connection, MessageType, Bunch);
