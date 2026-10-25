@@ -20243,6 +20243,23 @@ async fn legal_documents_versions_consent_gate_and_withdrawal() {
     let Some(app) = app().await else {
         return;
     };
+    // earlier runs on a shared DB leave their ZZ-only documents behind and they would show up in
+    // the exact `pending` counts below; sweep them first
+    {
+        let url = std::env::var("MUSUBI_TEST_DATABASE_URL").unwrap();
+        let db = sqlx::PgPool::connect(&url).await.unwrap();
+        sqlx::query(
+            "delete from musubi.legal_consents where key in \
+             (select key from musubi.legal_documents where countries = '{ZZ}')",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        sqlx::query("delete from musubi.legal_documents where countries = '{ZZ}'")
+            .execute(&db)
+            .await
+            .unwrap();
+    }
     let srv = |method: &str, path: String, body: Value| {
         let app = app.clone();
         let method = method.to_string();

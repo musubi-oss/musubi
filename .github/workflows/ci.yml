@@ -60,6 +60,16 @@ jobs:
       - run: sdk/unreal/tools/sim-wire-test.sh
       # QUIC transport: the C-ABI static library the MusubiQuic module links must build.
       - run: sdk/unreal/tools/build-quic-ffi.sh
+  audit:
+    # RUSTSEC advisories against Cargo.lock; accepted ones are listed with reasons in .cargo/audit.toml
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      - run: cargo audit
+
   console:
     # operator console: typecheck, catalog paths against the node's OpenAPI snapshot, vitest, production build
     runs-on: ubuntu-latest

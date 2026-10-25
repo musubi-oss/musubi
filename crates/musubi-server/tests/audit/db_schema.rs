@@ -1,7 +1,7 @@
 //! Schema audit regression tests (unit `db-schema`). Run with
 //! `MUSUBI_TEST_DATABASE_URL=postgres://...`; skipped otherwise.
 //!
-//! Migration `0221_db_schema.sql` adds the indexes behind the retention sweeper's purge
+//! Migration `0222_db_schema.sql` adds the indexes behind the retention sweeper's purge
 //! predicates; these tests pin them (and the migration's idempotency) so a later
 //! consolidation cannot silently drop them again.
 
@@ -85,7 +85,7 @@ async fn retention_predicates_are_indexed() {
 #[tokio::test]
 async fn audit_migration_is_idempotent() {
     let Some(db) = db().await else { return };
-    let sql: String = include_str!("../migrations/0221_db_schema.sql")
+    let sql: String = include_str!("../../migrations/0222_db_schema.sql")
         .lines()
         .filter(|l| !l.trim_start().starts_with("--"))
         .collect::<Vec<_>>()

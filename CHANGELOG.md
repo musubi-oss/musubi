@@ -2,6 +2,31 @@
 
 All notable changes to Musubi. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow SemVer with the `0.x` caveat that shapes may change between minor versions until `1.0`.
 
+## Unreleased
+
+Full backend security and modernization audit: every crate, every file of the node and all 220 migrations were reviewed against one checklist (authn/authz per route, IDOR, constant-time secret comparison, token entropy, SQL, races, limits, SSRF, panics, crypto, leakage). Highlights below; the per-area detail is in the commit history (`audit(<area>)`).
+
+### Security
+- **Node bus:** QUIC connections between nodes now require mutual TLS bound to the node's `bus_cert`; previously any client that could reach the bus port could inject SWIM verdicts, Raft RPCs and catalog writes.
+- **Money / rewards:** ad reward completion, tutorial rewards, donation requests, `buy_shield`, sweepstake entries, grant limits, code redemptions and other check-then-act paths are now atomic (advisory locks, single-statement updates, checked arithmetic); duplicate payouts and overflow-into-credit are closed.
+- **Identity:** login-queue tickets are no longer accepted as access tokens; restricted server keys cannot mint tokens with wider scopes; refresh / TOTP / MFA / reset flows are single-use and rate limited; passkey CBOR parsing is bounded; TOTP secrets and recovery codes are sealed / stronger; reset tokens no longer leak into LiveOps and analytics events.
+- **Operators:** SSO `return_to` is restricted to the console origins (open redirect leaked a fresh operator key); `GET /v1/admin/config` redacts secrets inside arrays; invite tokens are stored hashed.
+- **Input:** SQL injection through nested audience-rule `field`, private-lobby code bypass, path traversal and archive limits in content / builds, recursion and size limits in parsers and protocol frames, body and pagination caps on all list routes.
+- **Egress:** webhooks, push, config sources, environments and entitlement sync go through one SSRF guard (no private / link-local / metadata targets, no redirects, timeouts).
+- **Client address:** `X-Forwarded-For` / `X-Real-IP` are believed only from `[http] trusted_proxies` (default: loopback and private ranges); rate limits, bans and geo can no longer be spoofed by the client.
+- All key / token / signature comparisons are constant-time; one-time tokens come from a CSPRNG (256 bit) instead of UUID pairs.
+
+### Changed
+- **BREAKING (config):** with `session.signing_key_pem` (ES256) and `[[projects]]`, each project needs its own `[projects.session] signing_key_pem` (or an explicit `null` to use HS256 with the derived secret); the base key was inherited, so a token for project A verified for project B.
+- Consoles served from an origin other than the SSO `redirect_url` must be listed in `[http] cors_origins` to be accepted as `return_to`.
+- Error texts of several auth failures are more specific (same codes and JSON shape).
+- Dependencies: `once_cell` → `std::sync::LazyLock`, `async_trait` → native async traits where object safety allows, `rustls-webpki` / `webpki-roots` updated.
+- `cargo audit` runs in CI; the accepted advisories (crypto-bigint / rsa via `jsonwebtoken` verification paths, quick-xml via flamegraph writing, atomic-polyfill on targets without atomics) are listed with reasons in `.cargo/audit.toml`. `pprof` 0.14 → 0.15.
+- Unreal GDK: generated wire readers reject unknown optional tags and pre-reserve at most 1024 elements per array (the length prefix is no longer trusted for allocation). Regenerate with `cargo run -p musubi-unreal-gen` after pulling.
+
+### Database
+- `0221` / `0222`: indexes behind the retention sweeper and the audit fixes; forward-only as before.
+
 ## 0.1.0 — 2026-10-24
 
 First public release: one Rust binary with the full backend, the operator console embedded, the Unreal GDK, Helm/Terraform and the importers.

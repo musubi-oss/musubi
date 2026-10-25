@@ -360,7 +360,7 @@ impl ServerHost {
                     .as_i64()
                     .ok_or_else(|| Error::InvalidArgument("wallet.adjust needs `delta`".into()))?;
                 let who = account(&req, ctx)?;
-                crate::grant_limits::check(
+                let booked = crate::grant_limits::check(
                     &s.db,
                     who,
                     "currency",
@@ -368,7 +368,7 @@ impl ServerHost {
                     delta,
                 )
                 .await?;
-                let (entry, replayed) = s
+                let adjusted = s
                     .economy
                     .adjust(
                         who,
@@ -379,16 +379,16 @@ impl ServerHost {
                         req["idempotency_key"].as_str(),
                         req.get("metadata").cloned().unwrap_or(json!({})),
                     )
-                    .await?;
-                if !replayed {
-                    crate::grant_limits::record(
-                        &s.db,
-                        who,
-                        "currency",
-                        str_field(&req, "currency")?,
-                        delta,
-                    )
-                    .await?;
+                    .await;
+                let (entry, replayed) = match adjusted {
+                    Ok(v) => v,
+                    Err(e) => {
+                        crate::grant_limits::release(&s.db, &booked).await?;
+                        return Err(e);
+                    }
+                };
+                if replayed {
+                    crate::grant_limits::release(&s.db, &booked).await?;
                 }
                 Ok(json!({ "entry": to_json(entry)?, "replayed": replayed }))
             }
@@ -397,8 +397,8 @@ impl ServerHost {
                 let who = account(&req, ctx)?;
                 let item = str_field(&req, "item_id")?;
                 let qty = req["quantity"].as_i64().unwrap_or(1);
-                crate::grant_limits::check(&s.db, who, "item", item, qty).await?;
-                let e = s
+                let booked = crate::grant_limits::check(&s.db, who, "item", item, qty).await?;
+                let granted = s
                     .economy
                     .grant_item(
                         who,
@@ -406,9 +406,14 @@ impl ServerHost {
                         qty,
                         req.get("instance").cloned().unwrap_or(json!({})),
                     )
-                    .await?;
-                crate::grant_limits::record(&s.db, who, "item", item, qty).await?;
-                to_json(e)
+                    .await;
+                match granted {
+                    Ok(e) => to_json(e),
+                    Err(e) => {
+                        crate::grant_limits::release(&s.db, &booked).await?;
+                        Err(e)
+                    }
+                }
             }
             "notify.send" => {
                 s.notify

@@ -137,6 +137,25 @@ pub struct HttpConfig {
     pub cors_origins: Vec<String>,
     /// How long browsers may cache a preflight answer.
     pub cors_max_age_secs: u64,
+    /// Reverse proxies whose `X-Forwarded-For` / `X-Real-IP` are believed (`ip` or CIDR). Only a
+    /// peer in this list can set the client address used for rate limits, bans and geo; the
+    /// default covers loopback and private ranges. `[]` trusts nobody, `0.0.0.0/0` everybody.
+    #[serde(default = "default_trusted_proxies")]
+    pub trusted_proxies: Vec<String>,
+}
+
+fn default_trusted_proxies() -> Vec<String> {
+    [
+        "127.0.0.0/8",
+        "::1/128",
+        "10.0.0.0/8",
+        "172.16.0.0/12",
+        "192.168.0.0/16",
+        "fc00::/7",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -224,6 +243,7 @@ impl Default for HttpConfig {
             server_key: "defaultkey".into(),
             cors_origins: Vec::new(),
             cors_max_age_secs: 600,
+            trusted_proxies: default_trusted_proxies(),
         }
     }
 }

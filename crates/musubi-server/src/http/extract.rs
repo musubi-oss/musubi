@@ -1,7 +1,10 @@
 use axum::extract::FromRequestParts;
 use axum::http::request::Parts;
+use ipnet::IpNet;
 use musubi_auth::Authenticated;
 use musubi_core::Error;
+use std::net::IpAddr;
+use std::sync::OnceLock;
 
 use crate::app::AppState;
 use crate::http::ApiError;
@@ -159,32 +162,137 @@ pub fn check_server_key(
     Err(Error::Unauthenticated("bad server key".into()))
 }
 
-/// Best-effort client address: first `X-Forwarded-For` hop, then `X-Real-IP`, then the peer
-/// address (when served with connect info), else `"unknown"`. Infallible.
+/// Client address as seen through the reverse proxies listed in `[http] trusted_proxies`: when
+/// the TCP peer is a trusted proxy, the right-most `X-Forwarded-For` hop that is not itself
+/// trusted (then `X-Real-IP`); otherwise the peer address, so an internet client cannot pick
+/// its own address for rate limits, bans and geo. `"unknown"` without connect info. Infallible.
 pub struct ClientIp(pub String);
+
+static TRUSTED_PROXIES: OnceLock<Vec<IpNet>> = OnceLock::new();
+
+/// Install `[http] trusted_proxies` once at startup; returns the entries that did not parse
+/// (`ip` or `ip/prefix`). Later calls are ignored, the config default applies until then.
+pub fn set_trusted_proxies(entries: &[String]) -> Vec<String> {
+    let (nets, bad) = parse_proxies(entries);
+    let _ = TRUSTED_PROXIES.set(nets);
+    bad
+}
+
+fn parse_proxies(entries: &[String]) -> (Vec<IpNet>, Vec<String>) {
+    let mut nets = Vec::new();
+    let mut bad = Vec::new();
+    for e in entries {
+        let e = e.trim();
+        if let Ok(n) = e.parse::<IpNet>() {
+            nets.push(n);
+        } else if let Ok(ip) = e.parse::<IpAddr>() {
+            nets.push(IpNet::from(ip));
+        } else {
+            bad.push(e.to_string());
+        }
+    }
+    (nets, bad)
+}
+
+fn is_trusted_proxy(ip: IpAddr) -> bool {
+    TRUSTED_PROXIES
+        .get_or_init(|| {
+            parse_proxies(&musubi_core::config::HttpConfig::default().trusted_proxies).0
+        })
+        .iter()
+        .any(|n| n.contains(&ip))
+}
+
+/// The client behind trusted hops: walk `X-Forwarded-For` from the right, skipping trusted
+/// proxies and anything that is not an IP; fall back to `X-Real-IP`.
+fn forwarded_client(headers: &axum::http::HeaderMap) -> Option<IpAddr> {
+    let hops: Vec<IpAddr> = headers
+        .get_all("x-forwarded-for")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .filter_map(|h| {
+            h.trim()
+                .trim_matches(|c| c == '[' || c == ']' || c == '"')
+                .parse()
+                .ok()
+        })
+        .collect();
+    if let Some(ip) = hops.iter().rev().find(|ip| !is_trusted_proxy(**ip)) {
+        return Some(*ip);
+    }
+    if let Some(first) = hops.first() {
+        return Some(*first);
+    }
+    headers
+        .get("x-real-ip")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse().ok())
+}
+
+pub(crate) fn resolve_client_ip(
+    peer: Option<IpAddr>,
+    headers: &axum::http::HeaderMap,
+) -> Option<IpAddr> {
+    match peer {
+        Some(p) if is_trusted_proxy(p) => forwarded_client(headers).or(Some(p)),
+        Some(p) => Some(p),
+        None => forwarded_client(headers),
+    }
+}
 
 impl<S: Sync> FromRequestParts<S> for ClientIp {
     type Rejection = std::convert::Infallible;
 
     async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
-        let header = |n: &str| {
-            parts
-                .headers
-                .get(n)
-                .and_then(|v| v.to_str().ok())
-                .and_then(|v| v.split(',').next())
-                .map(|v| v.trim().to_string())
-                .filter(|v| !v.is_empty())
-        };
-        let ip = header("x-forwarded-for")
-            .or_else(|| header("x-real-ip"))
-            .or_else(|| {
-                parts
-                    .extensions
-                    .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
-                    .map(|c| c.0.ip().to_string())
-            })
+        let peer = parts
+            .extensions
+            .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+            .map(|c| c.0.ip());
+        let ip = resolve_client_ip(peer, &parts.headers)
+            .map(|ip| ip.to_string())
             .unwrap_or_else(|| "unknown".into());
         Ok(ClientIp(ip))
+    }
+}
+
+#[cfg(test)]
+mod client_ip_tests {
+    use super::resolve_client_ip;
+    use axum::http::{HeaderMap, HeaderValue};
+
+    fn h(xff: &str) -> HeaderMap {
+        let mut m = HeaderMap::new();
+        m.insert("x-forwarded-for", HeaderValue::from_str(xff).unwrap());
+        m
+    }
+
+    #[test]
+    fn internet_peer_cannot_spoof_forwarded_for() {
+        let ip = resolve_client_ip(Some("203.0.113.9".parse().unwrap()), &h("10.0.0.1"));
+        assert_eq!(ip.unwrap().to_string(), "203.0.113.9");
+    }
+
+    #[test]
+    fn trusted_proxy_yields_rightmost_untrusted_hop() {
+        let ip = resolve_client_ip(
+            Some("10.0.0.2".parse().unwrap()),
+            &h("1.2.3.4, 198.51.100.7, 172.16.0.3"),
+        );
+        assert_eq!(ip.unwrap().to_string(), "198.51.100.7");
+    }
+
+    #[test]
+    fn garbage_hops_are_ignored() {
+        let ip = resolve_client_ip(Some("127.0.0.1".parse().unwrap()), &h("evil, 198.51.100.7"));
+        assert_eq!(ip.unwrap().to_string(), "198.51.100.7");
+        let mut m = HeaderMap::new();
+        m.insert("x-real-ip", HeaderValue::from_static("not-an-ip"));
+        assert_eq!(
+            resolve_client_ip(Some("127.0.0.1".parse().unwrap()), &m)
+                .unwrap()
+                .to_string(),
+            "127.0.0.1"
+        );
     }
 }

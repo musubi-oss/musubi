@@ -87,18 +87,6 @@ pub async fn release(db: &PgPool, r: &Reservation) -> Result<()> {
     Ok(())
 }
 
-/// Kept for the existing call sites: usage is booked by [`check`] itself now, so a separate
-/// record step would double-count.
-pub async fn record(
-    _db: &PgPool,
-    _account: AccountId,
-    _kind: &str,
-    _key: &str,
-    _amount: i64,
-) -> Result<()> {
-    Ok(())
-}
-
 pub async fn list(db: &PgPool) -> Result<Value> {
     let rows: Vec<(String, String, i32, i64)> = sqlx::query_as(
         "select kind, key, window_secs, max_per_account from musubi.grant_limits order by kind, key",

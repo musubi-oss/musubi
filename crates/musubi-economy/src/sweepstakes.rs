@@ -398,7 +398,10 @@ impl EconomyService {
         .fetch_one(&mut *tx)
         .await
         .map_err(Error::internal)?;
-        if have + count > d.max_entries_per_player {
+        let total = have
+            .checked_add(count)
+            .ok_or_else(|| Error::InvalidArgument("entries overflow".into()))?;
+        if total > d.max_entries_per_player {
             return Err(Error::ResourceExhausted(format!(
                 "at most {} entries per player (you have {have})",
                 d.max_entries_per_player

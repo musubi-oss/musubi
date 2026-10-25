@@ -175,10 +175,15 @@ async fn report(
             if let Some(table) = pick(&r.rewards.map, rank).and_then(|v| v.as_str()) {
                 let reference = format!("match:{id}");
                 let res = async {
-                    crate::grant_limits::check(&s.db, acc, "reward_table", table, 1).await?;
-                    let rw = s.economy.grant_table(acc, table, &reference).await?;
-                    crate::grant_limits::record(&s.db, acc, "reward_table", table, 1).await?;
-                    Ok::<_, Error>(rw)
+                    let booked =
+                        crate::grant_limits::check(&s.db, acc, "reward_table", table, 1).await?;
+                    match s.economy.grant_table(acc, table, &reference).await {
+                        Ok(rw) => Ok::<_, Error>(rw),
+                        Err(e) => {
+                            crate::grant_limits::release(&s.db, &booked).await?;
+                            Err(e)
+                        }
+                    }
                 }
                 .await;
                 match res {

@@ -64,6 +64,7 @@ metrics = "0.24.6"
 metrics-exporter-prometheus = { version = "0.18.3", default-features = false }
 hmac = "0.12"
 subtle = "2"
+ipnet = "2"
 md-5 = "0.10"
 sha2.workspace = true
 sha1.workspace = true
@@ -76,8 +77,6 @@ maxminddb.workspace = true
 tar.workspace = true
 flate2.workspace = true
 hex.workspace = true
-# constant-time comparison of capability tokens (build artifacts)
-subtle = "2"
 include_dir.workspace = true
 
 jsonwebtoken.workspace = true
@@ -106,4 +105,4 @@ flate2.workspace = true
 str0m = "0.24"
 
 [target.'cfg(target_os = "linux")'.dependencies]
-pprof = { version = "0.14", default-features = false, features = ["flamegraph", "prost-codec"] }
+pprof = { version = "0.15", default-features = false, features = ["flamegraph", "prost-codec"] }

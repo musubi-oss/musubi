@@ -1,0 +1,19 @@
+# `cargo audit` policy. Every ignored advisory needs a reason and is re-checked on each dependency
+# bump (see the `audit` job in .github/workflows/ci.yml).
+[advisories]
+ignore = [
+    # crypto-bigint 0.5 timing variability (via p256/p384 <- jsonwebtoken). No fixed release on
+    # the 0.5 line; the 0.6 line is not yet picked up by ecdsa/p256 stable. Musubi only *verifies*
+    # ES256/ES384 tokens with these crates (public-key operations), signing uses ring.
+    "RUSTSEC-2026-0387",
+    # rsa Marvin attack (via jsonwebtoken). RSA is only used to verify RS256 OIDC id_tokens
+    # against provider public keys; no RSA private-key operations happen in the node.
+    "RUSTSEC-2023-0071",
+    # quick-xml 0.26 DoS on *parsing* hostile XML (via inferno <- pprof flamegraphs). inferno is
+    # only used to *write* flamegraph SVGs from our own stack samples; it never parses input.
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
+    # atomic-polyfill unmaintained (via heapless 0.7 <- postcard). Only compiled for targets
+    # without native atomics; a no-op on x86_64 / aarch64 Linux builds.
+    "RUSTSEC-2023-0089",
+]

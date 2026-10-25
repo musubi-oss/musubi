@@ -1294,6 +1294,9 @@ async fn serve(cfg: Config) -> anyhow::Result<()> {
         extra.push((p.name.clone(), p.hosts.clone(), st));
     }
     let state = &main;
+    for bad in crate::http::extract::set_trusted_proxies(&state.cfg.http.trusted_proxies) {
+        tracing::warn!(entry = %bad, "[http] trusted_proxies: not an ip or cidr, ignored");
+    }
     let socket = match state.cfg.http.listen {
         std::net::SocketAddr::V4(_) => tokio::net::TcpSocket::new_v4()?,
         std::net::SocketAddr::V6(_) => tokio::net::TcpSocket::new_v6()?,
