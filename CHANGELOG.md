@@ -5,6 +5,8 @@ All notable changes to Musubi. The format follows [Keep a Changelog](https://kee
 ## Unreleased
 
 ### Unreal GDK
+- `musubi.phys.bodies` is a quantised binary blob (base64; ~45 B + name per body, ~4× smaller than the JSON arrays,
+  which are still read).
 - Uncooked servers no longer close clients that stream a World Partition cell the server lacks:
   `net.SkipMissingLevelDisconnect` is set for them (`bSkipMissingLevelDisconnectUncooked`); the WP NITL client now
   streams by its own controller.

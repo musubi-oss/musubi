@@ -677,9 +677,11 @@ Module `MusubiNet` (runtime, all tiers: the driver uses only classic `UNetDriver
   is the cross-node path) runs `RestorePhysicsFromComponents`.
 - Per-bone physics (done): every simulating body beyond the root — each `FBodyInstance` of a
   `USkeletalMeshComponent` (a ragdoll) and every other simulating primitive of the actor — goes into
-  `musubi.phys.bodies` as `[name, p(3), q(4), v(3), w(3), awake]`, `name` = `Mesh:bone` or the component name, the
-  pose relative to the root body (the node's entity position stays the anchor), quantised to 0.01 cm / 1e-4 /
-  0.1 cm/s like `FRepMovement` does. On arrival the skeletal mesh switches all its bodies on
+  `musubi.phys.bodies` as one base64 blob: `[u8 version][u16 count]` then per body `[name][i32 p×3 @0.01 cm]
+  [i16 q×4][i32 v×3 @0.1 cm/s][i32 w×3 @1e-3 rad/s][u8 awake]` — `name` = `Mesh:bone` or the component name, the
+  pose relative to the root body (the node's entity position stays the anchor), ~45 B + name per body (a 23-body
+  ragdoll ≈ 1.3 KB; the 16 KiB component limit fits ~300 bodies; the JSON arrays of the first version are still
+  read). On arrival the skeletal mesh switches all its bodies on
   (`SetAllBodiesSimulatePhysics`) and each body gets `SetBodyTransform(TeleportPhysics)` + both velocities +
   wake/sleep; broken skeletal constraints travel as `Mesh:JointName` in `broken` and are broken again with
   `BreakConstraint`. Chaos re-solves the joints from the restored poses, so the ragdoll continues instead of
