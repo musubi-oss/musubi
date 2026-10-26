@@ -251,10 +251,12 @@ controllers out of the server's sources (`OnIsStreamingSourceProviderFiltered`, 
 so a server streams by its leases, not by where its players stand. `bWorldPartitionStreaming = false` turns it
 all off; the per-cell level instances above (`CellLevels`) remain for non-WP maps. NITL covers it with
 `NITL_WP=1` (an empty partitioned map with a grid equal to the world's and a marker actor per cell, built
-headless by `UMusubiNitlWpMapCommandlet`; the servers' logs show which markers are streamed in per lease). Mind an
-uncooked `UnrealEditor -server`: it has no WP cell packages on disk and closes a client that reports a cell visible
-which the server has not streamed in itself (`MissingLevelPackage`) — cooked servers hold every cell package and
-accept any; the harness client therefore runs with `-MusubiNitlNoWpSource` (its controller is not a streaming source).
+headless by `UMusubiNitlWpMapCommandlet`; the servers' logs show which markers are streamed in per lease). An
+uncooked `UnrealEditor -server` has no WP cell packages on disk and would close a client that reports a cell visible
+which the server has not streamed in itself (`MissingLevelPackage`); cooked servers hold every cell package and
+accept any. For the editor dev loop the module sets the engine's `net.SkipMissingLevelDisconnect` on uncooked
+servers (`bSkipMissingLevelDisconnectUncooked`, default on), so the close becomes a warning and the harness client
+streams by its own controller like a real one (the run checks no connection was closed for it).
 
 ### 6.2b Multi-map worlds as level instances (`WorldConfig::levels`)
 
@@ -669,7 +671,8 @@ Module `MusubiNet` (runtime, all tiers: the driver uses only classic `UNetDriver
   Ghosts apply `q` with the position every frame they are updated. Welded children ride in the root.
   Protocol: `handover_started` reaches the owner, which pushes its final `apply` (position + the captured
   components) and then a `handover_ack` as its *release*; the node forwards `handover_request` to the receiver
-  only after that release (or 2 ticks), so the state the receiver gets is the owner's last word. The receiver's
+  only after that release — waiting up to 10 ticks while the owner keeps renewing its leases, 2 ticks once it went
+  silent (dead, or a simulator without the release step) — so the state the receiver gets is the owner's last word. The receiver's
   copy is a ghost until the frame lists the entity as owned — that ownership flip (not `handover_arrived`, which
   is the cross-node path) runs `RestorePhysicsFromComponents`.
 - Per-bone physics (done): every simulating body beyond the root — each `FBodyInstance` of a

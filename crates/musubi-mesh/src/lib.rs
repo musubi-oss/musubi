@@ -865,6 +865,15 @@ impl World {
         }
     }
 
+    /// Whether `sim` renewed a lease during the last `ticks` ticks (a live engine stream renews
+    /// on every `tick_done`); false for a simulator that holds no lease.
+    pub fn sim_renewed_within(&self, sim: SimId, ticks: u64) -> bool {
+        let ttl = self.cfg.lease_ttl_ticks;
+        self.leases.values().any(|l| {
+            l.sim == sim && l.expires_tick.saturating_sub(ttl) + ticks >= self.tick
+        })
+    }
+
     pub fn revoke_lease(&mut self, cell: CellId) -> Option<SimId> {
         self.leases.remove(&cell).map(|l| l.sim)
     }

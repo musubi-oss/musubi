@@ -52,6 +52,9 @@ public:
 	 *  engine loads/unloads the map's WP cells under split/merge/handover by itself (one map for the whole world, no travel).
 	 *  Turns on wp.Runtime.EnableServerStreaming(+Out) at module start unless an ini/command line already set them. */
 	UPROPERTY(Config, EditAnywhere, Category = "World Partition") bool bWorldPartitionStreaming = true;
+	/** Uncooked servers (editor -server) have no WP cell packages and would close a client that streams a cell this server
+	 *  has not: set net.SkipMissingLevelDisconnect so it is a warning instead. Cooked servers are unaffected. */
+	UPROPERTY(Config, EditAnywhere, Category = "World Partition") bool bSkipMissingLevelDisconnectUncooked = true;
 	/** Extra radius (cm) streamed around each leased cell; < 0 = the world's ghost_margin (where ghosts of neighbouring cells live). */
 	UPROPERTY(Config, EditAnywhere, Category = "World Partition") float CellStreamingMargin = -1.f;
 	/** Ignore player controllers as server streaming sources (clients stream by their own controller; the server streams by its cells). */

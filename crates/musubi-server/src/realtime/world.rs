@@ -5989,6 +5989,7 @@ impl WorldRegistry {
                             to,
                             group: group.clone(),
                             due_tick: st.world.tick + HANDOVER_RELEASE_TICKS,
+                            hard_due_tick: st.world.tick + HANDOVER_RELEASE_MAX_TICKS,
                             released: false,
                         });
                         push_event(
@@ -6820,8 +6821,12 @@ fn queue_interest(q: &mut Vec<PendingInterest>, p: PendingInterest) {
 }
 
 /// Ticks the owner gets after `handover_started` to push its final state and release the entity
-/// before the receiver is asked anyway (2 ≈ 66 ms at 30 Hz: one poll of a simulator's stream).
+/// before the receiver is asked anyway: 2 (≈ 66 ms at 30 Hz, one poll of a simulator's stream) for
+/// an owner that stopped renewing its leases (dead, or a simulator without the release step), up
+/// to `HANDOVER_RELEASE_MAX_TICKS` while the owner's stream is visibly alive (it renews on every
+/// `tick_done`, so its release is on the way).
 const HANDOVER_RELEASE_TICKS: u64 = 2;
+const HANDOVER_RELEASE_MAX_TICKS: u64 = 10;
 
 struct PendingRequest {
     entity: EntityId,
@@ -6829,6 +6834,7 @@ struct PendingRequest {
     to: Uuid,
     group: Vec<EntityId>,
     due_tick: u64,
+    hard_due_tick: u64,
     released: bool,
 }
 
@@ -6876,9 +6882,19 @@ fn flush_pending_requests(st: &mut WorldState, name: &str) {
     });
     for i in 0..st.pending_requests.len() {
         let p = &st.pending_requests[i];
-        if !p.released && tick >= p.due_tick {
-            push_request(st, name, i, "release timeout");
+        if p.released || tick < p.due_tick {
+            continue;
         }
+        let owner_alive = st.world.sim_renewed_within(p.from, HANDOVER_RELEASE_TICKS);
+        if owner_alive && tick < p.hard_due_tick {
+            continue;
+        }
+        push_request(
+            st,
+            name,
+            i,
+            if owner_alive { "release timeout" } else { "owner silent" },
+        );
     }
 }
 

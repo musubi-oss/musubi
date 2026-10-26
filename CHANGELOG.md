@@ -5,6 +5,11 @@ All notable changes to Musubi. The format follows [Keep a Changelog](https://kee
 ## Unreleased
 
 ### Unreal GDK
+- Uncooked servers no longer close clients that stream a World Partition cell the server lacks:
+  `net.SkipMissingLevelDisconnect` is set for them (`bSkipMissingLevelDisconnectUncooked`); the WP NITL client now
+  streams by its own controller.
+- Handover release wait is adaptive: the node waits for the owner's release up to 10 ticks while the owner keeps
+  renewing its leases, 2 ticks once it went silent.
 - Handover protocol: the node asks the receiving simulator only after the owner released the entity (its final
   `apply` + `handover_ack`, or 2 ticks), so the receiver resumes from the owner's last state; the GDK no longer
   captures physics from its ghost on `handover_request`, and restores it on the ownership flip of a local handover

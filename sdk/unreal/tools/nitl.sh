@@ -99,10 +99,10 @@ if [ "$WP" = 1 ] && [ -z "${NITL_PROJECT:-}" ]; then
   [ -f "$PROJ/Content/NitlWP.umap" ] || { echo "wp map not written"; grep -i "wpmap\|error" "$OUT/wpmap.log" | tail -20; exit 1; }
   echo "wp map: $(grep -o 'wpmap: .*' "$OUT/wpmap.log" | tail -1)"
   MAP=/Game/NitlWP
-  # An uncooked `UnrealEditor -server` has no WP cell packages on disk and kicks a client that reports a WP cell visible
-  # which this server has not streamed in (MissingLevelPackage; cooked servers have every cell package and take any), and
-  # the walk leaves the two leased cells far behind — so the harness client does not stream by its controller.
-  WPCLIENT="-MusubiNitlNoWpSource"
+  # The client streams the partitioned map by its controller like a real one; an uncooked `UnrealEditor -server` has no WP
+  # cell packages on disk, and the plugin turns the engine's MissingLevelPackage close into a warning for such servers
+  # (net.SkipMissingLevelDisconnect) — the run checks nobody was closed for it. NITL_WP_NOCLIENT=1 restores the old mode.
+  WPCLIENT=""; [ "${NITL_WP_NOCLIENT:-0}" = 1 ] && WPCLIENT="-MusubiNitlNoWpSource"
 fi
 echo "== servers"
 S2SPAWN=""; if [ "$CHAOS" = 1 ]; then
@@ -291,6 +291,14 @@ if [ "$WP" = 1 ] && [ "$CHAOS" != 1 ]; then
   case "$WM1" in *"0,0"*) echo "PASS nitl-s1: wp streamed in the leased cell 0,0 ($WM1)";; *) echo "FAIL nitl-s1: wp streamed in the leased cell 0,0 (${WM1:-none})"; ok=0;; esac
   case "$WM1" in *"11,0"*) echo "FAIL nitl-s1: wp did not stream a far cell 11,0 ($WM1)"; ok=0;; *) echo "PASS nitl-s1: wp did not stream a far cell 11,0";; esac
   chk nitl-c "nitl: wp partitioned=1"
+  if [ -z "$WPCLIENT" ]; then
+    chk nitl-s1 "uncooked server: net.SkipMissingLevelDisconnect on"
+    for N in nitl-c nitl-s1 $S2LOG; do
+      if grep -q "MissingLevelPackage" "$OUT/$N.log"; then echo "FAIL $N: a connection was closed for a WP cell the server lacks (MissingLevelPackage)"; ok=0; else echo "PASS $N: no MissingLevelPackage close"; fi
+    done
+    WMC=$(grep "nitl: wp partitioned=1" "$OUT/nitl-c.log" | grep -o "markers=.*" | grep -v "markers=$\|markers=\[\]" | tail -1)
+    if [ -n "$WMC" ]; then echo "PASS nitl-c: client streamed wp cells by its own controller ($WMC)"; else echo "FAIL nitl-c: client streamed wp cells by its own controller"; ok=0; fi
+  fi
 fi
 if [ "$JOIN" = 1 ]; then echo "SKIP nitl-s: inventory / iris-seed / subobject-seed checks (the node-spawned avatar carries no NITL seed; the client did see the new owner's FastArray and subobject above)"; else
 GINV=$(grep "nitl: server pawn .* id=$ENTITY owned=0 " "$OUT/$S2LOG.log" | grep -o "inv=[0-9]* gold=[0-9]*" | tail -1)
