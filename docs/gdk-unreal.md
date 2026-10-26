@@ -687,7 +687,23 @@ Module `MusubiNet` (runtime, all tiers: the driver uses only classic `UNetDriver
   `BreakConstraint`. Chaos re-solves the joints from the restored poses, so the ragdoll continues instead of
   snapping to the reference pose. `NITL_RAGDOLL=1` kicks the engine's TutorialTPP ragdoll across the border and
   checks that the new owner resumed every body within 2 cm and keeps simulating it. Exact determinism is not a
-  goal (Epic replicates only the root body); cloth and vehicles are not covered.
+  goal (Epic replicates only the root body).
+- Extension hook (`IMusubiHandoverState`, `MusubiHandoverState.h`): any component on the actor implementing it adds one
+  JSON value under its key to `musubi.phys.ext` when the old owner freezes the body and gets it back on the new owner
+  after the rigid bodies resumed — for state the engine simulates outside the bodies. `MusubiVehicles`
+  (`UMusubiVehicleHandover`, optional module, depends on ChaosVehiclesPlugin) uses it for the Chaos wheeled vehicle
+  snapshot (`GetSnapshot`/`SetSnapshot`: gear, engine RPM, per-wheel suspension offset / rotation / steering / radius /
+  angular velocity) so the drive continues instead of the suspension re-settling and the gear dropping. Verified to
+  compile on 5.7.4; no vehicle asset ships with the engine, so NITL has no runtime vehicle scenario.
+- Cloth: the engine exposes no particle state, so none is transferred; the new owner calls
+  `ForceClothNextUpdateTeleportAndReset` on every skeletal mesh after the pose is restored and the cloth settles from
+  the restored pose in a frame instead of exploding. Geometry collections (destruction): the engine's own replication
+  data (`FGeometryCollectionRepData`, `ProcessRepData`) is protected in the component and the physics proxy has no
+  public per-piece pose setter (only `BreakClusters_External` / `DisableParticles_External` / `ApplyImpulseAt_External`),
+  so a broken collection cannot be rebuilt pose-exact on another server from outside the engine; what is possible
+  through `IMusubiHandoverState` is replaying the break set (which clusters are released, which pieces are gone) —
+  pieces then fall from their rest pose. Until a project needs that, keep destructibles on their home server
+  (`CanRelease() = false`) or treat them as world dressing rather than entities.
 - Roles: an owned actor is `ROLE_Authority`; a ghost is `ROLE_SimulatedProxy` with `RemoteRole =
   ROLE_Authority` (`UMusubiAuthorityComponent::ApplyNetRole`, on bind and on every ownership flip), so
   `AActor::HasAuthority()` is false on it for every Blueprint and third-party plugin, CharacterMovement runs

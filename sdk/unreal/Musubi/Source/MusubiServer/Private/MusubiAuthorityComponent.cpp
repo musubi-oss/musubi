@@ -1,5 +1,6 @@
 #include "MusubiAuthorityComponent.h"
 #include "MusubiServerModule.h"
+#include "MusubiHandoverState.h"
 #include "MusubiEntityRegistry.h"
 #include "MusubiSimulatorSubsystem.h"
 #include "MusubiJson.h"
@@ -423,6 +424,14 @@ void UMusubiAuthorityComponent::CapturePhysicsIntoComponents()
 			if (UPhysicsConstraintComponent* K = Cast<UPhysicsConstraintComponent>(C))
 				if (K->IsBroken()) Broken.Add(MakeShared<FJsonValueString>(K->GetName()));
 	if (AActor* A = GetOwner()) CaptureBodies(A, B, P, Broken);
+	if (AActor* OwnerActor = GetOwner())
+	{
+		TSharedPtr<FJsonObject> Ext = MakeShared<FJsonObject>();
+		for (UActorComponent* Comp : OwnerActor->GetComponents())
+			if (IMusubiHandoverState* H = Cast<IMusubiHandoverState>(Comp))
+				if (TSharedPtr<FJsonValue> State = H->CaptureHandoverState()) Ext->SetField(H->HandoverStateKey().ToString(), State);
+		if (Ext->Values.Num()) P->SetObjectField(TEXT("ext"), Ext);
+	}
 	if (Broken.Num()) P->SetArrayField(TEXT("broken"), Broken);
 	FMusubiJson Phys; Phys.Value = MakeShared<FJsonValueObject>(P);
 	Components.FindOrAdd(PhysicsComponent()).Value = Phys;
@@ -471,7 +480,16 @@ void UMusubiAuthorityComponent::RestorePhysicsFromComponents()
 		if ((*P)->TryGetStringField(TEXT("bodies"), B64)) { if (!DecodeBodies(B64, Recs)) UE_LOG(LogMusubiServer, Warning, TEXT("%s: musubi.phys bodies undecodable"), *Owner->GetName()); }
 		else if ((*P)->TryGetArrayField(TEXT("bodies"), Legacy) && Legacy) DecodeLegacyBodies(*Legacy, Recs);
 		if (Recs.Num()) RestoreBodies(Owner, B, Recs);
+		// cloth has no transferable state; a teleport+reset keeps it from exploding against the restored pose
+		for (UActorComponent* Comp : Owner->GetComponents())
+			if (USkeletalMeshComponent* SK = Cast<USkeletalMeshComponent>(Comp)) SK->ForceClothNextUpdateTeleportAndReset();
 	}
+	const TSharedPtr<FJsonObject>* Ext = nullptr;
+	if ((*P)->TryGetObjectField(TEXT("ext"), Ext) && Ext)
+		if (AActor* Owner = GetOwner())
+			for (UActorComponent* Comp : Owner->GetComponents())
+				if (IMusubiHandoverState* H = Cast<IMusubiHandoverState>(Comp))
+					if (TSharedPtr<FJsonValue> State = (*Ext)->TryGetField(H->HandoverStateKey().ToString())) H->RestoreHandoverState(State);
 	const TArray<TSharedPtr<FJsonValue>>* Broken = nullptr;
 	if ((*P)->TryGetArrayField(TEXT("broken"), Broken) && Broken)
 		if (AActor* A = GetOwner())

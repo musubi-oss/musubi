@@ -54,11 +54,20 @@
 			"Name": "MusubiNitl",
 			"Type": "Runtime",
 			"LoadingPhase": "Default"
+		},
+		{
+			"Name": "MusubiVehicles",
+			"Type": "Runtime",
+			"LoadingPhase": "Default"
 		}
 	],
 	"Plugins": [
 		{
 			"Name": "MassGameplay",
+			"Enabled": true
+		},
+		{
+			"Name": "ChaosVehiclesPlugin",
 			"Enabled": true
 		}
 	]

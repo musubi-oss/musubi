@@ -5,6 +5,9 @@ All notable changes to Musubi. The format follows [Keep a Changelog](https://kee
 ## Unreleased
 
 ### Unreal GDK
+- Cloth on a handed-over actor gets `ForceClothNextUpdateTeleportAndReset` after the pose is restored (no explosion).
+- `IMusubiHandoverState`: components add their own state to `musubi.phys.ext` across a handover; new optional
+  `MusubiVehicles` module carries the Chaos wheeled vehicle snapshot (gear, RPM, wheels) with it.
 - `musubi.phys.bodies` is a quantised binary blob (base64; ~45 B + name per body, ~4× smaller than the JSON arrays,
   which are still read).
 - Uncooked servers no longer close clients that stream a World Partition cell the server lacks:
